@@ -1,0 +1,26 @@
+[project]
+name = "thistle"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "jolsten", email = "jolsten@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.2.2",
+    "sgp4>=2.23",
+]
+
+[project.scripts]
+thistle = "thistle:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.124.2",
+    "pytest>=8.3.4",
+]

@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# uv
+uv.lock
+
+# pytest
+.pytest_cache
+.hypothesis
+
+# tle-db specific items
+.secrets.ini
+*.sqlite
+*.sqlite-journal
