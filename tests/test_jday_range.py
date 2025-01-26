@@ -51,8 +51,9 @@ def date_range(
 
 @given(date_range())
 def test_jday_range(date_range: tuple[datetime.datetime, datetime.datetime]):
+    NUM_SAMPLES = 10
     start, stop = date_range
-    step = (stop - start).total_seconds() / 100
+    step = (stop - start).total_seconds() / (NUM_SAMPLES - 1)
     jd, fr = jday_range(start, stop, step)
     start_jd, start_fr = jday_datetime(start.replace(tzinfo=datetime.UTC))
     stop_jd, stop_fr = jday_datetime(stop.replace(tzinfo=datetime.UTC))
@@ -61,8 +62,6 @@ def test_jday_range(date_range: tuple[datetime.datetime, datetime.datetime]):
         stop.isoformat(sep="T", timespec="milliseconds"),
         step,
     )
-    # print(start.isoformat(sep="T", timespec="milliseconds"), jd, fr, start_jd, start_fr)
-    # print(stop.isoformat(sep="T", timespec="milliseconds"), jd, fr, stop_jd, stop_fr)
     # Ensure first time value is the input "start" time
     assert float(jd[0]) == pytest.approx(start_jd, abs=TOLERANCE)
     assert float(fr[0]) == pytest.approx(start_fr, abs=TOLERANCE)
@@ -71,3 +70,7 @@ def test_jday_range(date_range: tuple[datetime.datetime, datetime.datetime]):
     stop_jday_exp = stop_jd + stop_fr
     stop_jday_out = jd[-1] + fr[-1]
     assert abs(stop_jday_exp - stop_jday_out) < (step * 86400)
+
+    # Ensure vector list is appropriate size, plus/minus 1
+    assert len(jd) == pytest.approx(NUM_SAMPLES, abs=1)
+    assert len(fr) == pytest.approx(NUM_SAMPLES, abs=1)

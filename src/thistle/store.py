@@ -79,7 +79,7 @@ def jday_range(
 
 
 @dataclass
-class _SingleStore:
+class Satellite:
     satnum: str
     _epochs: np.ndarray[np.datetime64] = field(repr=False, init=False, default=None)
     _satrec: list[Satrec] = field(repr=False, default_factory=list)
@@ -149,7 +149,7 @@ class _SingleStore:
 
 @dataclass
 class TLEStore:
-    _single_stores: dict[str, _SingleStore] = field(default_factory=dict, repr=False)
+    _single_stores: dict[str, Satellite] = field(default_factory=dict, repr=False)
 
     def load(self, path: PathLike) -> None:
         tles = _read_tle_file(path)
@@ -157,9 +157,7 @@ class TLEStore:
             sat = Satrec.twoline2rv(tle[0], tle[1])
 
             if sat.satnum_str not in self._single_stores:
-                self._single_stores[sat.satnum_str] = _SingleStore(
-                    satnum=sat.satnum_str
-                )
+                self._single_stores[sat.satnum_str] = Satellite(satnum=sat.satnum_str)
             self._single_stores[sat.satnum_str].add_satrec(sat)
 
     def find_nearest(self, satnum: str, epoch: datetime.datetime) -> Satrec:
