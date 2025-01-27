@@ -1,19 +1,86 @@
 import abc
-import datetime
-from typing import Optional, Union, Iterable
-import itertools
 
 import numpy as np
 from sgp4.api import Satrec
 from sgp4.conveniences import sat_epoch_datetime
 
-TIME_SCALE = "us"
-EPOCH_DTYPE = np.dtype(f"datetime64[{TIME_SCALE}]")
+from thistle._utils import (
+    EPOCH_DTYPE,
+    TIME_SCALE,
+    datetime_to_dt64,
+    dt64_to_datetime,
+    pairwise,
+)
+
+DATETIME64_MIN = np.datetime64(0, TIME_SCALE)
+DATETIME64_MAX = np.datetime64(-1, TIME_SCALE)
+DATETIME_MIN = dt64_to_datetime(DATETIME64_MIN)
+DATETIME_MAX = dt64_to_datetime(DATETIME64_MAX)
+
+
+def slices_by_transitions(
+    transitions: np.ndarray[np.datetime64], times: np.ndarray[np.datetime64]
+) -> list[tuple[int, np.ndarray[np.int64]]]:
+    indices = []
+    t0 = times[0]
+    t1 = times[-1]
+
+    print(f"Start: {t0}")
+    print(f"Stop:  {t1}")
+
+    # Avoid traversing the ENTIRE Satrec list by checking
+    # the first & last progataion times
+
+    # Find the first transition index to search
+    if t0 < transitions[0]:
+        start_idx = 0
+    else:
+        print("a", t0 < transitions)
+        start_idx = np.nonzero(t0 < transitions)[0][0]
+
+    # Find the last transition index to search
+    if transitions[-1] < t1:
+        stop_idx = len(transitions)
+    else:
+        print("b", transitions < t1)
+        stop_idx = np.nonzero(transitions < t1)[0][-1] + 1
+
+    print("bb", transitions < t1)
+
+    print(f"Start Idx: {start_idx}")
+    print(f"Stop  Idx: {stop_idx}")
+
+    # times before first epoch
+    if start_idx == 0:
+        print("bbb", np.nonzero(times < transitions[0])[0])
+        indices.append((start_idx, np.nonzero(times < transitions[0])[0]))
+
+    search_space = transitions[start_idx - 1 : stop_idx + 1]
+    print("c", search_space)
+
+    for idx, bounds in enumerate(pairwise(search_space), start=start_idx):
+        print("d", idx, bounds)
+        time_a, time_b = bounds
+        cond1 = time_a <= times
+        cond2 = times < time_b
+        comb = np.logical_and(cond1, cond2)
+        slice_ = np.nonzero(comb)[0]
+        print("e", times[slice_])
+        indices.append((idx, slice_))
+
+    # times after last epoch
+    if stop_idx == len(transitions):
+        print("f", np.nonzero(transitions[-1] < times)[0])
+        indices.append((stop_idx, np.nonzero(transitions[-1] < times)[0]))
+
+    print("z", indices)
+
+    return indices
 
 
 class TLESwitcher(abc.ABC):
     satrecs: list[Satrec]
-    transitions: list[datetime.datetime]
+    transitions: np.ndarray
 
     def __init__(
         self,
@@ -21,7 +88,7 @@ class TLESwitcher(abc.ABC):
     ) -> None:
         self.satrecs = sorted(satrecs, key=lambda sat: sat_epoch_datetime(sat))
         self.transitions = None
-    
+
     @abc.abstractmethod
     def compute_transitions(self) -> None:
         pass
@@ -29,40 +96,36 @@ class TLESwitcher(abc.ABC):
     def propagate(
         self, times: np.ndarray[np.datetime64]
     ) -> tuple[np.ndarray, np.ndarray]:
-        pass
+        indices = slices_by_transitions(self.transitions, times)
+
+        for idx, slice_ in indices:
+            print(idx, self.transitions[idx], slice_)
+        return
 
 
 class EpochSwitcher(TLESwitcher):
     def compute_transitions(self) -> None:
-        transitions = [sat_epoch_datetime(sat).replace(tzinfo=None) for sat in self.satrecs[1:]]
+        transitions = [
+            sat_epoch_datetime(sat).replace(tzinfo=None) for sat in self.satrecs[1:]
+        ]
+        transitions = [DATETIME_MIN] + transitions + [DATETIME_MAX]
         self.transitions = np.array(
-            [
-                np.datetime64(
-                    dt.isoformat(sep="T", timespec="milliseconds"), TIME_SCALE
-                )
-                for dt in transitions
-            ],
+            [datetime_to_dt64(dt) for dt in transitions],
             dtype=EPOCH_DTYPE,
         )
-
-
-def _pairwise(iterable: Iterable) -> Iterable:
-    "s -> (s0, s1), (s1, s2), (s2, s3), ..."
-    a, b = itertools.tee(iterable)
-    next(b, None)
-    return zip(a, b)
 
 
 class MidpointSwitcher(TLESwitcher):
     def compute_transitions(self) -> None:
         transitions = []
-        for sat_a, sat_b in _pairwise(self.satrecs):
+        for sat_a, sat_b in pairwise(self.satrecs):
             time_a = sat_epoch_datetime(sat_a).replace(tzinfo=None)
             time_b = sat_epoch_datetime(sat_b).replace(tzinfo=None)
             delta = time_b - time_a
             midpoint = time_a + delta / 2
             midpoint = np.datetime64(midpoint, TIME_SCALE)
             transitions.append(midpoint)
+        transitions = [DATETIME_MIN] + transitions + [DATETIME_MAX]
         self.transitions = np.array(transitions, dtype=EPOCH_DTYPE)
 
 

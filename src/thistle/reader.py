@@ -1,6 +1,8 @@
+import os
 import pathlib
 from typing import Union
-import os
+
+from sgp4.api import Satrec
 
 PathLike = Union[str, bytes, pathlib.Path, os.PathLike]
 
@@ -23,3 +25,7 @@ def read_tle_file(path: PathLike) -> list[tuple[str]]:
                 tles.append(tuple(lines))
                 lines = _init()
     return tles
+
+
+def parse_tle_file(path: PathLike) -> list[Satrec]:
+    return [Satrec.twoline2rv(a, b) for a, b in read_tle_file(path)]
