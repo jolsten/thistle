@@ -7,15 +7,12 @@ from sgp4.conveniences import sat_epoch_datetime
 from thistle._utils import (
     EPOCH_DTYPE,
     TIME_SCALE,
+    DATETIME_MIN,
+    DATETIME_MAX,
     datetime_to_dt64,
     dt64_to_datetime,
     pairwise,
 )
-
-DATETIME64_MIN = np.datetime64(0, TIME_SCALE)
-DATETIME64_MAX = np.datetime64(-1, TIME_SCALE)
-DATETIME_MIN = dt64_to_datetime(DATETIME64_MIN)
-DATETIME_MAX = dt64_to_datetime(DATETIME64_MAX)
 
 
 def slices_by_transitions(
@@ -25,55 +22,37 @@ def slices_by_transitions(
     t0 = times[0]
     t1 = times[-1]
 
-    print(f"Start: {t0}")
-    print(f"Stop:  {t1}")
+    # print(f"Start: {t0}")
+    # print(f"Stop:  {t1}")
 
     # Avoid traversing the ENTIRE Satrec list by checking
     # the first & last progataion times
 
     # Find the first transition index to search
-    if t0 < transitions[0]:
-        start_idx = 0
-    else:
-        print("a", t0 < transitions)
-        start_idx = np.nonzero(t0 < transitions)[0][0]
+    start_idx = np.nonzero(t0 < transitions)[0][0]
 
     # Find the last transition index to search
-    if transitions[-1] < t1:
-        stop_idx = len(transitions)
-    else:
-        print("b", transitions < t1)
-        stop_idx = np.nonzero(transitions < t1)[0][-1] + 1
+    stop_idx = np.nonzero(transitions < t1)[0][-1] + 1
 
-    print("bb", transitions < t1)
+    # print("bb", transitions < t1)
+    # print(f"Start Idx: {start_idx}")
+    # print(f"Stop  Idx: {stop_idx}")
 
-    print(f"Start Idx: {start_idx}")
-    print(f"Stop  Idx: {stop_idx}")
-
-    # times before first epoch
-    if start_idx == 0:
-        print("bbb", np.nonzero(times < transitions[0])[0])
-        indices.append((start_idx, np.nonzero(times < transitions[0])[0]))
-
-    search_space = transitions[start_idx - 1 : stop_idx + 1]
-    print("c", search_space)
+    search_space = transitions[start_idx - 1: stop_idx + 1]
+    # print("c", search_space)
 
     for idx, bounds in enumerate(pairwise(search_space), start=start_idx):
-        print("d", idx, bounds)
+        # print("d", idx, bounds)
         time_a, time_b = bounds
         cond1 = time_a <= times
         cond2 = times < time_b
         comb = np.logical_and(cond1, cond2)
         slice_ = np.nonzero(comb)[0]
-        print("e", times[slice_])
+        # print("e", times[slice_])
         indices.append((idx, slice_))
 
-    # times after last epoch
-    if stop_idx == len(transitions):
-        print("f", np.nonzero(transitions[-1] < times)[0])
-        indices.append((stop_idx, np.nonzero(transitions[-1] < times)[0]))
-
-    print("z", indices)
+    # print("y", times[slice_])
+    # print("z", indices)
 
     return indices
 
@@ -127,6 +106,7 @@ class MidpointSwitcher(TLESwitcher):
             transitions.append(midpoint)
         transitions = [DATETIME_MIN] + transitions + [DATETIME_MAX]
         self.transitions = np.array(transitions, dtype=EPOCH_DTYPE)
+
 
 
 class TCASwitcher(TLESwitcher):

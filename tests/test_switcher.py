@@ -1,4 +1,5 @@
 import datetime
+from typing import Type
 
 import numpy as np
 import pytest
@@ -6,17 +7,45 @@ from hypothesis import assume, given
 from hypothesis import strategies as st
 from sgp4.api import Satrec
 from sgp4.conveniences import sat_epoch_datetime
-from thistle._utils import datetime_to_dt64, dt64_to_datetime, trange
-from thistle.reader import read_tle_file
-from thistle.switcher import EpochSwitcher, MidpointSwitcher, slices_by_transitions
+from thistle._utils import datetime_to_dt64, dt64_to_datetime, trange, DATETIME64_MAX, DATETIME64_MIN, DATETIME_MAX, DATETIME_MIN
+from thistle.reader import parse_tle_file, read_tle_file
+from thistle.switcher import EpochSwitcher, MidpointSwitcher, TLESwitcher, slices_by_transitions
 
-from .strategies import datetime_bounds
+
+from .strategies import DATETIME_1957, DATETIME_2056, datetime_bounds
+
+BASIC_TIMES = trange(datetime.datetime(2000, 1, 1, 0), datetime.datetime(2000,1,2,0), step=360)
+BASIC_SATRECS = parse_tle_file("tests/data/25544.tle")
+
+class SwitcherBasic:
+    class_: Type[TLESwitcher]
+
+    def setup_class(self):
+        self.switcher = self.class_(BASIC_SATRECS)
+        self.switcher.compute_transitions()
+
+    def test_switcher_transition_count(self):
+        assert len(self.switcher.transitions) == len(BASIC_SATRECS) + 1
+
+    def test_switcher_first_epoch(self):
+        assert self.switcher.transitions[0] == DATETIME64_MIN
+    
+    def test_switcher_last_epoch(self):
+        assert self.switcher.transitions[-1] == DATETIME64_MAX
+    
+
+class TestEpochSwitcherBasic(SwitcherBasic):
+    class_ = EpochSwitcher
+
+class TestMidpointSwitcherBasic(SwitcherBasic):
+    class_ = MidpointSwitcher
+
 
 
 @given(st.data(), datetime_bounds())
 def test_slices(data, bounds: tuple[datetime.datetime, datetime.datetime]):
     t0, t1 = bounds
-    step = (t1 - t0).total_seconds() / 100
+    step = (t1 - t0).total_seconds() / 10
     times = trange(t0, t1, step)
     transitions = data.draw(
         st.lists(
@@ -26,27 +55,29 @@ def test_slices(data, bounds: tuple[datetime.datetime, datetime.datetime]):
             unique_by=lambda x: x,
         )
     )
-    transitions = sorted(transitions)
+    transitions = [DATETIME_MIN] + sorted(transitions) + [DATETIME_MAX]
     transitions = np.atleast_1d(
         np.array([datetime_to_dt64(t) for t in transitions], dtype="datetime64[us]")
     )
-    print("=" * 20)
-    print(t0, "step =", step)
+    # print("=" * 20)
+    # print(t0, "step =", step)
     # print(transitions)
-    for t in transitions:
-        print(" ", t)
-    print(t1)
-    print("-" * 20)
+    # for t in transitions:
+    #     print(" ", t)
+    # print(t1)
+    # print("-" * 20)
     slices = slices_by_transitions(transitions, times)
     for idx, slc_ in slices:
-        print(transitions[idx])
-        print(" ", times[slc_][0], times[slc_][-1], len(times[slc_]))
+        # print(transitions[idx])
+        # print(" ", times[slc_][0], times[slc_][-1], len(times[slc_]))
+        assert (transitions[idx-1] < times[slc_]).all()
+        assert (times[slc_] < transitions[idx]).all()
     # print(slices)
 
     # for val in times[slice_]:
     #     assert val < transitions
 
-    assert False
+    # assert False
 
 
 def test_transitions_epoch_switcher():
