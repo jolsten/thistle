@@ -7,15 +7,32 @@ from hypothesis import assume, given
 from hypothesis import strategies as st
 from sgp4.api import Satrec
 from sgp4.conveniences import sat_epoch_datetime
-from thistle._utils import datetime_to_dt64, dt64_to_datetime, trange, DATETIME64_MAX, DATETIME64_MIN, DATETIME_MAX, DATETIME_MIN
+from thistle._utils import (
+    DATETIME64_MAX,
+    DATETIME64_MIN,
+    DATETIME_MAX,
+    DATETIME_MIN,
+    datetime_to_dt64,
+    dt64_to_datetime,
+    trange,
+)
 from thistle.reader import parse_tle_file, read_tle_file
-from thistle.switcher import EpochSwitcher, MidpointSwitcher, TLESwitcher, slices_by_transitions
+from thistle.switcher import (
+    EpochSwitcher,
+    MidpointSwitcher,
+    TLESwitcher,
+    slices_by_transitions,
+)
 
+from .strategies import datetime_bounds
 
-from .strategies import DATETIME_1957, DATETIME_2056, datetime_bounds
+np.set_printoptions(linewidth=300)
 
-BASIC_TIMES = trange(datetime.datetime(2000, 1, 1, 0), datetime.datetime(2000,1,2,0), step=360)
+BASIC_TIMES = trange(
+    datetime.datetime(2000, 1, 1, 0), datetime.datetime(2000, 1, 2, 0), step=360
+)
 BASIC_SATRECS = parse_tle_file("tests/data/25544.tle")
+
 
 class SwitcherBasic:
     class_: Type[TLESwitcher]
@@ -25,21 +42,22 @@ class SwitcherBasic:
         self.switcher.compute_transitions()
 
     def test_switcher_transition_count(self):
-        assert len(self.switcher.transitions) == len(BASIC_SATRECS) + 1
+        # One transition per satrec, plus one for before and one for after
+        assert len(self.switcher.transitions) == len(BASIC_SATRECS) + 2
 
     def test_switcher_first_epoch(self):
         assert self.switcher.transitions[0] == DATETIME64_MIN
-    
+
     def test_switcher_last_epoch(self):
         assert self.switcher.transitions[-1] == DATETIME64_MAX
-    
+
 
 class TestEpochSwitcherBasic(SwitcherBasic):
     class_ = EpochSwitcher
 
+
 class TestMidpointSwitcherBasic(SwitcherBasic):
     class_ = MidpointSwitcher
-
 
 
 @given(st.data(), datetime_bounds())
@@ -67,11 +85,16 @@ def test_slices(data, bounds: tuple[datetime.datetime, datetime.datetime]):
     # print(t1)
     # print("-" * 20)
     slices = slices_by_transitions(transitions, times)
+    print("=" * 20)
     for idx, slc_ in slices:
         # print(transitions[idx])
         # print(" ", times[slc_][0], times[slc_][-1], len(times[slc_]))
-        assert (transitions[idx-1] < times[slc_]).all()
-        assert (times[slc_] < transitions[idx]).all()
+        print("a", transitions[idx])
+        print("b", times[slc_])
+        print("c", transitions[idx + 1])
+        print("-" * 20)
+        assert (transitions[idx] <= times[slc_]).all()
+        assert (times[slc_] < transitions[idx + 1]).all()
     # print(slices)
 
     # for val in times[slice_]:
@@ -87,7 +110,10 @@ def test_transitions_epoch_switcher():
 
     switcher = EpochSwitcher(satrecs)
     switcher.compute_transitions()
-    for sat, time in zip(satrecs[1:], switcher.transitions):
+
+    print(satrecs, switcher.transitions)
+
+    for sat, time in zip(satrecs, switcher.transitions[1:-1]):
         sat_epoch = (
             sat_epoch_datetime(sat)
             .replace(tzinfo=None)
