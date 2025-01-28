@@ -14,6 +14,24 @@ from thistle._utils import (
     pairwise,
 )
 
+# Transition Examples
+# Epoch Switching
+# -     A     B     C     D     E     +
+# |-----/-----|-----|-----|-----|-----|
+# Transitions: n + 1
+# Segments: n
+# 
+# MidpointSWitching
+# -     A     B     C     D     E     +
+# |-----/--|--/--|--/--|--/--|--/-----|
+# Transitions: n + 1
+# Segments: n
+#
+# TCA Switching
+# -     A     B     C     D     E     +
+# |-----/--|--/--|--/--|--/--|--/-----|
+# Transitions: n + 1
+# Segments: n
 
 def slices_by_transitions(
     transitions: np.ndarray[np.datetime64], times: np.ndarray[np.datetime64]
@@ -123,7 +141,7 @@ class EpochSwitcher(TLESwitcher):
         transitions = [
             sat_epoch_datetime(sat).replace(tzinfo=None) for sat in self.satrecs
         ]
-        transitions = [DATETIME_MIN] + transitions + [DATETIME_MAX]
+        transitions = [DATETIME_MIN] + transitions[1:] + [DATETIME_MAX]
         self.transitions = np.array(
             [datetime_to_dt64(dt) for dt in transitions],
             dtype=EPOCH_DTYPE,
