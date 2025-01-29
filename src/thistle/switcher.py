@@ -11,8 +11,13 @@ from thistle._utils import (
     TIME_SCALE,
     datetime_to_dt64,
     dt64_to_datetime,
-    pairwise,
 )
+
+try:
+    from itertools import pairwise
+except ImportError:
+    from thistle._utils import pairwise_recipe as pairwise
+
 
 # Transition Examples
 # Epoch Switching
@@ -20,7 +25,7 @@ from thistle._utils import (
 # |-----/-----|-----|-----|-----|-----|
 # Transitions: n + 1
 # Segments: n
-# 
+#
 # MidpointSWitching
 # -     A     B     C     D     E     +
 # |-----/--|--/--|--/--|--/--|--/-----|
@@ -32,6 +37,7 @@ from thistle._utils import (
 # |-----/--|--/--|--/--|--/--|--/-----|
 # Transitions: n + 1
 # Segments: n
+
 
 def slices_by_transitions(
     transitions: np.ndarray[np.datetime64], times: np.ndarray[np.datetime64]
@@ -91,23 +97,17 @@ def slices_by_transitions(
     # print(f"Stop  Idx: {stop_idx}")
 
     search_space = transitions[start_idx : stop_idx + 1]
-    print("time range", times[0], times[-1])
-    print("transitions", transitions)
-    print("search space", search_space)
+    # print("time range", times[0], times[-1])
+    # print("transitions", transitions)
+    # print("search space", search_space)
 
     for idx, bounds in enumerate(pairwise(search_space), start=start_idx):
-        # print("d", idx, bounds)
         time_a, time_b = bounds
         cond1 = time_a <= times
         cond2 = times < time_b
         comb = np.logical_and(cond1, cond2)
         slice_ = np.nonzero(comb)[0]
-        # print("e", times[slice_])
         indices.append((idx, slice_))
-
-    # print("y", times[slice_])
-    # print("z", indices)
-
     return indices
 
 
@@ -151,12 +151,16 @@ class EpochSwitcher(TLESwitcher):
 class MidpointSwitcher(TLESwitcher):
     def compute_transitions(self) -> None:
         transitions = []
+        print(self.satrecs)
         for sat_a, sat_b in pairwise(self.satrecs):
             time_a = sat_epoch_datetime(sat_a).replace(tzinfo=None)
             time_b = sat_epoch_datetime(sat_b).replace(tzinfo=None)
             delta = time_b - time_a
             midpoint = time_a + delta / 2
-            midpoint = np.datetime64(midpoint, TIME_SCALE)
+            midpoint = datetime_to_dt64(midpoint)
+            print("time_a =", time_a)
+            print("midpt  =", midpoint)
+            print("time_b =", time_b)
             transitions.append(midpoint)
         transitions = [DATETIME_MIN] + transitions + [DATETIME_MAX]
         self.transitions = np.array(transitions, dtype=EPOCH_DTYPE)
