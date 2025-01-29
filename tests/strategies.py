@@ -1,18 +1,29 @@
 import datetime
-from sgp4.api import Satrec
-from thistle._utils import DATETIME_MAX, DATETIME_MIN, datetime_to_dt64, trange, datetime_to_yy_days
+
+import numpy as np
 from hypothesis import assume
 from hypothesis import strategies as st
-import numpy as np
-
+from sgp4.api import Satrec
+from thistle._utils import (
+    DATETIME_MAX,
+    DATETIME_MIN,
+    datetime_to_dt64,
+    datetime_to_yy_days,
+    trange,
+)
 
 GENERIC_TLE = [
     "1 25544U 98067A   98324.28472222 -.00003657  11563-4  00000+0 0  9996",
     "2 25544 051.5908 168.3788 0125362 086.4185 359.7454 16.05064833    05",
 ]
 
+
 @st.composite
-def satrecs(draw, min_epoch: datetime.datetime = DATETIME_MIN, max_epoch: datetime.datetime = DATETIME_MAX) -> Satrec:
+def satrecs(
+    draw,
+    min_epoch: datetime.datetime = DATETIME_MIN,
+    max_epoch: datetime.datetime = DATETIME_MAX,
+) -> Satrec:
     sat = Satrec.twoline2rv(*GENERIC_TLE)
     dt = draw(st.datetimes(min_value=min_epoch, max_value=max_epoch))
     dt = dt.replace(tzinfo=datetime.UTC)
@@ -20,13 +31,27 @@ def satrecs(draw, min_epoch: datetime.datetime = DATETIME_MIN, max_epoch: dateti
     return sat
 
 
+def unique_by_epoch(sat: Satrec) -> float:
+    return sat.jdsatepoch + sat.jdsatepochF
+
+
 @st.composite
-def satrec_lists(draw, min_epoch: datetime.datetime = DATETIME_MIN, max_epoch: datetime.datetime = DATETIME_MAX, min_size: int = 1, max_size: int = 100) -> list[Satrec]:
-    key = lambda sat: sat.jdsatepoch + sat.jdsatepochF
-    satrec_list = draw(st.lists(
-        satrecs(min_epoch=min_epoch, max_epoch=max_epoch), min_size=min_size, max_size=max_size, unique_by=key
-    ))
-    satrec_list = sorted(satrec_list, key=key)
+def satrec_lists(
+    draw,
+    min_epoch: datetime.datetime = DATETIME_MIN,
+    max_epoch: datetime.datetime = DATETIME_MAX,
+    min_size: int = 1,
+    max_size: int = 100,
+) -> list[Satrec]:
+    satrec_list = draw(
+        st.lists(
+            satrecs(min_epoch=min_epoch, max_epoch=max_epoch),
+            min_size=min_size,
+            max_size=max_size,
+            unique_by=unique_by_epoch,
+        )
+    )
+    satrec_list = sorted(satrec_list, key=unique_by_epoch)
     return satrec_list
 
 
@@ -56,8 +81,14 @@ def times(draw, min_size: int = 1, max_size: int = 10) -> np.ndarray[np.datetime
 
 
 @st.composite
-def transitions(draw, min_count: int = 1, max_count: int = 3):
-    t0, t1 = draw(datetime_bounds())
+def transitions(
+    draw,
+    min_value: datetime.datetime = DATETIME_MIN,
+    max_value: datetime.datetime = DATETIME_MAX,
+    min_count: int = 1,
+    max_count: int = 3,
+) -> np.ndarray[np.datetime64]:
+    t0, t1 = draw(datetime_bounds(min_value=min_value, max_value=max_value))
     transitions = draw(
         st.lists(
             st.datetimes(min_value=t0, max_value=t1),

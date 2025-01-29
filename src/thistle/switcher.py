@@ -8,9 +8,7 @@ from thistle._utils import (
     DATETIME_MAX,
     DATETIME_MIN,
     EPOCH_DTYPE,
-    TIME_SCALE,
     datetime_to_dt64,
-    dt64_to_datetime,
 )
 
 try:
@@ -22,19 +20,19 @@ except ImportError:
 # Transition Examples
 # Epoch Switching
 # -     A     B     C     D     E     +
-# |-----/-----|-----|-----|-----|-----|
+# |-----~-----|-----|-----|-----|-----|
 # Transitions: n + 1
 # Segments: n
 #
 # MidpointSWitching
 # -     A     B     C     D     E     +
-# |-----/--|--/--|--/--|--/--|--/-----|
+# |-----~--|--~--|--~--|--~--|--~-----|
 # Transitions: n + 1
 # Segments: n
 #
 # TCA Switching
 # -     A     B     C     D     E     +
-# |-----/--|--/--|--/--|--/--|--/-----|
+# |-----~--|--~--|--~--|--~--|--~-----|
 # Transitions: n + 1
 # Segments: n
 
