@@ -151,17 +151,22 @@ class EpochSwitcher(TLESwitcher):
 class MidpointSwitcher(TLESwitcher):
     def compute_transitions(self) -> None:
         transitions = []
-        print(self.satrecs)
+        # print(self.satrecs)
+        # print("="*20)
         for sat_a, sat_b in pairwise(self.satrecs):
             time_a = sat_epoch_datetime(sat_a).replace(tzinfo=None)
             time_b = sat_epoch_datetime(sat_b).replace(tzinfo=None)
+
+            # if time_a < time_b:
             delta = time_b - time_a
             midpoint = time_a + delta / 2
             midpoint = datetime_to_dt64(midpoint)
-            print("time_a =", time_a)
-            print("midpt  =", midpoint)
-            print("time_b =", time_b)
             transitions.append(midpoint)
+            # else:
+            #     if midpoint == time_b:
+            #         print(time_a, midpoint, time_b)
+            #         raise ValueError
+            #     transitions.append(time_a)
         transitions = [DATETIME_MIN] + transitions + [DATETIME_MAX]
         self.transitions = np.array(transitions, dtype=EPOCH_DTYPE)
 
