@@ -26,7 +26,7 @@ def satrecs(
 ) -> Satrec:
     sat = Satrec.twoline2rv(*GENERIC_TLE)
     dt = draw(st.datetimes(min_value=min_epoch, max_value=max_epoch))
-    dt = dt.replace(tzinfo=datetime.timezone.UTC)
+    dt = dt.replace(tzinfo=datetime.timezone.utc)
     sat.epochyr, sat.epochdays = datetime_to_yy_days(dt)
     return sat
 

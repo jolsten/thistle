@@ -46,7 +46,7 @@ def trange(
 
 def datetime_to_yy_days(dt: datetime.datetime) -> tuple[int, float]:
     midnight = datetime.datetime.combine(
-        dt.date(), datetime.time(0, 0, 0), tzinfo=datetime.timezone.UTC
+        dt.date(), datetime.time(0, 0, 0), tzinfo=datetime.timezone.utc
     )
     fday = (dt - midnight).total_seconds()
     yr = int(dt.strftime("%y"))
