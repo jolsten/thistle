@@ -44,7 +44,7 @@ def test_convert_2(integer: int):
     ],
 )
 def test_datetime_to_yy_days(dt: datetime.datetime, yy: int, days: float):
-    got_yy, got_days = datetime_to_yy_days(dt.replace(tzinfo=datetime.UTC))
+    got_yy, got_days = datetime_to_yy_days(dt.replace(tzinfo=datetime.timezone.UTC))
     assert got_yy == yy
     assert got_days == days
 
@@ -54,7 +54,7 @@ def test_datetime_to_yy_days(dt: datetime.datetime, yy: int, days: float):
         st.datetimes(
             min_value=DATETIME_MIN,
             max_value=DATETIME_MAX,
-            timezones=st.sampled_from([datetime.UTC]),
+            timezones=st.sampled_from([datetime.timezone.UTC]),
         ),
         min_size=1,
         max_size=100,

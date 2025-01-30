@@ -25,7 +25,7 @@ def test_jday_range_single_example():
 )
 def test_jday_range_single_time(time: datetime.datetime):
     jd, fr = jday_range(time, time)
-    ex_jd, ex_fr = jday_datetime(time.replace(tzinfo=datetime.UTC))
+    ex_jd, ex_fr = jday_datetime(time.replace(tzinfo=datetime.timezone.UTC))
     print(time.isoformat(sep="T", timespec="milliseconds"), jd[0], fr[0], ex_jd, ex_fr)
     assert float(jd[0]) == pytest.approx(ex_jd, abs=TOLERANCE)
     assert float(fr[0]) == pytest.approx(ex_fr, abs=TOLERANCE)
@@ -55,8 +55,8 @@ def test_jday_range(date_range: tuple[datetime.datetime, datetime.datetime]):
     start, stop = date_range
     step = (stop - start).total_seconds() / (NUM_SAMPLES - 1)
     jd, fr = jday_range(start, stop, step)
-    start_jd, start_fr = jday_datetime(start.replace(tzinfo=datetime.UTC))
-    stop_jd, stop_fr = jday_datetime(stop.replace(tzinfo=datetime.UTC))
+    start_jd, start_fr = jday_datetime(start.replace(tzinfo=datetime.timezone.UTC))
+    stop_jd, stop_fr = jday_datetime(stop.replace(tzinfo=datetime.timezone.UTC))
     print(
         start.isoformat(sep="T", timespec="milliseconds"),
         stop.isoformat(sep="T", timespec="milliseconds"),
