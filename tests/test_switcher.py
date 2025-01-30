@@ -12,6 +12,7 @@ from thistle._utils import (
     DATETIME64_MIN,
     datetime_to_dt64,
     dt64_to_datetime,
+    jday_datetime64,
     trange,
 )
 from thistle.reader import parse_tle_file
@@ -79,22 +80,21 @@ class TestEpochSwitcherBasic(SwitcherBasic):
             assert epoch == dt64_to_datetime(t)
 
     def test_example_1(self):
-        line1 = "2 25544 051.5927 164.4358 0123823 089.5260 271.9768 16.05621877000127"
-        line2 = "1 25544U 98067A   98325.45376114  .01829530  18113-2  41610-2 0  9996"
+        line1 = "1 25544U 98067A   98325.45376114  .01829530  18113-2  41610-2 0  9996"
+        line2 = "2 25544 051.5938 162.0926 0074012 097.3081 262.5015 15.92299093   191"
 
         sat = Satrec.twoline2rv(line1, line2)
         dt = sat_epoch_datetime(sat)
         times = trange(dt, dt + datetime.timedelta(seconds=60), 10)
 
-        exp_e, exp_r, exp_v = sat.sgp4(times)
+        jd, fr = jday_datetime64(times)
+        exp_e, exp_r, exp_v = sat.sgp4_array(jd, fr)
 
         e, r, v = self.switcher.propagate(times)
 
-        assert e == exp_e
-        assert r == exp_r
-        assert v == exp_v
-
-
+        assert e.tolist() == exp_e.flatten().tolist()
+        assert r.tolist() == exp_r.flatten().tolist()
+        assert v.tolist() == exp_v.flatten().tolist()
 
 
 class TestMidpointSwitcherBasic(SwitcherBasic):

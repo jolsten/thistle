@@ -9,6 +9,7 @@ from thistle._utils import (
     DATETIME_MIN,
     EPOCH_DTYPE,
     datetime_to_dt64,
+    jday_datetime64,
 )
 
 try:
@@ -54,7 +55,6 @@ def slices_by_transitions(
     stop_idx = np.nonzero(t1 < transitions)[0][0]
 
     search_space = transitions[start_idx : stop_idx + 1]
-
     for idx, bounds in enumerate(pairwise(search_space), start=start_idx):
         time_a, time_b = bounds
         cond1 = time_a <= times
@@ -85,16 +85,17 @@ class TLESwitcher(abc.ABC):
     ) -> tuple[np.ndarray, np.ndarray]:
         indices = slices_by_transitions(self.transitions, times)
 
-        E, R, V = [], [], []
-
+        e, r, v = [], [], []
         for idx, slice_ in indices:
-            jd, fr = datetime64_to_jd_fr(times[slice_])
-            e, r, v = self.satrecs[idx].sgp4_array(jd, fr)
-            E.append(e)
-            R.append(r)
-            V.append(v)
-            # print(idx, self.transitions[idx], slice_)
-        return np.asarray(R).flatten(), np.asarray(V).flatten()
+            jd, fr = jday_datetime64(times[slice_])
+            a, b, c = self.satrecs[idx].sgp4_array(jd, fr)
+            e.append(a)
+            r.append(b)
+            v.append(c)
+        e = np.asarray(e).flatten()
+        r = np.asarray(r).flatten()
+        v = np.asarray(v).flatten()
+        return e, r, v
 
 
 class EpochSwitcher(TLESwitcher):
@@ -112,22 +113,15 @@ class EpochSwitcher(TLESwitcher):
 class MidpointSwitcher(TLESwitcher):
     def compute_transitions(self) -> None:
         transitions = []
-        # print(self.satrecs)
-        # print("="*20)
         for sat_a, sat_b in pairwise(self.satrecs):
             time_a = sat_epoch_datetime(sat_a).replace(tzinfo=None)
             time_b = sat_epoch_datetime(sat_b).replace(tzinfo=None)
 
-            # if time_a < time_b:
             delta = time_b - time_a
             midpoint = time_a + delta / 2
             midpoint = datetime_to_dt64(midpoint)
             transitions.append(midpoint)
-            # else:
-            #     if midpoint == time_b:
-            #         print(time_a, midpoint, time_b)
-            #         raise ValueError
-            #     transitions.append(time_a)
+
         transitions = [DATETIME_MIN] + transitions + [DATETIME_MAX]
         self.transitions = np.array(transitions, dtype=EPOCH_DTYPE)
 

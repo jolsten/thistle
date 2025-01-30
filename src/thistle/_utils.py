@@ -21,6 +21,8 @@ DATETIME_MAX = datetime.datetime(2056, 12, 31, 23, 59, 59, 999999)
 DATETIME64_MIN = np.datetime64(DATETIME_MIN, TIME_SCALE)
 DATETIME64_MAX = np.datetime64(DATETIME_MAX, TIME_SCALE)
 
+JDAY_1957 = 2435839.5
+
 
 def datetime_to_dt64(dt: datetime.datetime) -> np.datetime64:
     dt = dt.replace(tzinfo=None)
@@ -43,12 +45,22 @@ def trange(
 
 
 def datetime_to_yy_days(dt: datetime.datetime) -> tuple[int, float]:
-    midnight = datetime.datetime.combine(dt.date(), datetime.time(0,0,0), tzinfo=datetime.UTC)
+    midnight = datetime.datetime.combine(
+        dt.date(), datetime.time(0, 0, 0), tzinfo=datetime.UTC
+    )
     fday = (dt - midnight).total_seconds()
     yr = int(dt.strftime("%y"))
     days = int(dt.strftime("%j")) + fday / 86_400
     return yr, days
 
 
-def datetime64_to_jd_fr(array: np.ndarray[np.datetime64]) -> tuple[np.ndarray, np.ndarray]:
-    
+def jday_datetime64(
+    array: np.ndarray[np.datetime64],
+) -> tuple[np.ndarray[np.float64], np.ndarray[np.float64]]:
+    times = (
+        (array - np.datetime64("1957-01-01", "us")).astype("i8") / 86_400 / 1_000_000
+    )
+    jd = np.floor(times)
+    fr = times - jd
+    jd += JDAY_1957
+    return jd, fr
