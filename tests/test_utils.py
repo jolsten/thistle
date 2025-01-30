@@ -5,7 +5,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 from sgp4.conveniences import jday_datetime
-from thistle._utils import (
+from thistle.utils import (
     DATETIME64_MAX,
     DATETIME64_MIN,
     DATETIME_MAX,

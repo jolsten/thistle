@@ -4,18 +4,17 @@ import numpy as np
 from sgp4.api import Satrec
 from sgp4.conveniences import sat_epoch_datetime
 
-from thistle._utils import (
+from thistle.utils import (
     DATETIME_MAX,
     DATETIME_MIN,
     EPOCH_DTYPE,
     datetime_to_dt64,
-    jday_datetime64,
 )
 
 try:
     from itertools import pairwise
 except ImportError:
-    from thistle._utils import pairwise_recipe as pairwise
+    from thistle.utils import pairwise_recipe as pairwise
 
 
 # Transition Examples
@@ -38,33 +37,6 @@ except ImportError:
 # Segments: n
 
 
-def slices_by_transitions(
-    transitions: np.ndarray[np.datetime64], times: np.ndarray[np.datetime64]
-) -> list[tuple[int, np.ndarray[np.int64]]]:
-    indices = []
-    t0 = times[0]
-    t1 = times[-1]
-
-    # Avoid traversing the ENTIRE Satrec list by checking
-    # the first & last progataion times
-
-    # Find the first transition index to search
-    start_idx = np.nonzero(transitions <= t0)[0][-1]
-
-    # Find the last transition index to search
-    stop_idx = np.nonzero(t1 < transitions)[0][0]
-
-    search_space = transitions[start_idx : stop_idx + 1]
-    for idx, bounds in enumerate(pairwise(search_space), start=start_idx):
-        time_a, time_b = bounds
-        cond1 = time_a <= times
-        cond2 = times < time_b
-        comb = np.logical_and(cond1, cond2)
-        slice_ = np.nonzero(comb)[0]
-        indices.append((idx, slice_))
-    return indices
-
-
 class TLESwitcher(abc.ABC):
     satrecs: list[Satrec]
     transitions: np.ndarray
@@ -78,24 +50,7 @@ class TLESwitcher(abc.ABC):
 
     @abc.abstractmethod
     def compute_transitions(self) -> None:
-        pass
-
-    def propagate(
-        self, times: np.ndarray[np.datetime64]
-    ) -> tuple[np.ndarray, np.ndarray]:
-        indices = slices_by_transitions(self.transitions, times)
-
-        e, r, v = [], [], []
-        for idx, slice_ in indices:
-            jd, fr = jday_datetime64(times[slice_])
-            a, b, c = self.satrecs[idx].sgp4_array(jd, fr)
-            e.append(a)
-            r.append(b)
-            v.append(c)
-        e = np.asarray(e).flatten()
-        r = np.asarray(r).flatten()
-        v = np.asarray(v).flatten()
-        return e, r, v
+        raise NotImplementedError()
 
 
 class EpochSwitcher(TLESwitcher):

@@ -4,7 +4,7 @@ import numpy as np
 from hypothesis import assume
 from hypothesis import strategies as st
 from sgp4.api import Satrec
-from thistle._utils import (
+from thistle.utils import (
     DATETIME_MAX,
     DATETIME_MIN,
     datetime_to_dt64,
