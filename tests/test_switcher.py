@@ -83,10 +83,18 @@ class TestEpochSwitcherBasic(SwitcherBasic):
         line2 = "1 25544U 98067A   98325.45376114  .01829530  18113-2  41610-2 0  9996"
 
         sat = Satrec.twoline2rv(line1, line2)
-        dt64 = datetime_to_dt64(sat_epoch_datetime(sat))
+        dt = sat_epoch_datetime(sat)
+        times = trange(dt, dt + datetime.timedelta(seconds=60), 10)
 
-        times = np.array([dt64])
-        tle = self.switcher.select_satrec()
+        exp_e, exp_r, exp_v = sat.sgp4(times)
+
+        e, r, v = self.switcher.propagate(times)
+
+        assert e == exp_e
+        assert r == exp_r
+        assert v == exp_v
+
+
 
 
 class TestMidpointSwitcherBasic(SwitcherBasic):

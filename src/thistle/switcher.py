@@ -44,60 +44,16 @@ def slices_by_transitions(
     t0 = times[0]
     t1 = times[-1]
 
-    print(f"Start: {t0}")
-    print(f"Stop:  {t1}")
-
     # Avoid traversing the ENTIRE Satrec list by checking
     # the first & last progataion times
 
     # Find the first transition index to search
-    print(
-        "start idx",
-        np.nonzero(transitions <= t0)[0],
-        "->",
-        np.nonzero(transitions <= t0)[0][-1],
-        "->",
-        transitions[np.nonzero(transitions <= t0)[0][-1]],
-    )
     start_idx = np.nonzero(transitions <= t0)[0][-1]
-    # print(
-    #     "start idx",
-    #     np.nonzero(t0 < transitions)[0],
-    #     "->",
-    #     np.nonzero(t0 < transitions)[0][0],
-    #     "->",
-    #     transitions[np.nonzero(t0 < transitions)[0][0]],
-    # )
-    # start_idx = np.nonzero(t0 < transitions)[0][0]
 
     # Find the last transition index to search
-    print(
-        "stop  idx",
-        np.nonzero(t1 < transitions)[0],
-        "->",
-        np.nonzero(t1 < transitions)[0][0],
-        "->",
-        transitions[np.nonzero(t1 < transitions)[0][0]],
-    )
     stop_idx = np.nonzero(t1 < transitions)[0][0]
-    # print(
-    #     "stop  idx",
-    #     np.nonzero(transitions < t1)[0],
-    #     "->",
-    #     np.nonzero(transitions < t1)[0][-1] + 1,
-    #     "->",
-    #     transitions[np.nonzero(transitions < t1)[0][-1] + 1],
-    # )
-    # stop_idx = np.nonzero(transitions < t1)[0][-1] + 1
-
-    # print("bb", transitions < t1)
-    # print(f"Start Idx: {start_idx}")
-    # print(f"Stop  Idx: {stop_idx}")
 
     search_space = transitions[start_idx : stop_idx + 1]
-    # print("time range", times[0], times[-1])
-    # print("transitions", transitions)
-    # print("search space", search_space)
 
     for idx, bounds in enumerate(pairwise(search_space), start=start_idx):
         time_a, time_b = bounds
@@ -129,9 +85,16 @@ class TLESwitcher(abc.ABC):
     ) -> tuple[np.ndarray, np.ndarray]:
         indices = slices_by_transitions(self.transitions, times)
 
+        E, R, V = [], [], []
+
         for idx, slice_ in indices:
-            print(idx, self.transitions[idx], slice_)
-        return
+            jd, fr = datetime64_to_jd_fr(times[slice_])
+            e, r, v = self.satrecs[idx].sgp4_array(jd, fr)
+            E.append(e)
+            R.append(r)
+            V.append(v)
+            # print(idx, self.transitions[idx], slice_)
+        return np.asarray(R).flatten(), np.asarray(V).flatten()
 
 
 class EpochSwitcher(TLESwitcher):

@@ -48,3 +48,7 @@ def datetime_to_yy_days(dt: datetime.datetime) -> tuple[int, float]:
     yr = int(dt.strftime("%y"))
     days = int(dt.strftime("%j")) + fday / 86_400
     return yr, days
+
+
+def datetime64_to_jd_fr(array: np.ndarray[np.datetime64]) -> tuple[np.ndarray, np.ndarray]:
+    
