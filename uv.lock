@@ -188,7 +188,7 @@ wheels = [
 
 [[package]]
 name = "thistle"
-version = "0.1.0rc1"
+version = "0.1.0rc2"
 source = { editable = "." }
 dependencies = [
     { name = "numpy" },
@@ -203,7 +203,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "numpy", specifier = ">=2.2.2" },
+    { name = "numpy", specifier = ">=1.22" },
     { name = "sgp4", specifier = ">=2.23" },
 ]
 
