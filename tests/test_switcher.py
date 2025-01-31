@@ -1,90 +1,80 @@
-import datetime
+from itertools import pairwise
+from typing import Type
 
 import numpy as np
-import pytest
-from hypothesis import assume, given
-from hypothesis import strategies as st
+from hypothesis import given
 from sgp4.api import Satrec
 from sgp4.conveniences import sat_epoch_datetime
-from thistle._utils import datetime_to_dt64, dt64_to_datetime, trange
-from thistle.reader import read_tle_file
-from thistle.switcher import EpochSwitcher, MidpointSwitcher, slices_by_transitions
+from thistle.switcher import (
+    EpochSwitcher,
+    MidpointSwitcher,
+    TLESwitcher,
+)
+from thistle.utils import (
+    DATETIME64_MAX,
+    DATETIME64_MIN,
+    dt64_to_datetime,
+)
 
-from .strategies import datetime_bounds
+from . import strategies as cst
+from .conftest import ISS_SATRECS
 
-
-@given(st.data(), datetime_bounds())
-def test_slices(data, bounds: tuple[datetime.datetime, datetime.datetime]):
-    t0, t1 = bounds
-    step = (t1 - t0).total_seconds() / 100
-    times = trange(t0, t1, step)
-    transitions = data.draw(
-        st.lists(
-            st.datetimes(min_value=t0, max_value=t1),
-            min_size=1,
-            max_size=3,
-            unique_by=lambda x: x,
-        )
-    )
-    transitions = sorted(transitions)
-    transitions = np.atleast_1d(
-        np.array([datetime_to_dt64(t) for t in transitions], dtype="datetime64[us]")
-    )
-    print("=" * 20)
-    print(t0, "step =", step)
-    # print(transitions)
-    for t in transitions:
-        print(" ", t)
-    print(t1)
-    print("-" * 20)
-    slices = slices_by_transitions(transitions, times)
-    for idx, slc_ in slices:
-        print(transitions[idx])
-        print(" ", times[slc_][0], times[slc_][-1], len(times[slc_]))
-    # print(slices)
-
-    # for val in times[slice_]:
-    #     assert val < transitions
-
-    assert False
+np.set_printoptions(linewidth=300)
 
 
-def test_transitions_epoch_switcher():
-    file = "tests/data/25544.tle"
-    tles = read_tle_file(file)
-    satrecs = [Satrec.twoline2rv(tle[0], tle[1]) for tle in tles]
-
-    switcher = EpochSwitcher(satrecs)
+@given(cst.satrec_lists())
+def test_midpoint_switcher(satrec_list: list[Satrec]) -> None:
+    switcher = MidpointSwitcher(satrec_list)
     switcher.compute_transitions()
-    for sat, time in zip(satrecs[1:], switcher.transitions):
-        sat_epoch = (
-            sat_epoch_datetime(sat)
-            .replace(tzinfo=None)
-            .isoformat(sep="T", timespec="milliseconds")
-        )
-        assert sat_epoch == str(time)[0:23]
+
+    for idx, bounds in enumerate(pairwise(switcher.transitions)):
+        time_a, time_b = [dt64_to_datetime(t) for t in bounds]
+        # Midpoints should be between Satrecs on either side
+        # idx1 is between a and b
+        epoch = sat_epoch_datetime(switcher.satrecs[idx]).replace(tzinfo=None)
+        assert time_a <= epoch
+        assert epoch <= time_b
 
 
-def test_transitions_midpoint_switcher():
-    file = "tests/data/25544.tle"
-    tles = read_tle_file(file)
-    satrecs = [Satrec.twoline2rv(tle[0], tle[1]) for tle in tles]
+class SwitcherBasic:
+    class_: Type[TLESwitcher]
 
-    switcher = MidpointSwitcher(satrecs)
-    switcher.compute_transitions()
-    for idx, t_time in enumerate(switcher.transitions):
-        t_time = dt64_to_datetime(t_time)
-        sat_a, sat_b = switcher.satrecs[idx : idx + 2]
-        time_a = sat_epoch_datetime(sat_a).replace(tzinfo=None)
-        time_b = sat_epoch_datetime(sat_b).replace(tzinfo=None)
+    def setup_class(self):
+        self.switcher = self.class_(ISS_SATRECS)
+        self.switcher.compute_transitions()
 
-        print(time_a, t_time, time_b)
+    def test_switcher_transition_count(self):
+        # One transition per satrec, plus one  after
+        assert len(self.switcher.transitions) == len(ISS_SATRECS) + 1
 
-        # transition time must be between t0 and t1
-        assert time_a <= t_time
-        assert t_time <= time_b
+    def test_switcher_first_epoch(self):
+        assert self.switcher.transitions[0] == DATETIME64_MIN
 
-        # transition should be halfway between t0 and t1... duh
-        dur1 = (t_time - time_a).total_seconds()
-        dur2 = (time_b - t_time).total_seconds()
-        assert dur1 == pytest.approx(dur2, abs=1e-5)
+    def test_switcher_last_epoch(self):
+        assert self.switcher.transitions[-1] == DATETIME64_MAX
+
+
+class TestEpochSwitcherBasic(SwitcherBasic):
+    class_ = EpochSwitcher
+
+    def test_transitions(self):
+        for idx, t in enumerate(self.switcher.transitions[1:-1]):
+            # First Satrec period of validity starts at -inf
+            # (ergo its epoch should not be a transition time)
+            epoch = sat_epoch_datetime(self.switcher.satrecs[idx + 1]).replace(
+                tzinfo=None
+            )
+            assert epoch == dt64_to_datetime(t)
+
+
+class TestMidpointSwitcherBasic(SwitcherBasic):
+    class_ = MidpointSwitcher
+
+    def test_transitions(self):
+        for idx, bounds in enumerate(pairwise(self.switcher.transitions)):
+            time_a, time_b = [dt64_to_datetime(t) for t in bounds]
+            # Midpoints should be between Satrecs on either side idx1 is between a and b
+            # less than or equal to is required in the case of two consecutive, identical epochs
+            epoch = sat_epoch_datetime(self.switcher.satrecs[idx]).replace(tzinfo=None)
+            assert time_a <= epoch
+            assert epoch <= time_b

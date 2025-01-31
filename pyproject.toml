@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "jolsten", email = "jolsten@gmail.com" }
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 dependencies = [
     "numpy>=2.2.2",
     "sgp4>=2.23",
