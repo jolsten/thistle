@@ -52,7 +52,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Set numpy version
-        run: uv add "numpy<=${{ matrix.numpy-version }}"
+        run: uv add "numpy<=${{ matrix.numpy-version }}.999"
 
       - name: Install the project
         run: uv sync --all-extras --dev
