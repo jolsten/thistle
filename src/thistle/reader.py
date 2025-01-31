@@ -1,8 +1,10 @@
 import os
 import pathlib
-from typing import Union
+from typing import Optional, Union
 
 from sgp4.api import Satrec
+
+from thistle.alpha5 import from_alpha5, Satnum
 
 PathLike = Union[str, bytes, pathlib.Path, os.PathLike]
 
@@ -11,7 +13,7 @@ def _init() -> list:
     return [None] * 2
 
 
-def read_tle_file(path: PathLike) -> list[tuple[str]]:
+def _parse_tle_file(path: PathLike) -> list[tuple[str]]:
     tles = []
     with open(path, "r") as reader:
         lines = _init()
@@ -27,5 +29,55 @@ def read_tle_file(path: PathLike) -> list[tuple[str]]:
     return tles
 
 
-def parse_tle_file(path: PathLike) -> list[Satrec]:
-    return [Satrec.twoline2rv(a, b) for a, b in read_tle_file(path)]
+def _tles_to_satrecs(path: PathLike) -> list[Satrec]:
+    return [Satrec.twoline2rv(a, b) for a, b in _parse_tle_file(path)]
+
+
+def _satrec_epoch(satrec: Satrec) -> float:
+    return satrec.epochyr + satrec.epochdays
+
+
+class SatrecDict:
+    satrecs: dict[int, list[Satrec]]
+
+    def __init__(self) -> None:
+        self.satrecs = {}
+
+    def append(self, satrec: Satrec) -> None:
+        if satrec.satnum not in self.satrecs:
+            self.satrecs[satrec.satnum] = []
+        self.satrecs[satrec.satnum].append(satrec)
+    
+    def extend(self, satrecs: list[Satrec]) -> None:
+        for satrec in satrecs:
+            self.append(satrec)
+
+    def get(self, satnum: Satnum) -> list[Satrec]:
+        satnum = from_alpha5(satnum)
+        if satnum not in self.satrecs:
+            return []
+        self.satrecs[satnum] = sorted(self.satrecs[satnum], key=_satrec_epoch)
+        return self.satrecs[satnum]
+
+
+class TLEReader:
+    satnums: Optional[list[int]]
+    _satrecs: SatrecDict
+
+    def __init__(self, satnums: Optional[list[Satnum]] = None) -> None:
+        self._satrecs = SatrecDict()
+        self.satnums = None
+        if satnums is not None:
+            self.satnums = [from_alpha5(satnum) for satnum in satnums]
+    
+    def read(self, path: PathLike, ) -> None:
+        tles = _parse_tle_file(path)
+        satrecs = [Satrec.twoline2rv(line1, line2) for line1, line2 in tles]
+
+        if self.satnums is not None:
+            satrecs = [sat for sat in satrecs if sat.satnum in self.satnums]
+
+        self._satrecs.extend(satrecs)
+
+    def select(self, satnum: Satnum) -> list[Satrec]:
+        return self._satrecs.get(satnum)
