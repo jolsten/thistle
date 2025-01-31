@@ -30,3 +30,19 @@ jobs:
 
       - name: Run tests
         run: uv run pytest tests
+
+  numpy:
+    name: numpy-versions
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        numpy-version:
+        - "1.22"
+        - "1.23"
+        - "1.24"
+        - "1.25"
+        - "1.26"
+        - "2.0"
+        - "2.1"
+        - "2.2"
+        
