@@ -3,9 +3,10 @@ import datetime
 import numpy as np
 from hypothesis import given
 from sgp4.api import Satrec
+from sgp4.exporter import export_tle
 from sgp4.conveniences import sat_epoch_datetime
 from thistle.propagator import Propagator, slices_by_transitions
-from thistle.utils import jday_datetime64, trange
+from thistle.utils import datetime_to_dt64, jday_datetime64, trange
 
 from . import strategies as cst
 from .conftest import ISS_SATRECS
@@ -31,6 +32,16 @@ class PropagatorBaseClass:
 
 class TestPropagatorEpoch(PropagatorBaseClass):
     method: str = "epoch"
+
+    def test_find_satrec(self):
+        line1 = "1 25544U 98067A   98325.45376114  .01829530  18113-2  41610-2 0  9996"
+        line2 = "2 25544 051.5938 162.0926 0074012 097.3081 262.5015 15.92299093   191"
+
+        exp_sat = Satrec.twoline2rv(line1, line2)
+        dt = sat_epoch_datetime(exp_sat)
+        sat = self.propagator.find_satrec(datetime_to_dt64(dt))
+
+        assert export_tle(sat) == export_tle(exp_sat)
 
     def test_propagator(self):
         line1 = "1 25544U 98067A   98325.45376114  .01829530  18113-2  41610-2 0  9996"
@@ -72,6 +83,7 @@ class TestPropagatorMidpoint(PropagatorBaseClass):
         jd, fr = jday_datetime64(times)
         e, r, v = self.propagator.propagate(times)
         exp_e, exp_r, exp_v = sat_a.sgp4_array(jd, fr)
+        assert export_tle(self.propagator.find_satrec(times[-1])) == export_tle(sat_a)
         assert e.tolist() == exp_e.flatten().tolist()
         assert r.tolist() == exp_r.flatten().tolist()
         assert v.tolist() == exp_v.flatten().tolist()
@@ -81,6 +93,7 @@ class TestPropagatorMidpoint(PropagatorBaseClass):
         jd, fr = jday_datetime64(times)
         e, r, v = self.propagator.propagate(times)
         exp_e, exp_r, exp_v = sat_b.sgp4_array(jd, fr)
+        assert export_tle(self.propagator.find_satrec(times[-1])) == export_tle(sat_b)
         assert e.tolist() == exp_e.flatten().tolist()
         assert r.tolist() == exp_r.flatten().tolist()
         assert v.tolist() == exp_v.flatten().tolist()

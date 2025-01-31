@@ -1,7 +1,7 @@
 [project]
 name = "thistle"
 version = "0.1.0rc1"
-description = "Add your description here"
+description = "A wrapper for sgp4 that handles TLE switching"
 readme = "README.md"
 authors = [
     { name = "jolsten", email = "jolsten@gmail.com" }
@@ -11,9 +11,6 @@ dependencies = [
     "numpy>=2.2.2",
     "sgp4>=2.23",
 ]
-
-[project.scripts]
-thistle = "thistle:main"
 
 [build-system]
 requires = ["hatchling"]

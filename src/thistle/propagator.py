@@ -64,6 +64,11 @@ class Propagator:
 
         self.switcher = switcher
         self.switcher.compute_transitions()
+    
+    def find_satrec(self, time: np.datetime64) -> Satrec:
+        indices = slices_by_transitions(self.switcher.transitions, np.array([time]))
+        idx, _ = indices[0]
+        return self.satrecs[idx]
 
     def propagate(
         self, times: np.ndarray[np.datetime64]
