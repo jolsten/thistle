@@ -1,6 +1,6 @@
 [project]
 name = "thistle"
-version = "0.1.0rc1"
+version = "0.1.0rc2"
 description = "A wrapper for sgp4 that handles TLE switching"
 readme = "README.md"
 authors = [
