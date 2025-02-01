@@ -3,8 +3,8 @@ import datetime
 import numpy as np
 from hypothesis import given
 from sgp4.api import Satrec
-from sgp4.exporter import export_tle
 from sgp4.conveniences import sat_epoch_datetime
+from sgp4.exporter import export_tle
 from thistle.propagator import Propagator, _slices_by_transitions
 from thistle.utils import datetime_to_dt64, jday_datetime64, trange
 

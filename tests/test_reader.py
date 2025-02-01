@@ -1,8 +1,8 @@
 import pathlib
 
 import pytest
-
 from thistle.reader import TLEReader, _parse_tle_file
+
 
 @pytest.mark.parametrize("file", list(pathlib.Path("tests/data").glob("*.tle")))
 class TestTleFileParser:
@@ -28,11 +28,14 @@ def test_loader_iss():
     assert len(satrecs) == len(text) / 2
 
 
-@pytest.mark.parametrize("satnum", [
-    25544,
-    31113,
-    45556,
-])
+@pytest.mark.parametrize(
+    "satnum",
+    [
+        25544,
+        31113,
+        45556,
+    ],
+)
 def test_loader_leo(satnum: int):
     file = "tests/data/leo.tle"
     loader = TLEReader()

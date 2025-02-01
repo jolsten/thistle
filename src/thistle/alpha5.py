@@ -33,12 +33,12 @@ INT_TO_ALPHA = {val: key for key, val in ALPHA_TO_INT.items()}
 
 def to_alpha5(satnum: int) -> str:
     """Encode an integer to an Alpha-5 string."""
+    if satnum < 0 or satnum > 339_999:
+        msg = "Alpha-5 satnum must be >= 0 and < 334,000 (encoded as Z9999)"
+        raise ValueError(msg)
+
     if satnum < 100_000:
         return f"{satnum:05}"
-
-    if satnum > 339999:
-        msg = "satnum exceeds maximum value for Alpha-5 encoding 339999 (encoded as Z9999)"
-        raise ValueError(msg)
 
     a, b = divmod(satnum, 10_000)
     return f"{INT_TO_ALPHA[a]}{b:04}"
