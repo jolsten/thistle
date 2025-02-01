@@ -5,7 +5,7 @@ from hypothesis import given
 from sgp4.api import Satrec
 from sgp4.exporter import export_tle
 from sgp4.conveniences import sat_epoch_datetime
-from thistle.propagator import Propagator, slices_by_transitions
+from thistle.propagator import Propagator, _slices_by_transitions
 from thistle.utils import datetime_to_dt64, jday_datetime64, trange
 
 from . import strategies as cst
@@ -16,7 +16,7 @@ from .conftest import ISS_SATRECS
 def test_slices(
     transitions: np.ndarray[np.datetime64], times: np.ndarray[np.datetime64]
 ):
-    slices = slices_by_transitions(transitions, times)
+    slices = _slices_by_transitions(transitions, times)
     for idx, slc_ in slices:
         assert (transitions[idx] <= times[slc_]).all()
         assert (times[slc_] < transitions[idx + 1]).all()

@@ -8,7 +8,7 @@ from sgp4.conveniences import sat_epoch_datetime
 from thistle.switcher import (
     EpochSwitcher,
     MidpointSwitcher,
-    TLESwitcher,
+    SwitchingStrategy,
 )
 from thistle.utils import (
     DATETIME64_MAX,
@@ -37,7 +37,7 @@ def test_midpoint_switcher(satrec_list: list[Satrec]) -> None:
 
 
 class SwitcherBasic:
-    class_: Type[TLESwitcher]
+    class_: Type[SwitchingStrategy]
 
     def setup_class(self):
         self.switcher = self.class_(ISS_SATRECS)

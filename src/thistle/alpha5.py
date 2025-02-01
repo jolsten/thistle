@@ -15,6 +15,7 @@ ALPHA_TO_INT = {
 INT_TO_ALPHA = {val: key for key, val in ALPHA_TO_INT.items()}
 
 def to_alpha5(satnum: int) -> str:
+    """Encode an integer to an Alpha-5 string."""
     if satnum < 100_000:
         return f'{satnum:05}'
     
@@ -26,6 +27,7 @@ def to_alpha5(satnum: int) -> str:
     return f"{INT_TO_ALPHA[a]}{b:04}"
 
 def from_alpha5(satnum: str) -> int:
+    """Decode an Alpha-5 string to an integer."""
     satnum = str(satnum)
     if satnum[0].isnumeric():
         return int(satnum)
