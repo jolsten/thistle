@@ -3,7 +3,12 @@ from typing import Literal, get_args
 import numpy as np
 from sgp4.api import Satrec
 
-from thistle.switcher import EpochSwitcher, MidpointSwitcher, TCASwitcher, SwitchingStrategy
+from thistle.switcher import (
+    EpochSwitcher,
+    MidpointSwitcher,
+    SwitchingStrategy,
+    TCASwitcher,
+)
 from thistle.utils import jday_datetime64
 
 try:
@@ -65,7 +70,7 @@ class Propagator:
 
         self.switcher = switcher
         self.switcher.compute_transitions()
-    
+
     def find_satrec(self, time: np.datetime64) -> Satrec:
         indices = _slices_by_transitions(self.switcher.transitions, np.array([time]))
         idx, _ = indices[0]

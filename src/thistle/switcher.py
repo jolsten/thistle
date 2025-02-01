@@ -55,10 +55,11 @@ class SwitchingStrategy(abc.ABC):
 
 class EpochSwitcher(SwitchingStrategy):
     """Switching based on the TLE epoch.
-    
-    This TLE switching strategy selects the TLE generated with an epoch 
+
+    This TLE switching strategy selects the TLE generated with an epoch
     closest to the time without being "in the future".
     """
+
     def compute_transitions(self) -> None:
         transitions = [
             sat_epoch_datetime(sat).replace(tzinfo=None) for sat in self.satrecs
@@ -72,10 +73,11 @@ class EpochSwitcher(SwitchingStrategy):
 
 class MidpointSwitcher(SwitchingStrategy):
     """Switching based on the midpoint between neighboring TLE epoch times.
-    
+
     This TLE switching strategy selects the TLE nearest to the desired time,
     regardless of whether that TLE is precedes it or is "in the future".
     """
+
     def compute_transitions(self) -> None:
         transitions = []
         for sat_a, sat_b in pairwise(self.satrecs):
@@ -93,7 +95,7 @@ class MidpointSwitcher(SwitchingStrategy):
 
 class TCASwitcher(SwitchingStrategy):
     """Switching based on the time of closest approach for neighboring TLEs.
-    
+
     This TLE switching method attempts to determine the time of closest approach
     for each pair of neighboring TLEs and use those times as the transitions.
     """
