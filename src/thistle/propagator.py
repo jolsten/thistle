@@ -3,7 +3,12 @@ from typing import Literal, get_args
 import numpy as np
 from sgp4.api import Satrec
 
-from thistle.switcher import EpochSwitcher, MidpointSwitcher, TCASwitcher, TLESwitcher
+from thistle.switcher import (
+    EpochSwitcher,
+    MidpointSwitcher,
+    SwitchingStrategy,
+    TCASwitcher,
+)
 from thistle.utils import jday_datetime64
 
 try:
@@ -15,9 +20,10 @@ except ImportError:
 SwitchingStrategies = Literal["epoch", "midpoint", "tca"]
 
 
-def slices_by_transitions(
+def _slices_by_transitions(
     transitions: np.ndarray[np.datetime64], times: np.ndarray[np.datetime64]
 ) -> list[tuple[int, np.ndarray[np.int64]]]:
+    """Split a time vector into slices based on a sequence of transition times."""
     indices = []
     t0 = times[0]
     t1 = times[-1]
@@ -44,7 +50,7 @@ def slices_by_transitions(
 
 class Propagator:
     satrecs: list[Satrec]
-    switcher: TLESwitcher
+    switcher: SwitchingStrategy
 
     def __init__(
         self, satrecs: list[Satrec], *, method: SwitchingStrategies = "epoch"
@@ -64,16 +70,16 @@ class Propagator:
 
         self.switcher = switcher
         self.switcher.compute_transitions()
-    
+
     def find_satrec(self, time: np.datetime64) -> Satrec:
-        indices = slices_by_transitions(self.switcher.transitions, np.array([time]))
+        indices = _slices_by_transitions(self.switcher.transitions, np.array([time]))
         idx, _ = indices[0]
         return self.satrecs[idx]
 
     def propagate(
         self, times: np.ndarray[np.datetime64]
     ) -> tuple[np.ndarray[np.float64], np.ndarray[np.float64]]:
-        indices = slices_by_transitions(self.switcher.transitions, times)
+        indices = _slices_by_transitions(self.switcher.transitions, times)
 
         e, r, v = [], [], []
         for idx, slice_ in indices:
