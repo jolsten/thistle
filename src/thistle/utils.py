@@ -1,9 +1,11 @@
 import datetime
 import itertools
-from typing import Any, Iterable
+from typing import Any, Iterable, Union
 
 import numpy as np
 
+
+DateTime = Union[datetime.datetime, np.datetime64]
 
 def pairwise_recipe(iterable: Iterable) -> Iterable[tuple[Any, Any]]:
     "s -> (s0, s1), (s1, s2), (s2, s3), ..."
@@ -31,6 +33,14 @@ def datetime_to_dt64(dt: datetime.datetime) -> np.datetime64:
 
 def dt64_to_datetime(dt: np.datetime64) -> datetime.datetime:
     return datetime.datetime.fromisoformat(str(dt))
+
+
+def ensure_datetime64(dt: DateTime) -> np.datetime64:
+    if isinstance(dt, datetime.datetime):
+        return datetime_to_dt64(dt)
+    elif isinstance(dt, np.datetime64):
+        return dt
+    raise TypeError
 
 
 def trange(

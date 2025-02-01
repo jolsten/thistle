@@ -5,6 +5,7 @@ from typing import Optional, Union
 from sgp4.api import Satrec
 
 from thistle.alpha5 import Satnum, from_alpha5
+from thistle.switcher import SwitchingStrategy
 
 PathLike = Union[str, bytes, pathlib.Path, os.PathLike]
 
@@ -34,7 +35,7 @@ def _tles_to_satrecs(tles: list[tuple[str, str]]) -> list[Satrec]:
 
 
 def _satrec_epoch(satrec: Satrec) -> float:
-    return satrec.epochyr + satrec.epochdays
+    return satrec.jdsatepoch + satrec.jdsatepochF
 
 
 class SatrecDict:

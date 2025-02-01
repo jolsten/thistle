@@ -1,5 +1,5 @@
-from typing import Literal, get_args
-
+from typing import Literal, get_args, Union
+import datetime
 import numpy as np
 from sgp4.api import Satrec
 
@@ -9,7 +9,7 @@ from thistle.switcher import (
     SwitchingStrategy,
     TCASwitcher,
 )
-from thistle.utils import jday_datetime64
+from thistle.utils import TIME_SCALE, ensure_datetime64, jday_datetime64
 
 try:
     from itertools import pairwise
@@ -71,8 +71,9 @@ class Propagator:
         self.switcher = switcher
         self.switcher.compute_transitions()
 
-    def find_satrec(self, time: np.datetime64) -> Satrec:
-        indices = _slices_by_transitions(self.switcher.transitions, np.array([time]))
+    def find_satrec(self, time: Union[datetime.datetime, np.datetime64]) -> Satrec:
+        time = ensure_datetime64(time)
+        indices = _slices_by_transitions(self.switcher.transitions, np.atleast_1d(time))
         idx, _ = indices[0]
         return self.satrecs[idx]
 
