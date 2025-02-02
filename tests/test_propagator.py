@@ -6,7 +6,7 @@ from sgp4.api import Satrec
 from sgp4.exporter import export_tle
 from sgp4.conveniences import sat_epoch_datetime
 from thistle.propagator import Propagator, _slices_by_transitions
-from thistle.utils import datetime_to_dt64, jday_datetime64, trange
+from thistle.utils import datetime_to_dt64, dt64_to_jday, trange
 
 from . import strategies as cst
 from .conftest import ISS_SATRECS
@@ -51,7 +51,7 @@ class TestPropagatorEpoch(PropagatorBaseClass):
         dt = sat_epoch_datetime(sat)
         times = trange(dt, dt + datetime.timedelta(seconds=60), 10)
 
-        jd, fr = jday_datetime64(times)
+        jd, fr = dt64_to_jday(times)
         exp_e, exp_r, exp_v = sat.sgp4_array(jd, fr)
 
         e, r, v = self.propagator.propagate(times)
@@ -80,7 +80,7 @@ class TestPropagatorMidpoint(PropagatorBaseClass):
 
         # Check first half of range
         times = trange(epoch_a, midpoint, step)
-        jd, fr = jday_datetime64(times)
+        jd, fr = dt64_to_jday(times)
         e, r, v = self.propagator.propagate(times)
         exp_e, exp_r, exp_v = sat_a.sgp4_array(jd, fr)
         assert export_tle(self.propagator.find_satrec(times[-1])) == export_tle(sat_a)
@@ -90,7 +90,7 @@ class TestPropagatorMidpoint(PropagatorBaseClass):
 
         # Check second half of range
         times = trange(midpoint, epoch_b, step)
-        jd, fr = jday_datetime64(times)
+        jd, fr = dt64_to_jday(times)
         e, r, v = self.propagator.propagate(times)
         exp_e, exp_r, exp_v = sat_b.sgp4_array(jd, fr)
         assert export_tle(self.propagator.find_satrec(times[-1])) == export_tle(sat_b)

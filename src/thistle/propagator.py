@@ -9,7 +9,7 @@ from thistle.switcher import (
     SwitchingStrategy,
     TCASwitcher,
 )
-from thistle.utils import jday_datetime64
+from thistle.utils import dt64_to_jday, jday_to_dt64
 
 try:
     from itertools import pairwise
@@ -18,6 +18,7 @@ except ImportError:
 
 
 SwitchingStrategies = Literal["epoch", "midpoint", "tca"]
+SGP4Output = tuple[np.ndarray, np.ndarray[float], np.ndarray[float]]
 
 
 def _slices_by_transitions(
@@ -48,6 +49,12 @@ def _slices_by_transitions(
     return indices
 
 
+class SatrecSwitcher:
+    satnum: int
+    satrecs: list[Satrec]
+    switcher: SwitchingStrategy
+
+
 class Propagator:
     satrecs: list[Satrec]
     switcher: SwitchingStrategy
@@ -75,16 +82,18 @@ class Propagator:
         indices = _slices_by_transitions(self.switcher.transitions, np.array([time]))
         idx, _ = indices[0]
         return self.satrecs[idx]
+    
+    def sgp4_array(self, jd: np.ndarray[np.float64], fr: np.ndarray[np.float64]) -> SGP4Output:
+        times = jday_to_dt64(jd, fr)
 
     def propagate(
         self, times: np.ndarray[np.datetime64]
     ) -> tuple[np.ndarray[np.float64], np.ndarray[np.float64]]:
         indices = _slices_by_transitions(self.switcher.transitions, times)
-
+        jd, fr = dt64_to_jday(times)
         e, r, v = [], [], []
         for idx, slice_ in indices:
-            jd, fr = jday_datetime64(times[slice_])
-            a, b, c = self.satrecs[idx].sgp4_array(jd, fr)
+            a, b, c = self.satrecs[idx].sgp4_array(jd[slice_], fr[slice_])
             e.append(a)
             r.append(b)
             v.append(c)
