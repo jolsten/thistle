@@ -4,8 +4,8 @@ from typing import Any, Iterable, Union
 
 import numpy as np
 
-
 DateTime = Union[datetime.datetime, np.datetime64]
+
 
 def pairwise_recipe(iterable: Iterable) -> Iterable[tuple[Any, Any]]:
     "s -> (s0, s1), (s1, s2), (s2, s3), ..."

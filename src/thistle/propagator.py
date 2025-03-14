@@ -1,5 +1,6 @@
-from typing import Literal, get_args, Union
 import datetime
+from typing import Literal, Union, get_args
+
 import numpy as np
 from sgp4.api import Satrec
 
@@ -9,7 +10,7 @@ from thistle.switcher import (
     SwitchingStrategy,
     TCASwitcher,
 )
-from thistle.utils import TIME_SCALE, ensure_datetime64, jday_datetime64
+from thistle.utils import ensure_datetime64, jday_datetime64
 
 try:
     from itertools import pairwise
