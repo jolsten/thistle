@@ -5,12 +5,11 @@ import pathlib
 from typing import Iterable, Union
 
 import tqdm
-from sgp4.api import Satrec
 
 from thistle import utils
-from thistle.alpha5 import to_alpha5
+from thistle.alpha5 import ensure_alpha5
 from thistle.config import Settings
-from thistle.utils import group_by, tle_epoch, tle_satnum
+from thistle.utils import tle_epoch, tle_satnum
 
 PathLike = Union[str, bytes, os.PathLike, pathlib.Path]
 TLETuple = tuple[str, str]
@@ -87,24 +86,26 @@ def write_tles(
 
 
 class Loader:
-    satrecs: dict[int, list[Satrec]]
     settings: Settings
 
     def __init__(self, config: Settings) -> None:
         self.settings = config
-        self.satrecs = {}
+
+        if not self.settings.archive.exists():
+            raise FileNotFoundError(self.settings.archive)
+
+        if not self.settings.object.exists():
+            raise FileNotFoundError(self.settings.object)
+
+        if not self.settings.daily.exists():
+            raise FileNotFoundError(self.settings.daily)
 
     def load_object(self, satnum: Union[str, int]) -> None:
-        satnum = to_alpha5(satnum)
-        file = self.settings.daily / f"{satnum}{self.settings.suffix}"
-        tles = read_tle(file)
-        self.satrecs[satnum] = tles
+        satnum = ensure_alpha5(satnum)
+        file = self.settings.object / f"{satnum}{self.settings.suffix}"
+        return read_tle(file)
 
-    def load_daily(self, date: datetime.date) -> None:
+    def load_day(self, date: str) -> None:
+        date = datetime.datetime.strptime(date, "%Y%m%d")
         file = self.settings.daily / f"{date.strftime('%Y%m%d')}{self.settings.suffix}"
-        all_tles = read_tle(file)
-        grouped = group_by(all_tles, key=tle_satnum)
-        for satnum, tles in grouped.items():
-            if satnum not in self.satrecs:
-                self.satrecs[satnum] = []
-            self.satrecs[satnum].extend(tles)
+        return read_tle(file)

@@ -1,5 +1,6 @@
 import pytest
-from thistle.alpha5 import from_alpha5, to_alpha5
+
+from thistle.alpha5 import ensure_alpha5, from_alpha5, to_alpha5
 
 
 @pytest.mark.parametrize(
@@ -19,6 +20,10 @@ class TestAlpha5:
 
     def test_from_alpha5(self, objnum: int, alpha5: str) -> None:
         assert from_alpha5(alpha5) == objnum
+
+    def test_ensure_alpha5(self, objnum: int, alpha5: str) -> None:
+        assert ensure_alpha5(objnum)
+        assert ensure_alpha5(alpha5)
 
 
 @pytest.mark.parametrize("satnum", [-1, 999_999])
