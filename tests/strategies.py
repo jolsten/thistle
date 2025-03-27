@@ -4,11 +4,12 @@ import numpy as np
 from hypothesis import assume
 from hypothesis import strategies as st
 from sgp4.api import Satrec
+
 from thistle.utils import (
     DATETIME_MAX,
     DATETIME_MIN,
     datetime_to_dt64,
-    datetime_to_yy_days,
+    datetime_to_tle_epoch,
     trange,
 )
 
@@ -27,7 +28,7 @@ def satrecs(
     sat = Satrec.twoline2rv(*GENERIC_TLE)
     dt = draw(st.datetimes(min_value=min_epoch, max_value=max_epoch))
     dt = dt.replace(tzinfo=datetime.timezone.utc)
-    sat.epochyr, sat.epochdays = datetime_to_yy_days(dt)
+    sat.epochyr, sat.epochdays = datetime_to_tle_epoch(dt)
     return sat
 
 

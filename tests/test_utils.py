@@ -5,6 +5,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 from sgp4.conveniences import jday_datetime
+
 from thistle.utils import (
     DATETIME64_MAX,
     DATETIME64_MIN,
@@ -12,7 +13,7 @@ from thistle.utils import (
     DATETIME_MIN,
     TIME_SCALE,
     datetime_to_dt64,
-    datetime_to_yy_days,
+    datetime_to_tle_epoch,
     dt64_to_datetime,
     jday_datetime64,
 )
@@ -43,8 +44,8 @@ def test_convert_2(integer: int):
         (datetime.datetime(1957, 1, 1, 0, 0, 0), 57, 1.0),
     ],
 )
-def test_datetime_to_yy_days(dt: datetime.datetime, yy: int, days: float):
-    got_yy, got_days = datetime_to_yy_days(dt.replace(tzinfo=datetime.timezone.utc))
+def test_datetime_to_tle_epoch(dt: datetime.datetime, yy: int, days: float):
+    got_yy, got_days = datetime_to_tle_epoch(dt.replace(tzinfo=datetime.timezone.utc))
     assert got_yy == yy
     assert got_days == days
 

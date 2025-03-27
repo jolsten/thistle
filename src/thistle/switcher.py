@@ -14,7 +14,7 @@ from thistle.utils import (
 try:
     from itertools import pairwise
 except ImportError:
-    from thistle.utils import pairwise_recipe as pairwise
+    from thistle.utils import pairwise
 
 
 # Transition Examples

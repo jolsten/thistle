@@ -1,13 +1,13 @@
 import datetime
 import itertools
-from typing import Any, Iterable, Union
+from typing import Any, Callable, Iterable, TypeVar
 
 import numpy as np
 
-DateTime = Union[datetime.datetime, np.datetime64]
+from thistle.typing import DateTime, TLETuple
 
 
-def pairwise_recipe(iterable: Iterable) -> Iterable[tuple[Any, Any]]:
+def pairwise(iterable: Iterable) -> Iterable[tuple[Any, Any]]:
     "s -> (s0, s1), (s1, s2), (s2, s3), ..."
     a, b = itertools.tee(iterable)
     next(b, None)
@@ -35,12 +35,8 @@ def dt64_to_datetime(dt: np.datetime64) -> datetime.datetime:
     return datetime.datetime.fromisoformat(str(dt))
 
 
-def ensure_datetime64(dt: DateTime) -> np.datetime64:
-    if isinstance(dt, datetime.datetime):
-        return datetime_to_dt64(dt)
-    elif isinstance(dt, np.datetime64):
-        return dt
-    raise TypeError
+def validate_datetime64(value: DateTime) -> np.datetime64:
+    return np.datetime64(value, TIME_SCALE)
 
 
 def trange(
@@ -54,7 +50,7 @@ def trange(
     return times
 
 
-def datetime_to_yy_days(dt: datetime.datetime) -> tuple[int, float]:
+def datetime_to_tle_epoch(dt: datetime.datetime) -> tuple[int, float]:
     midnight = datetime.datetime.combine(
         dt.date(), datetime.time(0, 0, 0), tzinfo=datetime.timezone.utc
     )
@@ -74,3 +70,48 @@ def jday_datetime64(
     fr = times - jd
     jd += JDAY_1957
     return jd, fr
+
+
+def tle_epoch(tle: TLETuple) -> float:
+    """Get the epoch (float) from a TLE, adjusted for Y2K."""
+    epoch = float(tle[0][18:32].replace(" ", "0"))
+    epoch += 19_000 if epoch // 1000 >= 57 else 20_000
+    return epoch
+
+
+def tle_date(tle: TLETuple) -> str:
+    """Get the date (as str) from a TLE."""
+    epoch = tle_epoch(tle)
+    year, doy = divmod(epoch, 1000)
+    doy = doy // 1
+    dt = datetime.datetime(int(year), 1, 1) + datetime.timedelta(days=int(doy))
+    return dt.strftime("%Y%m%d")
+
+
+def tle_satnum(tle: TLETuple) -> str:
+    """Extract the (Alpha-5) Satnum from a TLE."""
+    return tle[0][2:7].replace(" ", "0")
+
+
+GroupByKey = TypeVar("GroupByKey")
+
+
+def group_by(
+    tles: list[TLETuple], key: Callable[[TLETuple], GroupByKey]
+) -> dict[GroupByKey, list[TLETuple]]:
+    """Groups input TLEs by values from a callable key."""
+    results: dict[GroupByKey, list[TLETuple]] = {}
+    for tle in tles:
+        group = key(tle)
+        if group not in results:
+            results[group] = []
+        results[group].append(tle)
+    return results
+
+
+T = TypeVar("T")
+
+
+def unique(tles: list[T]) -> list[T]:
+    """Returns input as a list list ensuring unique entries."""
+    return list(dict.fromkeys(tles).keys())

@@ -1,8 +1,6 @@
 from typing import Union
 
-Satnum = Union[str, int]
-
-ALPHA_TO_INT = {
+_A_TO_I = {
     "A": 10,
     "B": 11,
     "C": 12,
@@ -28,7 +26,7 @@ ALPHA_TO_INT = {
     "Y": 32,
     "Z": 33,
 }
-INT_TO_ALPHA = {val: key for key, val in ALPHA_TO_INT.items()}
+_I_TO_A = {val: key for key, val in _A_TO_I.items()}
 
 
 def to_alpha5(satnum: int) -> str:
@@ -41,7 +39,7 @@ def to_alpha5(satnum: int) -> str:
         return f"{satnum:05}"
 
     a, b = divmod(satnum, 10_000)
-    return f"{INT_TO_ALPHA[a]}{b:04}"
+    return f"{_I_TO_A[a]}{b:04}"
 
 
 def from_alpha5(satnum: str) -> int:
@@ -49,4 +47,12 @@ def from_alpha5(satnum: str) -> int:
     satnum = str(satnum)
     if satnum[0].isnumeric():
         return int(satnum)
-    return ALPHA_TO_INT[satnum[0]] * 10_000 + int(satnum[1:])
+    return _A_TO_I[satnum[0]] * 10_000 + int(satnum[1:])
+
+
+def ensure_alpha5(satnum: Union[int, str]) -> str:
+    if isinstance(satnum, int):
+        return to_alpha5(satnum)
+    elif isinstance(satnum, str):
+        return satnum
+    raise TypeError

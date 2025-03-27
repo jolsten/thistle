@@ -2,24 +2,9 @@ import argparse
 import pathlib
 import shutil
 import tempfile
-from typing import Iterable
 
-from benchmark import TLETuple
-from thistle.reader import PathLike, read_tle, tle_datetime, tle_satnum
-
-
-def write_tle(filename: PathLike, tle_list: Iterable[TLETuple]) -> None:
-    with open(filename, "w") as f:
-        for line1, line2 in sorted(tle_list, key=tle_datetime):
-            print(line1, file=f)
-            print(line2, file=f)
-
-
-def tle_jday(tle: TLETuple) -> float:
-    jday = float(tle[0][18:32]) + 1900
-    if jday < 1957:
-        jday += 100
-    return jday
+from thistle.io import read_tle, write_tle
+from thistle.utils import tle_epoch, tle_satnum
 
 
 def main():
@@ -41,11 +26,11 @@ def main():
     results = results.keys()
 
     results = sorted(results, key=tle_satnum)  # Sort by second attribute first
-    results = sorted(results, key=tle_jday)  # Sort by first attribute last
+    results = sorted(results, key=tle_epoch)  # Sort by first attribute last
 
-    with tempfile.TemporaryFile("w", dir=infile.parent) as outfile:
+    with tempfile.TemporaryFile("w", dir=infile.parent, delete=False) as outfile:
         write_tle(outfile, results)
-        shutil.move(outfile, infile)
+    shutil.move(outfile, infile)
 
 
 if __name__ == "__main__":

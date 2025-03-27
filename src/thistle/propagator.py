@@ -1,5 +1,4 @@
-import datetime
-from typing import Literal, Union, get_args
+from typing import Literal, get_args
 
 import numpy as np
 from sgp4.api import Satrec
@@ -10,12 +9,13 @@ from thistle.switcher import (
     SwitchingStrategy,
     TCASwitcher,
 )
-from thistle.utils import ensure_datetime64, jday_datetime64
+from thistle.typing import DateTime
+from thistle.utils import jday_datetime64, validate_datetime64
 
 try:
     from itertools import pairwise
 except ImportError:
-    from thistle.utils import pairwise_recipe as pairwise
+    from thistle.utils import pairwise
 
 
 SwitchingStrategies = Literal["epoch", "midpoint", "tca"]
@@ -58,22 +58,22 @@ class Propagator:
     ) -> None:
         self.satrecs = satrecs
 
-        match method.lower():
-            case "epoch":
-                switcher = EpochSwitcher(self.satrecs)
-            case "midpoint":
-                switcher = MidpointSwitcher(self.satrecs)
-            case "tca":
-                switcher = TCASwitcher(self.satrecs)
-            case _:
-                msg = f"Switching method {method!r} must be in {get_args(SwitchingStrategies)!r}"
-                raise ValueError(msg)
+        method = method.lower()
+        if method == "epoch":
+            switcher = EpochSwitcher(self.satrecs)
+        elif method == "midpoint":
+            switcher = MidpointSwitcher(self.satrecs)
+        elif method == "tca":
+            switcher = TCASwitcher(self.satrecs)
+        else:
+            msg = f"Switching method {method!r} must be in {get_args(SwitchingStrategies)!r}"
+            raise ValueError(msg)
 
         self.switcher = switcher
         self.switcher.compute_transitions()
 
-    def find_satrec(self, time: Union[datetime.datetime, np.datetime64]) -> Satrec:
-        time = ensure_datetime64(time)
+    def find_satrec(self, time: DateTime) -> Satrec:
+        time = validate_datetime64(time)
         indices = _slices_by_transitions(self.switcher.transitions, np.atleast_1d(time))
         idx, _ = indices[0]
         return self.satrecs[idx]
