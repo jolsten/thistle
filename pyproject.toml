@@ -1,10 +1,10 @@
 [project]
 name = "thistle"
-version = "0.1.0rc4"
+version = "0.1.0rc5"
 description = "A wrapper for sgp4 that handles TLE switching"
 readme = "README.md"
 authors = [
-    { name = "jolsten", email = "jolsten@gmail.com" }
+    { name = "Jonathan Olsten", email = "jonathan.olsten@gmail.com" }
 ]
 requires-python = ">=3.9"
 dependencies = [
