@@ -9,7 +9,7 @@ from thistle.switcher import (
     SwitchingStrategy,
     TCASwitcher,
 )
-from thistle.typing import DateTime
+from thistle.typing import DateTime, TLETuple
 from thistle.utils import jday_datetime64, validate_datetime64
 
 try:
@@ -54,9 +54,9 @@ class Propagator:
     switcher: SwitchingStrategy
 
     def __init__(
-        self, satrecs: list[Satrec], *, method: SwitchingStrategies = "epoch"
+        self, tles: list[TLETuple], *, method: SwitchingStrategies = "epoch"
     ) -> None:
-        self.satrecs = satrecs
+        self.satrecs = [Satrec.twoline2rv(a, b) for a, b in tles]
 
         method = method.lower()
         if method == "epoch":
@@ -80,7 +80,7 @@ class Propagator:
 
     def propagate(
         self, times: np.ndarray[np.datetime64]
-    ) -> tuple[np.ndarray[np.float64], np.ndarray[np.float64]]:
+    ) -> tuple[np.ndarray[np.float64], np.ndarray[np.float64], np.ndarray[np.float64]]:
         indices = _slices_by_transitions(self.switcher.transitions, times)
 
         e, r, v = [], [], []

@@ -75,7 +75,7 @@ def jday_datetime64(
 def tle_epoch(tle: TLETuple) -> float:
     """Get the epoch (float) from a TLE, adjusted for Y2K."""
     epoch = float(tle[0][18:32].replace(" ", "0"))
-    epoch += 19_000 if epoch // 1000 >= 57 else 20_000
+    epoch += 1900_000 if epoch // 1000 >= 57 else 2000_000
     return epoch
 
 
@@ -84,7 +84,7 @@ def tle_date(tle: TLETuple) -> str:
     epoch = tle_epoch(tle)
     year, doy = divmod(epoch, 1000)
     doy = doy // 1
-    dt = datetime.datetime(int(year), 1, 1) + datetime.timedelta(days=int(doy))
+    dt = datetime.datetime(int(year), 1, 1) + datetime.timedelta(days=int(doy - 1))
     return dt.strftime("%Y%m%d")
 
 

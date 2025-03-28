@@ -5,11 +5,12 @@ from hypothesis import given
 from sgp4.api import Satrec
 from sgp4.conveniences import sat_epoch_datetime
 from sgp4.exporter import export_tle
+
 from thistle.propagator import Propagator, _slices_by_transitions
 from thistle.utils import datetime_to_dt64, jday_datetime64, trange
 
 from . import strategies as cst
-from .conftest import ISS_SATRECS
+from .conftest import ISS_TLES
 
 
 @given(cst.transitions(), cst.times())
@@ -26,33 +27,32 @@ class PropagatorBaseClass:
     method: str
 
     def setup_class(self):
-        self.propagator = Propagator(ISS_SATRECS, method=self.method)
-        self.propagator.switcher.compute_transitions()
+        self.tles = ISS_TLES
+        self.propagator = Propagator(ISS_TLES, method=self.method)
 
 
 class TestPropagatorEpoch(PropagatorBaseClass):
     method: str = "epoch"
 
-    def test_find_satrec(self):
+    def test_find_satrec_by_epoch(self):
         line1 = "1 25544U 98067A   98325.45376114  .01829530  18113-2  41610-2 0  9996"
         line2 = "2 25544 051.5938 162.0926 0074012 097.3081 262.5015 15.92299093   191"
 
         exp_sat = Satrec.twoline2rv(line1, line2)
         dt = sat_epoch_datetime(exp_sat)
         sat = self.propagator.find_satrec(datetime_to_dt64(dt))
-
         assert export_tle(sat) == export_tle(exp_sat)
 
     def test_propagator(self):
         line1 = "1 25544U 98067A   98325.45376114  .01829530  18113-2  41610-2 0  9996"
         line2 = "2 25544 051.5938 162.0926 0074012 097.3081 262.5015 15.92299093   191"
 
-        sat = Satrec.twoline2rv(line1, line2)
-        dt = sat_epoch_datetime(sat)
+        exp_sat = Satrec.twoline2rv(line1, line2)
+        dt = sat_epoch_datetime(exp_sat)
         times = trange(dt, dt + datetime.timedelta(seconds=60), 10)
 
         jd, fr = jday_datetime64(times)
-        exp_e, exp_r, exp_v = sat.sgp4_array(jd, fr)
+        exp_e, exp_r, exp_v = exp_sat.sgp4_array(jd, fr)
 
         e, r, v = self.propagator.propagate(times)
 

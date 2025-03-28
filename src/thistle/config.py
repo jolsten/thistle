@@ -25,6 +25,3 @@ class Settings(BaseSettings):
 
         if not self.object.is_absolute():
             self.object = self.archive / self.object
-
-
-# settings = Settings()
