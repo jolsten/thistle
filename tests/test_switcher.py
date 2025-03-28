@@ -1,10 +1,10 @@
-from itertools import pairwise
 from typing import Type
 
 import numpy as np
 from hypothesis import given
 from sgp4.api import Satrec
 from sgp4.conveniences import sat_epoch_datetime
+
 from thistle.switcher import (
     EpochSwitcher,
     MidpointSwitcher,
@@ -14,6 +14,7 @@ from thistle.utils import (
     DATETIME64_MAX,
     DATETIME64_MIN,
     dt64_to_datetime,
+    pairwise,
 )
 
 from . import strategies as cst
