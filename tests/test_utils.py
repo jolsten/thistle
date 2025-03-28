@@ -105,8 +105,8 @@ class TestTLEFuncs:
         assert tle_date(tle) == date
 
     def test_tle_satnum(self, epoch_str: str, date: str, epoch: float, satnum: str):
-        line1 = f"1 {satnum:05}U 98067A   25077.00000000  .00020137  00000-0  16538-3 0  9993"
-        line2 = f"2 {satnum:05}  51.6335 344.7760 0007976 126.2523 325.9359 15.70406856328906"
+        line1 = f"1 {satnum:5}U 98067A   25077.00000000  .00020137  00000-0  16538-3 0  9993"
+        line2 = f"2 {satnum:5}  51.6335 344.7760 0007976 126.2523 325.9359 15.70406856328906"
         tle = (line1, line2)
         assert tle_satnum(tle) == satnum
 
