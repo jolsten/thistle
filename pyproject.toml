@@ -1,6 +1,5 @@
 [project]
 name = "thistle"
-version = "0.1.0rc5"
 description = "A wrapper for sgp4 that handles TLE switching"
 readme = "README.md"
 authors = [
@@ -13,10 +12,17 @@ dependencies = [
     "sgp4>=2.23",
     "tqdm>=4.67.1",
 ]
+dynamic = ["version"]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/thistle/_version.py"
 
 [dependency-groups]
 dev = [

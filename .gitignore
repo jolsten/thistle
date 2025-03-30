@@ -13,7 +13,5 @@ wheels/
 .pytest_cache
 .hypothesis
 
-# tle-db specific items
-.secrets.ini
-*.sqlite
-*.sqlite-journal
+# hatch-vs
+src/*/_version.py
