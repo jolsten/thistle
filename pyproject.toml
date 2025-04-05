@@ -8,6 +8,7 @@ authors = [
 requires-python = ">=3.9"
 dependencies = [
     "numpy>=1.22",
+    "platformdirs>=4.3.7",
     "pydantic-settings>=2.8.1",
     "sgp4>=2.23",
     "tqdm>=4.67.1",
