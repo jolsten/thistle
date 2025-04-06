@@ -7,6 +7,7 @@ authors = [
 ]
 requires-python = ">=3.9"
 dependencies = [
+    "click>=8.1.8",
     "numpy>=1.22",
     "platformdirs>=4.3.7",
     "pydantic-settings>=2.8.1",
