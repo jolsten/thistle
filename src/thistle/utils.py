@@ -3,6 +3,8 @@ import itertools
 from typing import Any, Callable, Iterable, TypeVar
 
 import numpy as np
+import numpy.typing as npt
+import skyfield.timelib
 
 from thistle.typing import DateTime, TLETuple
 
@@ -70,6 +72,15 @@ def jday_datetime64(
     fr = times - jd
     jd += JDAY_1957
     return jd, fr
+
+
+def time_to_dt64(time: skyfield.timelib.Time) -> npt.NDArray[np.datetime64]:
+    dt, ls = time.utc_datetime_and_leap_second()
+    dt = [
+        a.replace(tzinfo=None) + datetime.timedelta(seconds=int(b))
+        for a, b in zip(dt, ls)
+    ]
+    return np.array(dt, dtype=EPOCH_DTYPE)
 
 
 def tle_epoch(tle: TLETuple) -> float:
