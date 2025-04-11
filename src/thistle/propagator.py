@@ -1,5 +1,4 @@
 import abc
-import datetime
 from typing import Literal, get_args
 
 import numpy as np
@@ -23,6 +22,10 @@ try:
 except ImportError:
     from thistle.utils import pairwise
 
+try:
+    from datetime import UTC
+except ImportError:
+    from datetime.timezone import UTC
 
 SwitchingStrategies = Literal["epoch", "midpoint", "tca"]
 
@@ -186,7 +189,7 @@ class Propagator:
         geos = []
         for idx, slice_ in indices:
             t = self.ts.from_datetimes(
-                [dt64_to_datetime(t).replace(tzinfo=datetime.UTC) for t in dt64[slice_]]
+                [dt64_to_datetime(t).replace(tzinfo=UTC) for t in dt64[slice_]]
             )
             g = self.satellites[idx].at(t)
             geos.append(g)
