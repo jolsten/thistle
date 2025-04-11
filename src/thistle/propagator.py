@@ -1,4 +1,5 @@
 import abc
+import datetime
 from typing import Literal, get_args
 
 import numpy as np
@@ -22,10 +23,7 @@ try:
 except ImportError:
     from thistle.utils import pairwise
 
-try:
-    from datetime import UTC
-except ImportError:
-    from datetime.timezone import UTC
+UTC = datetime.timezone.utc
 
 SwitchingStrategies = Literal["epoch", "midpoint", "tca"]
 
