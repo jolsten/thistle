@@ -10,7 +10,6 @@ dependencies = [
     "click>=8.1.8",
     "numpy>=1.22",
     "platformdirs>=4.3.7",
-    "pydantic-settings>=2.8.1",
     "sgp4>=2.23",
     "skyfield>=1.53",
     "tqdm>=4.67.1",
