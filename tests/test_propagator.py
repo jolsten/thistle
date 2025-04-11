@@ -27,6 +27,8 @@ from thistle.utils import (
 from . import strategies as cst
 from .conftest import ISS_SATRECS, ISS_TLES
 
+UTC = datetime.timezone.utc
+
 np.set_printoptions(linewidth=300)
 
 
@@ -136,7 +138,7 @@ class TestPropagatorEpoch(PropagatorBaseClass):
         dt = exp_sat.epoch.utc_datetime().replace(tzinfo=None)
         sat = self.propagator.find_satellite(datetime_to_dt64(dt))
         times = trange(dt, dt + datetime.timedelta(seconds=60), 10)
-        times = [dt64_to_datetime(t).replace(tzinfo=datetime.UTC) for t in times]
+        times = [dt64_to_datetime(t).replace(tzinfo=UTC) for t in times]
         times = self.ts.from_datetimes(times)
 
         exp_geo = exp_sat.at(times)
@@ -170,7 +172,7 @@ class TestPropagatorMidpoint(PropagatorBaseClass):
 
         # Check first half of range
         times = trange(epoch_a, midpoint, step)
-        dt = [dt64_to_datetime(t).replace(tzinfo=datetime.UTC) for t in times]
+        dt = [dt64_to_datetime(t).replace(tzinfo=UTC) for t in times]
         tt = self.ts.from_datetimes(dt)
 
         geo = self.propagator.at(tt)
@@ -189,7 +191,7 @@ class TestPropagatorMidpoint(PropagatorBaseClass):
 
         # Check second half of range
         times = trange(midpoint, epoch_b, step)
-        dt = [dt64_to_datetime(t).replace(tzinfo=datetime.UTC) for t in times]
+        dt = [dt64_to_datetime(t).replace(tzinfo=UTC) for t in times]
         tt = self.ts.from_datetimes(dt)
 
         geo = self.propagator.at(tt)
