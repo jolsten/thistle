@@ -121,6 +121,24 @@ class PropagatorBaseClass:
 class TestPropagatorEpoch(PropagatorBaseClass):
     method: str = "epoch"
 
+    def test_at_single_time(self):
+        line1 = "1 25544U 98067A   98325.45376114  .01829530  18113-2  41610-2 0  9996"
+        line2 = "2 25544 051.5938 162.0926 0074012 097.3081 262.5015 15.92299093   191"
+
+        exp_sat = EarthSatellite(line1, line2)
+        dt = exp_sat.epoch.utc_datetime().replace(tzinfo=None)
+        t = self.ts.from_datetimes([dt.replace(tzinfo=UTC)])
+
+        geo = self.propagator.at(t)
+        exp_geo = exp_sat.at(t)
+
+        assert geo.position.au.flatten().tolist() == pytest.approx(
+            exp_geo.position.au.flatten().tolist()
+        )
+        assert geo.velocity.au_per_d.flatten().tolist() == pytest.approx(
+            exp_geo.velocity.au_per_d.flatten().tolist()
+        )
+
     def test_find_satrec_by_epoch(self):
         line1 = "1 25544U 98067A   98325.45376114  .01829530  18113-2  41610-2 0  9996"
         line2 = "2 25544 051.5938 162.0926 0074012 097.3081 262.5015 15.92299093   191"

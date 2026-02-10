@@ -30,9 +30,22 @@ _I_TO_A = {val: key for key, val in _A_TO_I.items()}
 
 
 def to_alpha5(satnum: int) -> str:
-    """Encode an integer to an Alpha-5 string."""
+    """Encode an integer satellite number to an Alpha-5 string.
+
+    Numbers 0-99,999 are zero-padded to 5 digits. Numbers 100,000-339,999
+    use a letter prefix (A-Z, skipping I and O) followed by 4 digits.
+
+    Args:
+        satnum: Satellite catalog number (0 to 339,999).
+
+    Returns:
+        A 5-character Alpha-5 encoded string.
+
+    Raises:
+        ValueError: If satnum is outside the valid range.
+    """
     if satnum < 0 or satnum > 339_999:
-        msg = "Alpha-5 satnum must be >= 0 and < 334,000 (encoded as Z9999)"
+        msg = "Alpha-5 satnum must be >= 0 and <= 333,999 (encoded as Z9999)"
         raise ValueError(msg)
 
     if satnum < 100_000:
@@ -43,7 +56,14 @@ def to_alpha5(satnum: int) -> str:
 
 
 def from_alpha5(satnum: str) -> int:
-    """Decode an Alpha-5 string to an integer."""
+    """Decode an Alpha-5 string to an integer satellite number.
+
+    Args:
+        satnum: A 5-character Alpha-5 encoded string.
+
+    Returns:
+        The decoded integer satellite catalog number.
+    """
     satnum = str(satnum)
     if satnum[0].isnumeric():
         return int(satnum)
@@ -51,6 +71,20 @@ def from_alpha5(satnum: str) -> int:
 
 
 def ensure_alpha5(satnum: Union[int, str]) -> str:
+    """Ensure a satellite number is in Alpha-5 string format.
+
+    If the input is an integer it is encoded; if it is already a string
+    it is returned as-is.
+
+    Args:
+        satnum: An integer or string satellite number.
+
+    Returns:
+        The Alpha-5 encoded string.
+
+    Raises:
+        TypeError: If satnum is neither an int nor a str.
+    """
     if isinstance(satnum, int):
         return to_alpha5(satnum)
     elif isinstance(satnum, str):
