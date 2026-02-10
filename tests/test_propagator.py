@@ -2,6 +2,7 @@ import datetime
 from typing import Type
 
 import numpy as np
+import numpy.typing as npt
 import pytest
 from hypothesis import given
 from sgp4.api import Satrec
@@ -13,6 +14,8 @@ from thistle.propagator import (
     MidpointSwitchStrategy,
     Propagator,
     SwitchingStrategy,
+    TCASwitchStrategy,
+    _find_tca,
     _slices_by_transitions,
 )
 from thistle.utils import (
@@ -34,7 +37,7 @@ np.set_printoptions(linewidth=300)
 
 @given(cst.transitions(), cst.times())
 def test_slices(
-    transitions: np.ndarray[np.datetime64], times: np.ndarray[np.datetime64]
+    transitions: npt.NDArray[np.datetime64], times: npt.NDArray[np.datetime64]
 ):
     slices = _slices_by_transitions(transitions, times)
     for idx, slc_ in slices:
@@ -225,3 +228,146 @@ class TestPropagatorMidpoint(PropagatorBaseClass):
             exp_geo.velocity.au_per_d.flatten().tolist()
         )
         assert geo.t.tt.flatten().tolist() == exp_geo.t.tt.flatten().tolist()
+
+
+class TestFindTCA:
+    def setup_class(self):
+        self.ts = load.timescale()
+
+    def test_tca_between_epochs(self):
+        """TCA should fall between the two satellite epochs."""
+        a1 = "1 25544U 98067A   98325.45376114  .01829530  18113-2  41610-2 0  9996"
+        a2 = "2 25544 051.5938 162.0926 0074012 097.3081 262.5015 15.92299093   191"
+        b1 = "1 25544U 98067A   98325.51671211  .01832406  18178-2  41610-2 0  9996"
+        b2 = "2 25544 051.5928 161.7497 0074408 097.6565 263.2450 15.92278419   200"
+
+        sat_a = EarthSatellite(a1, a2, ts=self.ts)
+        sat_b = EarthSatellite(b1, b2, ts=self.ts)
+        epoch_a = sat_a.epoch.utc_datetime().replace(tzinfo=None)
+        epoch_b = sat_b.epoch.utc_datetime().replace(tzinfo=None)
+
+        tca = _find_tca(sat_a, sat_b, self.ts)
+
+        assert epoch_a <= tca
+        assert tca <= epoch_b
+
+    def test_tca_identical_epochs(self):
+        """When epochs are identical, TCA should return the epoch itself."""
+        a1 = "1 25544U 98067A   98325.45376114  .01829530  18113-2  41610-2 0  9996"
+        a2 = "2 25544 051.5938 162.0926 0074012 097.3081 262.5015 15.92299093   191"
+
+        sat_a = EarthSatellite(a1, a2, ts=self.ts)
+        sat_b = EarthSatellite(a1, a2, ts=self.ts)
+        epoch_a = sat_a.epoch.utc_datetime().replace(tzinfo=None)
+
+        tca = _find_tca(sat_a, sat_b, self.ts)
+
+        # Allow for floating-point precision (within 1 millisecond)
+        assert abs((tca - epoch_a).total_seconds()) < 0.001
+
+    def test_tca_is_near_minimum_distance(self):
+        """Distance at TCA should be less than or equal to distance at endpoints."""
+        a1 = "1 25544U 98067A   98325.45376114  .01829530  18113-2  41610-2 0  9996"
+        a2 = "2 25544 051.5938 162.0926 0074012 097.3081 262.5015 15.92299093   191"
+        b1 = "1 25544U 98067A   98325.51671211  .01832406  18178-2  41610-2 0  9996"
+        b2 = "2 25544 051.5928 161.7497 0074408 097.6565 263.2450 15.92278419   200"
+
+        sat_a = EarthSatellite(a1, a2, ts=self.ts)
+        sat_b = EarthSatellite(b1, b2, ts=self.ts)
+        epoch_a = sat_a.epoch.utc_datetime().replace(tzinfo=None)
+        epoch_b = sat_b.epoch.utc_datetime().replace(tzinfo=None)
+
+        tca = _find_tca(sat_a, sat_b, self.ts)
+
+        def distance_at(dt):
+            t = self.ts.from_datetimes([dt.replace(tzinfo=UTC)])
+            ga = sat_a.at(t)
+            gb = sat_b.at(t)
+            diff = ga.xyz.au - gb.xyz.au
+            return float(np.sqrt(np.sum(diff**2)))
+
+        d_tca = distance_at(tca)
+        d_a = distance_at(epoch_a)
+        d_b = distance_at(epoch_b)
+
+        assert d_tca <= d_a
+        assert d_tca <= d_b
+
+
+class TestTCASwitchStrategy(SwitchStrategyBasic):
+    class_ = TCASwitchStrategy
+
+    def setup_class(self):
+        self.ts = load.timescale()
+        self.switcher = self.class_(
+            [EarthSatellite.from_satrec(satrec, self.ts) for satrec in ISS_SATRECS[:20]],
+            ts=self.ts,
+        )
+        self.switcher.compute_transitions()
+
+    def test_switcher_transition_count(self):
+        # One transition per satrec, plus one after
+        assert len(self.switcher.transitions) == 20 + 1
+
+    def test_transitions_between_epochs(self):
+        """Each TCA transition should fall between the neighboring epochs."""
+        tolerance = datetime.timedelta(microseconds=10)
+        for idx, bounds in enumerate(pairwise(self.switcher.transitions)):
+            time_a, time_b = [dt64_to_datetime(t) for t in bounds]
+            epoch = (
+                self.switcher.satellites[idx]
+                .epoch.utc_datetime()
+                .replace(tzinfo=None)
+            )
+            # Allow small tolerance for floating-point precision
+            assert time_a <= epoch + tolerance
+            assert epoch <= time_b + tolerance
+
+    def test_transitions_differ_from_midpoint(self):
+        """TCA transitions should not exactly equal midpoint transitions."""
+        midpoint_switcher = MidpointSwitchStrategy(
+            [EarthSatellite.from_satrec(satrec, self.ts) for satrec in ISS_SATRECS[:20]]
+        )
+        midpoint_switcher.compute_transitions()
+
+        inner_tca = self.switcher.transitions[1:-1]
+        inner_mid = midpoint_switcher.transitions[1:-1]
+        assert not np.array_equal(inner_tca, inner_mid)
+
+
+class TestPropagatorTCA(PropagatorBaseClass):
+    method: str = "tca"
+
+    def setup_class(self):
+        self.ts = load.timescale()
+        self.tles = ISS_TLES[:20]
+        self.propagator = Propagator(self.tles, method="tca")
+
+    def test_at_single_time(self):
+        """Position at a known TLE epoch should match that TLE's prediction."""
+        line1 = "1 25544U 98067A   98325.45376114  .01829530  18113-2  41610-2 0  9996"
+        line2 = "2 25544 051.5938 162.0926 0074012 097.3081 262.5015 15.92299093   191"
+
+        exp_sat = EarthSatellite(line1, line2)
+        dt = exp_sat.epoch.utc_datetime().replace(tzinfo=None)
+        t = self.ts.from_datetimes([dt.replace(tzinfo=UTC)])
+
+        geo = self.propagator.at(t)
+        exp_geo = exp_sat.at(t)
+
+        assert geo.position.au.flatten().tolist() == pytest.approx(
+            exp_geo.position.au.flatten().tolist()
+        )
+        assert geo.velocity.au_per_d.flatten().tolist() == pytest.approx(
+            exp_geo.velocity.au_per_d.flatten().tolist()
+        )
+
+    def test_find_satellite_at_epoch(self):
+        """find_satellite at a TLE epoch should return that TLE's satellite."""
+        line1 = "1 25544U 98067A   98325.45376114  .01829530  18113-2  41610-2 0  9996"
+        line2 = "2 25544 051.5938 162.0926 0074012 097.3081 262.5015 15.92299093   191"
+
+        exp_sat = EarthSatellite(line1, line2)
+        dt = exp_sat.epoch.utc_datetime().replace(tzinfo=None)
+        sat = self.propagator.find_satellite(datetime_to_dt64(dt))
+        assert export_tle(sat.model) == export_tle(exp_sat.model)

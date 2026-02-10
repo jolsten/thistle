@@ -1,6 +1,6 @@
 import abc
 import datetime
-from typing import Literal, get_args
+from typing import Literal, Union, get_args
 
 import numpy as np
 import numpy.typing as npt
@@ -61,7 +61,7 @@ class SwitchingStrategy(abc.ABC):
     """
 
     satellites: list[EarthSatellite]
-    transitions: np.ndarray
+    transitions: npt.NDArray[np.datetime64]
 
     def __init__(
         self,
@@ -115,15 +115,97 @@ class MidpointSwitchStrategy(SwitchingStrategy):
         self.transitions = np.array(transitions, dtype=EPOCH_DTYPE)
 
 
+def _find_tca(
+    sat_a: EarthSatellite,
+    sat_b: EarthSatellite,
+    ts: Timescale,
+    n_coarse: int = 100,
+    n_fine: int = 50,
+) -> datetime.datetime:
+    """Find the Time of Closest Approach between two satellite TLEs.
+
+    Uses a two-pass grid search over Julian dates: a coarse sweep across
+    the full epoch window followed by a finer sweep around the coarse
+    minimum. All time arithmetic is done in numpy with TT Julian dates
+    to avoid creating Python datetime objects.
+
+    Args:
+        sat_a: The earlier satellite (by epoch).
+        sat_b: The later satellite (by epoch).
+        ts: Skyfield Timescale for building Time objects.
+        n_coarse: Number of grid points for the coarse search.
+        n_fine: Number of grid points for the refinement search.
+
+    Returns:
+        The datetime (timezone-naive, UTC) of closest approach.
+    """
+    tt_a = sat_a.epoch.tt
+    tt_b = sat_b.epoch.tt
+    delta_days = tt_b - tt_a
+
+    if delta_days < 1.0 / 86400.0:  # less than 1 second apart
+        mid_tt = (tt_a + tt_b) / 2.0
+        return ts.tt_jd(mid_tt).utc_datetime().replace(tzinfo=None)
+
+    # Coarse grid search — pure numpy, no datetime objects
+    coarse_tt = np.linspace(tt_a, tt_b, n_coarse)
+    coarse_times = ts.tt_jd(coarse_tt)
+    diff = sat_a.at(coarse_times).xyz.au - sat_b.at(coarse_times).xyz.au
+    dist_sq = np.sum(diff**2, axis=0)
+    ci = int(np.argmin(dist_sq))
+
+    # Fine grid refinement around the coarse minimum
+    step = delta_days / (n_coarse - 1)
+    fine_tt = np.linspace(
+        max(tt_a, coarse_tt[ci] - step),
+        min(tt_b, coarse_tt[ci] + step),
+        n_fine,
+    )
+    fine_times = ts.tt_jd(fine_tt)
+    diff = sat_a.at(fine_times).xyz.au - sat_b.at(fine_times).xyz.au
+    dist_sq = np.sum(diff**2, axis=0)
+    fi = int(np.argmin(dist_sq))
+
+    return ts.tt_jd(fine_tt[fi]).utc_datetime().replace(tzinfo=None)
+
+
 class TCASwitchStrategy(SwitchingStrategy):
     """Switching based on the time of closest approach for neighboring TLEs.
 
-    This TLE switching method attempts to determine the time of closest approach
-    for each pair of neighboring TLEs and use those times as the transitions.
+    This TLE switching method attempts to determine the time of closest
+    approach for each pair of neighboring TLEs and use those times as the
+    transitions.
+
+    Attributes:
+        ts: Skyfield Timescale used for time conversions during TCA search.
+        n_coarse: Number of grid points for the coarse TCA search.
+        n_fine: Number of grid points for the fine TCA refinement.
     """
 
+    def __init__(
+        self,
+        satellites: list[EarthSatellite],
+        ts: Timescale,
+        n_coarse: int = 100,
+        n_fine: int = 50,
+    ) -> None:
+        super().__init__(satellites)
+        self.ts = ts
+        self.n_coarse = n_coarse
+        self.n_fine = n_fine
+
     def compute_transitions(self) -> None:
-        raise NotImplementedError("TCA switching is not yet implemented")
+        transitions = []
+        for sat_a, sat_b in pairwise(self.satellites):
+            tca = _find_tca(
+                sat_a, sat_b, self.ts,
+                n_coarse=self.n_coarse,
+                n_fine=self.n_fine,
+            )
+            transitions.append(datetime_to_dt64(tca))
+
+        transitions = [DATETIME_MIN] + transitions + [DATETIME_MAX]
+        self.transitions = np.array(transitions, dtype=EPOCH_DTYPE)
 
 
 def _slices_by_transitions(
@@ -204,7 +286,12 @@ class Propagator:
     ts: Timescale
 
     def __init__(
-        self, tles: list[TLETuple], *, method: SwitchingStrategies = "epoch"
+        self,
+        tles: list[TLETuple],
+        *,
+        method: SwitchingStrategies = "epoch",
+        start: Union[datetime.datetime, None] = None,
+        stop: Union[datetime.datetime, None] = None,
     ) -> None:
         """Initialize the propagator.
 
@@ -212,12 +299,35 @@ class Propagator:
             tles: List of (line1, line2) TLE tuples for a single satellite.
             method: TLE switching strategy. One of ``"epoch"``,
                 ``"midpoint"``, or ``"tca"``.
+            start: Optional start time to filter TLEs. Only TLEs relevant
+                to this time range will be kept.
+            stop: Optional stop time to filter TLEs. Only TLEs relevant
+                to this time range will be kept.
 
         Raises:
             ValueError: If method is not a valid switching strategy.
         """
         self.ts = load.timescale()
         self.satellites = [EarthSatellite(a, b, ts=self.ts) for a, b in tles]
+        self.satellites.sort(key=lambda s: s.epoch.tt)
+
+        # Filter satellites to time range if specified
+        if start is not None or stop is not None:
+            epochs = np.array([s.epoch.tt for s in self.satellites])
+            lo = 0
+            hi = len(self.satellites)
+
+            if start is not None:
+                start_tt = self.ts.from_datetime(start.replace(tzinfo=UTC)).tt
+                # Keep one satellite before start for boundary coverage
+                lo = max(0, int(np.searchsorted(epochs, start_tt)) - 1)
+
+            if stop is not None:
+                stop_tt = self.ts.from_datetime(stop.replace(tzinfo=UTC)).tt
+                # Keep one satellite after stop for boundary coverage
+                hi = min(hi, int(np.searchsorted(epochs, stop_tt)) + 1)
+
+            self.satellites = self.satellites[lo:hi]
 
         strategy = method.lower()
         switcher: SwitchingStrategy
@@ -226,7 +336,7 @@ class Propagator:
         elif strategy == "midpoint":
             switcher = MidpointSwitchStrategy(self.satellites)
         elif strategy == "tca":
-            switcher = TCASwitchStrategy(self.satellites)
+            switcher = TCASwitchStrategy(self.satellites, ts=self.ts)
         else:
             msg = f"Switching method {strategy!r} must be in {get_args(SwitchingStrategies)!r}"
             raise ValueError(msg)

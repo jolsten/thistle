@@ -31,3 +31,31 @@ dev = [
     "hypothesis>=6.124.2",
     "pytest>=8.3.4",
 ]
+
+[tool.pyright]
+# Suppress type errors from third-party libraries without complete type stubs
+reportAttributeAccessIssue = "none"
+reportOperatorIssue = "none"
+reportOptionalMemberAccess = "none"
+
+# Only apply to third-party modules
+[[tool.pyright.executionEnvironments]]
+root = "."
+include = ["src", "tests"]
+reportMissingTypeStubs = false
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+# Per-module options for third-party libraries
+[[tool.mypy.overrides]]
+module = [
+    "skyfield.*",
+    "sgp4.*",
+]
+ignore_missing_imports = true
+ignore_errors = true

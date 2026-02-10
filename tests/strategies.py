@@ -1,6 +1,7 @@
 import datetime
 
 import numpy as np
+import numpy.typing as npt
 from hypothesis import assume
 from hypothesis import strategies as st
 from sgp4.api import Satrec
@@ -73,7 +74,7 @@ def datetime_bounds(
 
 
 @st.composite
-def times(draw, min_size: int = 1, max_size: int = 10) -> np.ndarray[np.datetime64]:
+def times(draw, min_size: int = 1, max_size: int = 10) -> npt.NDArray[np.datetime64]:
     t0, t1 = draw(datetime_bounds())
     size = draw(st.integers(min_value=min_size, max_value=max_size))
     step = (t1 - t0).total_seconds() / size
@@ -88,7 +89,7 @@ def transitions(
     max_value: datetime.datetime = DATETIME_MAX,
     min_count: int = 1,
     max_count: int = 3,
-) -> np.ndarray[np.datetime64]:
+) -> npt.NDArray[np.datetime64]:
     t0, t1 = draw(datetime_bounds(min_value=min_value, max_value=max_value))
     transitions = draw(
         st.lists(
