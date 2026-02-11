@@ -119,8 +119,8 @@ def _find_tca(
     sat_a: EarthSatellite,
     sat_b: EarthSatellite,
     ts: Timescale,
-    n_coarse: int = 100,
-    n_fine: int = 50,
+    coarse_step: float = 60.0,
+    fine_step: float = 5.0,
 ) -> datetime.datetime:
     """Find the Time of Closest Approach between two satellite TLEs.
 
@@ -133,8 +133,8 @@ def _find_tca(
         sat_a: The earlier satellite (by epoch).
         sat_b: The later satellite (by epoch).
         ts: Skyfield Timescale for building Time objects.
-        n_coarse: Number of grid points for the coarse search.
-        n_fine: Number of grid points for the refinement search.
+        coarse_step: Time step in seconds for the coarse search grid.
+        fine_step: Time step in seconds for the refinement search grid.
 
     Returns:
         The datetime (timezone-naive, UTC) of closest approach.
@@ -142,12 +142,14 @@ def _find_tca(
     tt_a = sat_a.epoch.tt
     tt_b = sat_b.epoch.tt
     delta_days = tt_b - tt_a
+    delta_seconds = delta_days * 86400.0
 
-    if delta_days < 1.0 / 86400.0:  # less than 1 second apart
+    if delta_seconds < 1.0:  # less than 1 second apart
         mid_tt = (tt_a + tt_b) / 2.0
         return ts.tt_jd(mid_tt).utc_datetime().replace(tzinfo=None)
 
-    # Coarse grid search — pure numpy, no datetime objects
+    # Coarse grid search — use fixed time step
+    n_coarse = max(2, int(delta_seconds / coarse_step) + 1)
     coarse_tt = np.linspace(tt_a, tt_b, n_coarse)
     coarse_times = ts.tt_jd(coarse_tt)
     diff = sat_a.at(coarse_times).xyz.au - sat_b.at(coarse_times).xyz.au
@@ -155,12 +157,14 @@ def _find_tca(
     ci = int(np.argmin(dist_sq))
 
     # Fine grid refinement around the coarse minimum
-    step = delta_days / (n_coarse - 1)
-    fine_tt = np.linspace(
-        max(tt_a, coarse_tt[ci] - step),
-        min(tt_b, coarse_tt[ci] + step),
-        n_fine,
-    )
+    # Refine over +/- one coarse step centered on the minimum
+    coarse_step_jd = coarse_step / 86400.0
+    fine_start = max(tt_a, coarse_tt[ci] - coarse_step_jd)
+    fine_end = min(tt_b, coarse_tt[ci] + coarse_step_jd)
+    fine_window_seconds = (fine_end - fine_start) * 86400.0
+    n_fine = max(2, int(fine_window_seconds / fine_step) + 1)
+
+    fine_tt = np.linspace(fine_start, fine_end, n_fine)
     fine_times = ts.tt_jd(fine_tt)
     diff = sat_a.at(fine_times).xyz.au - sat_b.at(fine_times).xyz.au
     dist_sq = np.sum(diff**2, axis=0)
@@ -178,29 +182,29 @@ class TCASwitchStrategy(SwitchingStrategy):
 
     Attributes:
         ts: Skyfield Timescale used for time conversions during TCA search.
-        n_coarse: Number of grid points for the coarse TCA search.
-        n_fine: Number of grid points for the fine TCA refinement.
+        coarse_step: Time step in seconds for the coarse TCA search.
+        fine_step: Time step in seconds for the fine TCA refinement.
     """
 
     def __init__(
         self,
         satellites: list[EarthSatellite],
         ts: Timescale,
-        n_coarse: int = 100,
-        n_fine: int = 50,
+        coarse_step: float = 60.0,
+        fine_step: float = 5.0,
     ) -> None:
         super().__init__(satellites)
         self.ts = ts
-        self.n_coarse = n_coarse
-        self.n_fine = n_fine
+        self.coarse_step = coarse_step
+        self.fine_step = fine_step
 
     def compute_transitions(self) -> None:
         transitions = []
         for sat_a, sat_b in pairwise(self.satellites):
             tca = _find_tca(
                 sat_a, sat_b, self.ts,
-                n_coarse=self.n_coarse,
-                n_fine=self.n_fine,
+                coarse_step=self.coarse_step,
+                fine_step=self.fine_step,
             )
             transitions.append(datetime_to_dt64(tca))
 
@@ -262,9 +266,9 @@ def merge_geos(geos: list[Geocentric], ts: Timescale) -> Geocentric:
     """
     center = geos[0].center
     target = geos[0].target
-    pos = Distance(au=np.concatenate([g.xyz.au for g in geos], axis=1))
-    vel = Velocity(au_per_d=np.concatenate([g.velocity.au_per_d for g in geos], axis=1))
-    times = Time(ts=ts, tt=np.concatenate([g.t.tt for g in geos]))
+    pos = Distance(au=np.concatenate([g.xyz.au for g in geos], axis=1))  # type: ignore[call-overload]
+    vel = Velocity(au_per_d=np.concatenate([g.velocity.au_per_d for g in geos], axis=1))  # type: ignore[call-overload]
+    times = Time(ts=ts, tt=np.concatenate([g.t.tt for g in geos]))  # type: ignore[call-overload]
     return Geocentric(pos.au, vel.au_per_d, times, center, target)
 
 
