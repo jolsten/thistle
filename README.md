@@ -37,7 +37,26 @@ geo = prop.at(times)
 |---|---|
 | `"epoch"` | Uses the most recent TLE at or before the target time (conservative) |
 | `"midpoint"` | Uses the nearest TLE by epoch; transitions at midpoints between consecutive epochs |
-| `"tca"` | Time of closest approach between neighboring TLEs (not yet implemented) |
+| `"tca"` | Transitions at the time of closest approach between neighboring TLEs |
+
+## Lookup Methods
+
+You can look up the active TLE for any point in time:
+
+```python
+import numpy as np
+
+time = np.datetime64("2024-01-15T12:00:00")
+
+# Get the EarthSatellite (skyfield)
+satellite = prop.find_satellite(time)
+
+# Get the Satrec (sgp4)
+satrec = prop.find_satrec(time)
+
+# Get the TLE lines as a (line1, line2) tuple
+tle = prop.find_tle(time)
+```
 
 ## Requirements
 
