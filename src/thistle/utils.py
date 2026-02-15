@@ -2,13 +2,42 @@
 
 import datetime
 import itertools
-from typing import Any, Callable, Iterable, TypeVar
+from typing import Any, Callable, Iterable, Sequence, TypeVar, Union, cast
 
 import numpy as np
 import numpy.typing as npt
 import skyfield.timelib
 
-from thistle.typing import DateTime, TLETuple
+from thistle.typing import DateTime, PathLike, TLETuple
+
+
+def read_tle(
+    file: PathLike,
+) -> list[TLETuple]:
+    """Read a single TLE file.
+
+    Parses a file containing Two-Line Element sets, extracting line 1/line 2
+    pairs based on the leading character of each line.
+
+    Args:
+        file: Path to the TLE file.
+
+    Returns:
+        A list of (line1, line2) tuples for each TLE in the file.
+    """
+    results: list[TLETuple] = []
+    with open(file, "r") as f:
+        line1 = None
+        for line in f:
+            line = line.rstrip()
+            if not line:
+                continue
+            if line[0] == "1":
+                line1 = line
+            elif line[0] == "2" and line1 is not None:
+                results.append((line1, line))
+                line1 = None
+    return results
 
 
 def pairwise(iterable: Iterable) -> Iterable[tuple[Any, Any]]:
@@ -85,8 +114,16 @@ def validate_datetime64(value: DateTime) -> np.datetime64:
 
     Returns:
         A numpy datetime64 with microsecond resolution.
+
+    Raises:
+        TypeError: If value is not a datetime or datetime64.
     """
-    return np.datetime64(value, TIME_SCALE)
+    if isinstance(value, datetime.datetime):
+        value = value.replace(tzinfo=None)
+        return np.datetime64(value, TIME_SCALE)
+    if isinstance(value, np.datetime64):
+        return value.astype(f"datetime64[{TIME_SCALE}]")
+    raise TypeError(f"Expected datetime or datetime64, got {type(value).__name__}")
 
 
 def trange(
@@ -159,10 +196,13 @@ def time_to_dt64(time: skyfield.timelib.Time) -> npt.NDArray[np.datetime64]:
     Returns:
         An array of datetime64 values with microsecond resolution.
     """
-    dt, ls = time.utc_datetime_and_leap_second()
+    dt_arr, ls_arr = time.utc_datetime_and_leap_second()
     dt = [
         a.replace(tzinfo=None) + datetime.timedelta(seconds=int(b))
-        for a, b in zip(dt, ls)
+        for a, b in zip(
+            cast(Sequence[datetime.datetime], dt_arr),
+            cast(Sequence[float], ls_arr),
+        )
     ]
     return np.array(dt, dtype=EPOCH_DTYPE)
 
@@ -249,3 +289,99 @@ def unique(tles: Iterable[T]) -> list[T]:
         A list with duplicates removed, in first-seen order.
     """
     return list(dict.fromkeys(tles).keys())
+
+
+# ---------------------------------------------------------------------------
+# Alpha-5 satellite catalog number encoding/decoding
+# ---------------------------------------------------------------------------
+
+_A_TO_I = {
+    "A": 10,
+    "B": 11,
+    "C": 12,
+    "D": 13,
+    "E": 14,
+    "F": 15,
+    "G": 16,
+    "H": 17,
+    "J": 18,
+    "K": 19,
+    "L": 20,
+    "M": 21,
+    "N": 22,
+    "P": 23,
+    "Q": 24,
+    "R": 25,
+    "S": 26,
+    "T": 27,
+    "U": 28,
+    "V": 29,
+    "W": 30,
+    "X": 31,
+    "Y": 32,
+    "Z": 33,
+}
+_I_TO_A = {val: key for key, val in _A_TO_I.items()}
+
+
+def to_alpha5(satnum: int) -> str:
+    """Encode an integer satellite number to an Alpha-5 string.
+
+    Numbers 0-99,999 are zero-padded to 5 digits. Numbers 100,000-339,999
+    use a letter prefix (A-Z, skipping I and O) followed by 4 digits.
+
+    Args:
+        satnum: Satellite catalog number (0 to 339,999).
+
+    Returns:
+        A 5-character Alpha-5 encoded string.
+
+    Raises:
+        ValueError: If satnum is outside the valid range.
+    """
+    if satnum < 0 or satnum > 339_999:
+        msg = "Alpha-5 satnum must be >= 0 and <= 333,999 (encoded as Z9999)"
+        raise ValueError(msg)
+
+    if satnum < 100_000:
+        return f"{satnum:05}"
+
+    a, b = divmod(satnum, 10_000)
+    return f"{_I_TO_A[a]}{b:04}"
+
+
+def from_alpha5(satnum: str) -> int:
+    """Decode an Alpha-5 string to an integer satellite number.
+
+    Args:
+        satnum: A 5-character Alpha-5 encoded string.
+
+    Returns:
+        The decoded integer satellite catalog number.
+    """
+    satnum = str(satnum)
+    if satnum[0].isnumeric():
+        return int(satnum)
+    return _A_TO_I[satnum[0]] * 10_000 + int(satnum[1:])
+
+
+def ensure_alpha5(satnum: Union[int, str]) -> str:
+    """Ensure a satellite number is in Alpha-5 string format.
+
+    If the input is an integer it is encoded; if it is already a string
+    it is returned as-is.
+
+    Args:
+        satnum: An integer or string satellite number.
+
+    Returns:
+        The Alpha-5 encoded string.
+
+    Raises:
+        TypeError: If satnum is neither an int nor a str.
+    """
+    if isinstance(satnum, int):
+        return to_alpha5(satnum)
+    elif isinstance(satnum, str):
+        return satnum
+    raise TypeError
