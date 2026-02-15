@@ -5,6 +5,7 @@ magnetic field in nanoTesla, and local solar time in fractional hours.
 """
 
 import datetime
+import pathlib
 from typing import Dict, Optional, Sequence, cast
 
 import numpy as np
@@ -22,8 +23,10 @@ AU_PER_DAY_TO_M_PER_S = AU_TO_M / 86400.0
 R_EARTH_KM = 6371.0
 R_SUN_KM = 696340.0
 
+_DATA_DIR = pathlib.Path(__file__).parent / "data"
+
 ts = load.timescale()
-eph = load("de421.bsp")
+eph = load(str(_DATA_DIR / "de421.bsp"))
 
 GenerateResult = Dict[str, npt.NDArray]
 
@@ -270,7 +273,7 @@ def generate_local_solar_time(
 
     lon_deg = cast(npt.NDArray, wgs84.subpoint(geocentric).longitude.degrees)
     gmst = cast(npt.NDArray, t.gmst)
-    sun_ra_hours = cast(npt.NDArray, (eph["sun"] - eph["earth"]).at(t).apparent().radec()[0].hours)
+    sun_ra_hours = cast(npt.NDArray, eph["earth"].at(t).observe(eph["sun"]).apparent().radec()[0].hours)
 
     lst_hours = gmst + lon_deg / 15.0
     local_solar_time = (lst_hours - sun_ra_hours + 12.0) % 24.0
