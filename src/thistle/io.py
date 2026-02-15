@@ -1,3 +1,5 @@
+"""Read and write Two-Line Element (TLE) files, with concurrent I/O support."""
+
 import concurrent.futures
 import pathlib
 from typing import Iterable

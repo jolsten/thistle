@@ -1,3 +1,5 @@
+"""Utility functions for time conversion, TLE parsing, and collection helpers."""
+
 import datetime
 import itertools
 from typing import Any, Callable, Iterable, TypeVar
@@ -26,15 +28,28 @@ def pairwise(iterable: Iterable) -> Iterable[tuple[Any, Any]]:
 
 
 TIME_SCALE = "us"
+"""Numpy time resolution used throughout the package (microseconds)."""
+
 EPOCH_DTYPE = np.dtype(f"datetime64[{TIME_SCALE}]")
+"""Numpy dtype for datetime64 values at :data:`TIME_SCALE` resolution."""
+
 ONE_SECOND_IN_TIME_SCALE = np.timedelta64(1, "s").astype(f"timedelta64[{TIME_SCALE}]")
+"""One second expressed as a timedelta64 at :data:`TIME_SCALE` resolution."""
 
 DATETIME_MIN = datetime.datetime(1957, 1, 1)
+"""Earliest representable datetime (start of the space age)."""
+
 DATETIME_MAX = datetime.datetime(2056, 12, 31, 23, 59, 59, 999999)
+"""Latest representable datetime (end of the TLE two-digit year range)."""
+
 DATETIME64_MIN = np.datetime64(DATETIME_MIN, TIME_SCALE)
+"""Earliest representable datetime as a datetime64."""
+
 DATETIME64_MAX = np.datetime64(DATETIME_MAX, TIME_SCALE)
+"""Latest representable datetime as a datetime64."""
 
 JDAY_1957 = 2435839.5
+"""Julian date of 1957-01-01 00:00:00 UTC."""
 
 
 def datetime_to_dt64(dt: datetime.datetime) -> np.datetime64:

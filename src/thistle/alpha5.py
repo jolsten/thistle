@@ -1,3 +1,10 @@
+"""Alpha-5 satellite catalog number encoding and decoding.
+
+The Alpha-5 scheme extends the traditional 5-digit NORAD catalog number
+format to support numbers up to 339,999 by replacing the leading digit
+with a letter (A-Z, skipping I and O) for values above 99,999.
+"""
+
 from typing import Union
 
 _A_TO_I = {

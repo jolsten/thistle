@@ -1,3 +1,10 @@
+"""Satellite orbit propagation with automatic TLE switching.
+
+Provides a :class:`Propagator` that manages multiple TLEs for a satellite and
+selects the most appropriate one at each propagation time using a configurable
+:class:`SwitchingStrategy`.
+"""
+
 import abc
 import datetime
 from typing import Literal, Union, get_args
@@ -13,7 +20,6 @@ from thistle.utils import (
     DATETIME_MIN,
     EPOCH_DTYPE,
     datetime_to_dt64,
-    dt64_to_datetime,
     time_to_dt64,
     validate_datetime64,
 )
@@ -26,6 +32,7 @@ except ImportError:
 UTC = datetime.timezone.utc
 
 SwitchingStrategies = Literal["epoch", "midpoint", "tca"]
+"""Valid switching strategy names for :class:`Propagator`."""
 
 
 # Transition Examples
@@ -67,6 +74,12 @@ class SwitchingStrategy(abc.ABC):
         self,
         satellites: list[EarthSatellite],
     ) -> None:
+        """Initialize the strategy with a list of satellites.
+
+        Args:
+            satellites: EarthSatellite objects to manage. They will be
+                sorted by epoch internally.
+        """
         self.satellites = sorted(satellites, key=lambda sat: sat.epoch.utc_datetime())
 
     @abc.abstractmethod
@@ -78,11 +91,13 @@ class SwitchingStrategy(abc.ABC):
 class EpochSwitchStrategy(SwitchingStrategy):
     """Switching based on the TLE epoch.
 
-    This TLE switching strategy selects the TLE generated with an epoch
-    closest to the time without being "in the future".
+    Selects the TLE whose epoch is closest to the target time without
+    being in the future. Transition boundaries are placed at each TLE's
+    epoch time.
     """
 
     def compute_transitions(self) -> None:
+        """Compute transitions at each satellite's epoch time."""
         transitions = [
             sat.epoch.utc_datetime().replace(tzinfo=None) for sat in self.satellites
         ]
@@ -96,11 +111,13 @@ class EpochSwitchStrategy(SwitchingStrategy):
 class MidpointSwitchStrategy(SwitchingStrategy):
     """Switching based on the midpoint between neighboring TLE epoch times.
 
-    This TLE switching strategy selects the TLE nearest to the desired time,
-    regardless of whether that TLE is precedes it or is "in the future".
+    Selects the TLE nearest to the desired time, regardless of whether
+    it precedes the target or is in the future. Transition boundaries
+    are placed at the temporal midpoint between consecutive epochs.
     """
 
     def compute_transitions(self) -> None:
+        """Compute transitions at the midpoint between consecutive epochs."""
         transitions = []
         for sat_a, sat_b in pairwise(self.satellites):
             time_a = sat_a.epoch.utc_datetime().replace(tzinfo=None)
@@ -193,12 +210,21 @@ class TCASwitchStrategy(SwitchingStrategy):
         coarse_step: float = 60.0,
         fine_step: float = 5.0,
     ) -> None:
+        """Initialize the TCA switching strategy.
+
+        Args:
+            satellites: EarthSatellite objects to manage.
+            ts: Skyfield Timescale for time conversions during TCA search.
+            coarse_step: Time step in seconds for the coarse search grid.
+            fine_step: Time step in seconds for the fine refinement grid.
+        """
         super().__init__(satellites)
         self.ts = ts
         self.coarse_step = coarse_step
         self.fine_step = fine_step
 
     def compute_transitions(self) -> None:
+        """Compute transitions at the time of closest approach between consecutive TLEs."""
         transitions = []
         for sat_a, sat_b in pairwise(self.satellites):
             tca = _find_tca(
@@ -229,27 +255,12 @@ def _slices_by_transitions(
         index_array contains the positions in ``times`` that fall
         within that satellite's window.
     """
+    bins = np.searchsorted(transitions, times, side="right") - 1
     indices = []
-    t0 = times[0]
-    t1 = times[-1]
-
-    # Avoid traversing the ENTIRE Satrec list by checking
-    # the first & last progataion times
-
-    # Find the first transition index to search
-    start_idx = np.nonzero(transitions <= t0)[0][-1]
-
-    # Find the last transition index to search
-    stop_idx = np.nonzero(t1 < transitions)[0][0]
-
-    search_space = transitions[start_idx : stop_idx + 1]
-    for idx, bounds in enumerate(pairwise(search_space), start=start_idx):
-        time_a, time_b = bounds
-        cond1 = time_a <= times
-        cond2 = times < time_b
-        comb = np.logical_and(cond1, cond2)
-        slice_ = np.nonzero(comb)[0]
-        indices.append((idx, slice_))
+    for idx in range(int(bins[0]), int(bins[-1]) + 1):
+        slice_ = np.nonzero(bins == idx)[0]
+        if len(slice_) > 0:
+            indices.append((idx, slice_))
     return indices
 
 
@@ -381,9 +392,6 @@ class Propagator:
         indices = _slices_by_transitions(self.switcher.transitions, dt64)
         geos = []
         for idx, slice_ in indices:
-            t = self.ts.from_datetimes(
-                [dt64_to_datetime(t).replace(tzinfo=UTC) for t in dt64[slice_]]
-            )
-            g = self.satellites[idx].at(t)
+            g = self.satellites[idx].at(tt[slice_])
             geos.append(g)
         return merge_geos(geos, self.ts)

@@ -6,6 +6,20 @@ except ImportError:
     __version__ = version("thistle")
 
 from thistle.io import read_tle, read_tles, write_tle, write_tles
-from thistle.propagator import Propagator
+from thistle.propagator import (
+    EpochSwitchStrategy,
+    MidpointSwitchStrategy,
+    Propagator,
+    TCASwitchStrategy,
+)
 
-__all__ = ["Propagator", "read_tle", "read_tles", "write_tle", "write_tles"]
+__all__ = [
+    "Propagator",
+    "read_tle",
+    "read_tles",
+    "write_tle",
+    "write_tles",
+    "EpochSwitchStrategy",
+    "MidpointSwitchStrategy",
+    "TCASwitchStrategy",
+]
