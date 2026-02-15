@@ -1,7 +1,5 @@
 """Tests for thistle.satellite generate_* functions."""
 
-import datetime
-
 import numpy as np
 import pytest
 from skyfield.api import EarthSatellite, load
@@ -9,7 +7,6 @@ from skyfield.api import EarthSatellite, load
 from thistle.io import read_tle
 from thistle.satellite import (
     GENERATORS,
-    _F32_KEYS,
     generate,
     generate_beta_angle,
     generate_ecef,
@@ -59,7 +56,9 @@ class TestGenerateECI:
     def test_velocity_magnitude_leo(self):
         """ISS velocity should be ~7.5 km/s."""
         result = generate_eci(TIMES, SAT)
-        v = np.sqrt(result["eci_vx"] ** 2 + result["eci_vy"] ** 2 + result["eci_vz"] ** 2)
+        v = np.sqrt(
+            result["eci_vx"] ** 2 + result["eci_vy"] ** 2 + result["eci_vz"] ** 2
+        )
         assert np.all(v > 6_500)
         assert np.all(v < 8_500)
 
@@ -72,7 +71,14 @@ class TestGenerateECEF:
 
     def test_keys(self):
         result = generate_ecef(TIMES, SAT)
-        assert set(result) == {"ecef_x", "ecef_y", "ecef_z", "ecef_vx", "ecef_vy", "ecef_vz"}
+        assert set(result) == {
+            "ecef_x",
+            "ecef_y",
+            "ecef_z",
+            "ecef_vx",
+            "ecef_vy",
+            "ecef_vz",
+        }
 
     def test_shapes(self):
         result = generate_ecef(TIMES, SAT)
@@ -84,7 +90,9 @@ class TestGenerateECEF:
         eci = generate_eci(TIMES, SAT)
         ecef = generate_ecef(TIMES, SAT)
         r_eci = np.sqrt(eci["eci_x"] ** 2 + eci["eci_y"] ** 2 + eci["eci_z"] ** 2)
-        r_ecef = np.sqrt(ecef["ecef_x"] ** 2 + ecef["ecef_y"] ** 2 + ecef["ecef_z"] ** 2)
+        r_ecef = np.sqrt(
+            ecef["ecef_x"] ** 2 + ecef["ecef_y"] ** 2 + ecef["ecef_z"] ** 2
+        )
         np.testing.assert_allclose(r_ecef, r_eci, rtol=1e-6)
 
 
@@ -135,8 +143,19 @@ class TestGenerateKeplerian:
     """Tests for generate_keplerian."""
 
     EXPECTED_KEYS = {
-        "sma", "ecc", "inc", "raan", "aop", "ta", "ma", "ea",
-        "arglat", "tlon", "mlon", "lonper", "mm",
+        "sma",
+        "ecc",
+        "inc",
+        "raan",
+        "aop",
+        "ta",
+        "ma",
+        "ea",
+        "arglat",
+        "tlon",
+        "mlon",
+        "lonper",
+        "mm",
     }
 
     def test_keys(self):
