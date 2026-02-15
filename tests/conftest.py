@@ -4,7 +4,7 @@ import pathlib
 import pytest
 from sgp4.api import Satrec
 
-from thistle.io import read_tle
+from thistle.utils import read_tle
 from thistle.utils import trange
 
 BASIC_TIMES = trange(

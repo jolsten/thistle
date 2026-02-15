@@ -6,7 +6,7 @@ import time
 import numpy as np
 from skyfield.api import EarthSatellite, load
 
-from thistle.io import read_tle
+from thistle.utils import read_tle
 from thistle.propagator import (
     EpochSwitchStrategy,
     MidpointSwitchStrategy,

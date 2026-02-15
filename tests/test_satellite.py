@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from skyfield.api import EarthSatellite, load
 
-from thistle.io import read_tle
+from thistle.utils import read_tle
 from thistle.satellite import (
     GENERATORS,
     generate,
