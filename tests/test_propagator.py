@@ -151,6 +151,27 @@ class TestPropagatorEpoch(PropagatorBaseClass):
         sat = self.propagator.find_satellite(datetime_to_dt64(dt))
         assert export_tle(sat.model) == export_tle(exp_sat.model)
 
+    def test_find_satrec_returns_satrec(self):
+        line1 = "1 25544U 98067A   98325.45376114  .01829530  18113-2  41610-2 0  9996"
+        line2 = "2 25544 051.5938 162.0926 0074012 097.3081 262.5015 15.92299093   191"
+
+        exp_sat = EarthSatellite(line1, line2)
+        dt = exp_sat.epoch.utc_datetime().replace(tzinfo=None)
+        satrec = self.propagator.find_satrec(datetime_to_dt64(dt))
+        assert isinstance(satrec, Satrec)
+        assert export_tle(satrec) == export_tle(exp_sat.model)
+
+    def test_find_tle_returns_tuple(self):
+        line1 = "1 25544U 98067A   98325.45376114  .01829530  18113-2  41610-2 0  9996"
+        line2 = "2 25544 051.5938 162.0926 0074012 097.3081 262.5015 15.92299093   191"
+
+        exp_sat = EarthSatellite(line1, line2)
+        dt = exp_sat.epoch.utc_datetime().replace(tzinfo=None)
+        tle = self.propagator.find_tle(datetime_to_dt64(dt))
+        assert isinstance(tle, tuple)
+        assert len(tle) == 2
+        assert tle == export_tle(exp_sat.model)
+
     def test_at(self):
         line1 = "1 25544U 98067A   98325.45376114  .01829530  18113-2  41610-2 0  9996"
         line2 = "2 25544 051.5938 162.0926 0074012 097.3081 262.5015 15.92299093   191"
@@ -228,6 +249,27 @@ class TestPropagatorMidpoint(PropagatorBaseClass):
             exp_geo.velocity.au_per_d.flatten().tolist()
         )
         assert geo.t.tt.flatten().tolist() == exp_geo.t.tt.flatten().tolist()
+
+    def test_find_satrec_returns_satrec(self):
+        line1 = "1 25544U 98067A   98325.45376114  .01829530  18113-2  41610-2 0  9996"
+        line2 = "2 25544 051.5938 162.0926 0074012 097.3081 262.5015 15.92299093   191"
+
+        exp_sat = EarthSatellite(line1, line2)
+        dt = exp_sat.epoch.utc_datetime().replace(tzinfo=None)
+        satrec = self.propagator.find_satrec(datetime_to_dt64(dt))
+        assert isinstance(satrec, Satrec)
+        assert export_tle(satrec) == export_tle(exp_sat.model)
+
+    def test_find_tle_returns_tuple(self):
+        line1 = "1 25544U 98067A   98325.45376114  .01829530  18113-2  41610-2 0  9996"
+        line2 = "2 25544 051.5938 162.0926 0074012 097.3081 262.5015 15.92299093   191"
+
+        exp_sat = EarthSatellite(line1, line2)
+        dt = exp_sat.epoch.utc_datetime().replace(tzinfo=None)
+        tle = self.propagator.find_tle(datetime_to_dt64(dt))
+        assert isinstance(tle, tuple)
+        assert len(tle) == 2
+        assert tle == export_tle(exp_sat.model)
 
 
 class TestFindTCA:
@@ -371,3 +413,26 @@ class TestPropagatorTCA(PropagatorBaseClass):
         dt = exp_sat.epoch.utc_datetime().replace(tzinfo=None)
         sat = self.propagator.find_satellite(datetime_to_dt64(dt))
         assert export_tle(sat.model) == export_tle(exp_sat.model)
+
+    def test_find_satrec_at_epoch(self):
+        """find_satrec at a TLE epoch should return that TLE's Satrec."""
+        line1 = "1 25544U 98067A   98325.45376114  .01829530  18113-2  41610-2 0  9996"
+        line2 = "2 25544 051.5938 162.0926 0074012 097.3081 262.5015 15.92299093   191"
+
+        exp_sat = EarthSatellite(line1, line2)
+        dt = exp_sat.epoch.utc_datetime().replace(tzinfo=None)
+        satrec = self.propagator.find_satrec(datetime_to_dt64(dt))
+        assert isinstance(satrec, Satrec)
+        assert export_tle(satrec) == export_tle(exp_sat.model)
+
+    def test_find_tle_at_epoch(self):
+        """find_tle at a TLE epoch should return that TLE's lines."""
+        line1 = "1 25544U 98067A   98325.45376114  .01829530  18113-2  41610-2 0  9996"
+        line2 = "2 25544 051.5938 162.0926 0074012 097.3081 262.5015 15.92299093   191"
+
+        exp_sat = EarthSatellite(line1, line2)
+        dt = exp_sat.epoch.utc_datetime().replace(tzinfo=None)
+        tle = self.propagator.find_tle(datetime_to_dt64(dt))
+        assert isinstance(tle, tuple)
+        assert len(tle) == 2
+        assert tle == export_tle(exp_sat.model)

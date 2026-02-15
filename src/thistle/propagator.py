@@ -11,6 +11,8 @@ from typing import Literal, Union, get_args
 
 import numpy as np
 import numpy.typing as npt
+from sgp4.api import Satrec
+from sgp4.exporter import export_tle
 from skyfield.api import EarthSatellite, Time, Timescale, load
 from skyfield.positionlib import Distance, Geocentric, Velocity
 
@@ -228,7 +230,9 @@ class TCASwitchStrategy(SwitchingStrategy):
         transitions = []
         for sat_a, sat_b in pairwise(self.satellites):
             tca = _find_tca(
-                sat_a, sat_b, self.ts,
+                sat_a,
+                sat_b,
+                self.ts,
                 coarse_step=self.coarse_step,
                 fine_step=self.fine_step,
             )
@@ -373,6 +377,32 @@ class Propagator:
         indices = _slices_by_transitions(self.switcher.transitions, np.atleast_1d(time))
         idx, _ = indices[0]
         return self.satellites[idx]
+
+    def find_satrec(self, time: DateTime) -> Satrec:
+        """Find the appropriate Satrec for a given time.
+
+        Args:
+            time: The target time as a datetime or numpy.datetime64.
+
+        Returns:
+            The sgp4 Satrec whose TLE is most appropriate for the
+            given time according to the switching strategy.
+        """
+        time = validate_datetime64(time)
+        return self.find_satellite(time).model
+
+    def find_tle(self, time: DateTime) -> TLETuple:
+        """Find the appropriate TLE lines for a given time.
+
+        Args:
+            time: The target time as a datetime or numpy.datetime64.
+
+        Returns:
+            A (line1, line2) tuple of TLE strings for the most appropriate
+            TLE according to the switching strategy.
+        """
+        satrec = self.find_satrec(time)
+        return export_tle(satrec)
 
     def at(self, tt: Time) -> Geocentric:
         """Propagate satellite position at the given time(s).
