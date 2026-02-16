@@ -7,7 +7,7 @@ import numpy as np
 import numpy.typing as npt
 from skyfield.api import EarthSatellite, wgs84
 
-from thistle.satellite import AU_PER_DAY_TO_M_PER_S, AU_TO_M, GenerateResult, generate_lla, ts
+from thistle.orbit_data import AU_PER_DAY_TO_M_PER_S, AU_TO_M, GenerateResult, generate_lla, ts
 from thistle.utils import jday_datetime64
 
 

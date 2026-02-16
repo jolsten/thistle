@@ -1,11 +1,11 @@
-"""Tests for thistle.satellite generate_* functions."""
+"""Tests for thistle.orbit_data generate_* functions."""
 
 import numpy as np
 import pytest
 from skyfield.api import EarthSatellite, load
 
 from thistle.utils import read_tle
-from thistle.satellite import (
+from thistle.orbit_data import (
     GENERATORS,
     generate,
     generate_beta_angle,

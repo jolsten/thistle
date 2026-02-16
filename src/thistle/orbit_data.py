@@ -17,11 +17,11 @@ from skyfield.functions import angle_between
 
 from thistle.utils import jday_datetime64
 
-AU_TO_M = 149597870700.0
-AU_PER_DAY_TO_M_PER_S = AU_TO_M / 86400.0
+AU_TO_M = 149_597_870_700.0
+AU_PER_DAY_TO_M_PER_S = AU_TO_M / 86_400.0
 
-R_EARTH_KM = 6371.0
-R_SUN_KM = 696340.0
+R_EARTH_KM = 6_371.0
+R_SUN_KM = 696_340.0
 
 _DATA_DIR = pathlib.Path(__file__).parent / "data"
 
@@ -81,7 +81,10 @@ def generate_ecef(
     """
     _, geocentric = _propagate(times, satellite)
     pos = cast(npt.NDArray, geocentric.frame_xyz(itrs).au) * AU_TO_M
-    vel = cast(npt.NDArray, geocentric.frame_xyz_and_velocity(itrs)[1].au_per_d) * AU_PER_DAY_TO_M_PER_S
+    vel = (
+        cast(npt.NDArray, geocentric.frame_xyz_and_velocity(itrs)[1].au_per_d)
+        * AU_PER_DAY_TO_M_PER_S
+    )
     return {
         "ecef_x": pos[0],
         "ecef_y": pos[1],
@@ -273,7 +276,9 @@ def generate_local_solar_time(
 
     lon_deg = cast(npt.NDArray, wgs84.subpoint(geocentric).longitude.degrees)
     gmst = cast(npt.NDArray, t.gmst)
-    sun_ra_hours = cast(npt.NDArray, eph["earth"].at(t).observe(eph["sun"]).apparent().radec()[0].hours)
+    sun_ra_hours = cast(
+        npt.NDArray, eph["earth"].at(t).observe(eph["sun"]).apparent().radec()[0].hours
+    )
 
     lst_hours = gmst + lon_deg / 15.0
     local_solar_time = (lst_hours - sun_ra_hours + 12.0) % 24.0
@@ -391,10 +396,34 @@ GENERATORS = {
 
 # Keys that downcast to float32 (angles, dimensionless, magnetic field, lst).
 _F32_KEYS = {
-    "lat", "lon", "inc", "raan", "aop", "ta", "ma", "ea",
-    "arglat", "tlon", "mlon", "lonper", "mm", "ecc",
-    "f", "g", "h", "k", "L", "beta", "lst",
-    "Be", "Bn", "Bu", "Bt", "Bx", "By", "Bz",
+    "lat",
+    "lon",
+    "inc",
+    "raan",
+    "aop",
+    "ta",
+    "ma",
+    "ea",
+    "arglat",
+    "tlon",
+    "mlon",
+    "lonper",
+    "mm",
+    "ecc",
+    "f",
+    "g",
+    "h",
+    "k",
+    "L",
+    "beta",
+    "lst",
+    "Be",
+    "Bn",
+    "Bu",
+    "Bt",
+    "Bx",
+    "By",
+    "Bz",
 }
 
 
