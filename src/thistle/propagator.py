@@ -425,3 +425,24 @@ class Propagator:
             g = self.satellites[idx].at(tt[slice_])
             geos.append(g)
         return merge_geos(geos, self.ts)
+
+    def segment_times(
+        self, times: npt.NDArray[np.datetime64]
+    ) -> list[tuple[npt.NDArray[np.datetime64], EarthSatellite]]:
+        """Split a time array into segments by TLE switching boundaries.
+
+        Each segment pairs a contiguous slice of the input times with the
+        EarthSatellite that should be used for propagation in that interval.
+
+        Args:
+            times: Sorted array of datetime64 values.
+
+        Returns:
+            A list of (time_slice, satellite) tuples, ordered
+            chronologically.
+        """
+        slices = _slices_by_transitions(self.switcher.transitions, times)
+        return [
+            (times[indices], self.satellites[sat_idx])
+            for sat_idx, indices in slices
+        ]

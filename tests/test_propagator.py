@@ -24,6 +24,7 @@ from thistle.utils import (
     datetime_to_dt64,
     dt64_to_datetime,
     pairwise,
+    read_tle,
     trange,
 )
 
@@ -436,3 +437,50 @@ class TestPropagatorTCA(PropagatorBaseClass):
         assert isinstance(tle, tuple)
         assert len(tle) == 2
         assert tle == export_tle(exp_sat.model)
+
+
+class TestSegmentTimes:
+    def setup_class(self):
+        tles = read_tle("tests/data/25544.tle")
+        self.propagator = Propagator(tles, method="epoch")
+        # Time range spanning multiple TLEs
+        self.times = trange(
+            datetime.datetime(1998, 11, 20),
+            datetime.datetime(1998, 12, 20),
+            step=60,
+        )
+
+    def test_returns_list_of_tuples(self):
+        segments = self.propagator.segment_times(self.times)
+        assert isinstance(segments, list)
+        for t_slice, sat in segments:
+            assert isinstance(t_slice, np.ndarray)
+            assert isinstance(sat, EarthSatellite)
+
+    def test_segments_cover_all_times(self):
+        segments = self.propagator.segment_times(self.times)
+        reconstructed = np.concatenate([t for t, _ in segments])
+        np.testing.assert_array_equal(reconstructed, self.times)
+
+    def test_single_satellite(self):
+        """A time range within one TLE's window yields one segment."""
+        first_sat = self.propagator.satellites[0]
+        epoch = first_sat.epoch.utc_datetime().replace(tzinfo=None)
+        short_times = trange(epoch, epoch + datetime.timedelta(minutes=10), step=10)
+        segments = self.propagator.segment_times(short_times)
+        assert len(segments) == 1
+        assert segments[0][1] is first_sat
+
+    def test_empty_gaps_omitted(self):
+        """Segments with no matching times are not returned."""
+        segments = self.propagator.segment_times(self.times)
+        for t_slice, _ in segments:
+            assert len(t_slice) > 0
+
+    def test_correct_satellite_per_segment(self):
+        """Each segment's satellite matches what find_satellite returns."""
+        segments = self.propagator.segment_times(self.times)
+        for t_slice, sat in segments:
+            mid = t_slice[len(t_slice) // 2]
+            expected_sat = self.propagator.find_satellite(mid)
+            assert export_tle(sat.model) == export_tle(expected_sat.model)

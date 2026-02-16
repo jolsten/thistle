@@ -450,36 +450,28 @@ def _generate_with_propagator(
     Returns:
         A dict with all requested data groups.
     """
-    from thistle.propagator import _slices_by_transitions
-
-    # Split time array based on transition times
-    segments = _slices_by_transitions(propagator.switcher.transitions, times)
+    segments = propagator.segment_times(times)
 
     # Process each segment
     segment_results = []
-    for sat_idx, time_indices in segments:
-        segment_times = times[time_indices]
-        segment_satellite = propagator.switcher.satellites[sat_idx]
-
-        # Compute data for this segment
+    for t_slice, sat in segments:
         segment_data = {}  # type: GenerateResult
         for name in groups:
-            segment_data.update(GENERATORS[name](segment_times, segment_satellite))
-
-        segment_results.append((time_indices, segment_data))
+            segment_data.update(GENERATORS[name](t_slice, sat))
+        segment_results.append((len(t_slice), segment_data))
 
     # Merge segments back into full arrays
     result = {}  # type: GenerateResult
     if segment_results:
         all_keys = set(segment_results[0][1].keys())
         for key in all_keys:
-            # Create output array with same shape as input times
             first_segment_value = segment_results[0][1][key]
             output_array = np.empty(len(times), dtype=first_segment_value.dtype)
 
-            # Fill in values from each segment
-            for time_indices, segment_data in segment_results:
-                output_array[time_indices] = segment_data[key]
+            offset = 0
+            for n, segment_data in segment_results:
+                output_array[offset : offset + n] = segment_data[key]
+                offset += n
 
             result[key] = output_array
 
