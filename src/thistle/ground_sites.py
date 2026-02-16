@@ -16,9 +16,9 @@ _WGS84_A = 6378137.0
 def visibility_circle(
     lat: float,
     lon: float,
+    alt: float,
     sat_alt: float,
-    min_el: float,
-    alt: float = 0.0,
+    min_el: float = 0.0,
     n_points: int = 100,
 ) -> tuple[npt.NDArray, npt.NDArray]:
     """Compute the ground visibility circle for a satellite altitude.
@@ -30,9 +30,9 @@ def visibility_circle(
     Args:
         lat: Ground site geodetic latitude (deg).
         lon: Ground site geodetic longitude (deg).
+        alt: Ground site altitude above the ellipsoid (m).
         sat_alt: Target satellite altitude above the ellipsoid (m).
         min_el: Minimum elevation angle (deg).
-        alt: Ground site altitude above the ellipsoid (m).
         n_points: Number of polygon vertices.
 
     Returns:
