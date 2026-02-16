@@ -1,11 +1,26 @@
 [project]
 name = "thistle"
-description = "A wrapper for sgp4 that handles TLE switching"
+description = "Satellite orbit propagation and data generation with automatic TLE switching"
 readme = "README.md"
+license = "MIT"
 authors = [
     { name = "Jonathan Olsten", email = "jonathan.olsten@gmail.com" }
 ]
 requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "Topic :: Scientific/Engineering :: Physics",
+]
 dependencies = [
     "geographiclib>=2.0",
     "numpy>=1.22",
@@ -15,6 +30,10 @@ dependencies = [
     "skyfield>=1.53",
 ]
 dynamic = ["version"]
+
+[project.urls]
+Source = "https://github.com/jolsten/thistle"
+Issues = "https://github.com/jolsten/thistle/issues"
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
