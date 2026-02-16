@@ -7,8 +7,7 @@ import numpy as np
 import numpy.typing as npt
 from skyfield.api import EarthSatellite
 
-from thistle.ground_sites import _generate_range_single as generate_range
-from thistle.orbit_data import generate_lla
+from thistle.orbit_data import _extract_range, _propagate, generate_lla
 
 
 @dataclasses.dataclass
@@ -110,15 +109,15 @@ def _reflect_across_ground_track(
 
 def _extract_solution(
     opt_result: object,
-    times: npt.NDArray[np.datetime64],
-    satellite: EarthSatellite,
+    t,
+    geocentric,
     doppler: npt.NDArray[np.float64],
     alt: float,
 ) -> DopplerGeolocationResult:
     """Build a DopplerGeolocationResult from a scipy OptimizeResult."""
     lat_sol, lon_sol = float(opt_result.x[0]), float(opt_result.x[1])
-    rr = generate_range(times, satellite, lat_sol, lon_sol, alt=alt)
-    model_rr = cast(npt.NDArray, rr["range_rate"])
+    rr = _extract_range(t, geocentric, [("0", lat_sol, lon_sol, alt)])
+    model_rr = cast(npt.NDArray, rr["range_rate_0"])
     scale_sol = float(np.dot(doppler, model_rr) / np.dot(model_rr, model_rr))
     residuals = doppler - scale_sol * model_rr
     rms = float(np.sqrt(np.mean(residuals**2)))
@@ -180,6 +179,9 @@ def geolocate_doppler(
     if times.ndim != 1 or len(times) < 3:
         raise ValueError("Need at least 3 measurements")
 
+    # Propagate once — reused by every optimizer iteration
+    t, geocentric = _propagate(times, satellite)
+
     # Initial guess from TCA sub-satellite point
     tca_time = _find_doppler_tca(times, doppler)
     if lat0 is None or lon0 is None:
@@ -189,8 +191,8 @@ def geolocate_doppler(
     lon_guess: float = lon0
 
     def _cost(x: npt.NDArray) -> float:
-        rr = generate_range(times, satellite, float(x[0]), float(x[1]), alt=alt)
-        model_rr = cast(npt.NDArray, rr["range_rate"])
+        rr = _extract_range(t, geocentric, [("0", float(x[0]), float(x[1]), alt)])
+        model_rr = cast(npt.NDArray, rr["range_rate_0"])
         denom = np.dot(model_rr, model_rr)
         if denom < 1e-30:
             return 1e30
@@ -215,8 +217,8 @@ def geolocate_doppler(
     result_b = minimize(_cost, x0=[lat0_b, lon0_b], method="Nelder-Mead", options=opts)
 
     solutions = [
-        _extract_solution(result_a, times, satellite, doppler, alt),
-        _extract_solution(result_b, times, satellite, doppler, alt),
+        _extract_solution(result_a, t, geocentric, doppler, alt),
+        _extract_solution(result_b, t, geocentric, doppler, alt),
     ]
     solutions.sort(key=lambda s: s.rms)
     return solutions

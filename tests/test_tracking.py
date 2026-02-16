@@ -4,9 +4,9 @@ import numpy as np
 import pytest
 from skyfield.api import EarthSatellite, load
 
+from thistle.ground_sites import generate_range
 from thistle.tracking import (
     DopplerGeolocationResult,
-    generate_range,
     geolocate_doppler,
 )
 from thistle.utils import read_tle
@@ -27,9 +27,9 @@ SITE_LAT, SITE_LON = 40.0, -105.0
 _PASS_SITE_LAT, _PASS_SITE_LON = 42.0, 116.57
 _PASS_CENTER = np.datetime64("1998-11-20T08:29:20")
 _PASS_TIMES = _PASS_CENTER + np.arange(-300, 300, 10, dtype="timedelta64[s]")
-_PASS_RR = generate_range(_PASS_TIMES, SAT, _PASS_SITE_LAT, _PASS_SITE_LON)[
-    "range_rate"
-]
+_PASS_RR = generate_range(
+    _PASS_TIMES, SAT, sites=[(_PASS_SITE_LAT, _PASS_SITE_LON)]
+)["range_rate_0"]
 
 
 class TestGeolocateDoppler:

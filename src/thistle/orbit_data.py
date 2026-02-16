@@ -6,7 +6,7 @@ magnetic field in nanoTesla, and local solar time in fractional hours.
 
 import datetime
 import pathlib
-from typing import Dict, Optional, Sequence, Union, cast
+from typing import Dict, Optional, Sequence, Tuple, Union, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -35,7 +35,8 @@ ts = load.timescale()
 eph = load(str(_DATA_DIR / "de421.bsp"))
 
 GenerateResult = Dict[str, npt.NDArray]
-Sites = Union[Sequence[tuple], dict[str, tuple]]
+Site = Union[Tuple[float, float], Tuple[float, float, float]]
+Sites = Union[Sequence[Site], Dict[str, Site]]
 
 
 def _normalize_site(site: tuple) -> tuple[float, float, float]:

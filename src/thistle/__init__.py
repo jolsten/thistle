@@ -5,8 +5,23 @@ except ImportError:
 
     __version__ = version("thistle")
 
+from thistle.events import (
+    AscendingPeriod,
+    DescendingPeriod,
+    EclipsePeriod,
+    Event,
+    NodeCrossing,
+    SatellitePass,
+    SunlitPeriod,
+    find_ascending_periods,
+    find_descending_periods,
+    find_eclipse_periods,
+    find_node_crossings,
+    find_passes,
+    find_sunlit_periods,
+)
 from thistle.ground_sites import doppler_shift, generate_range, visibility_circle
-from thistle.orbit_data import Sites, generate
+from thistle.orbit_data import Site, Sites, generate
 from thistle.propagator import (
     EpochSwitchStrategy,
     MidpointSwitchStrategy,
@@ -25,5 +40,19 @@ __all__ = [
     "generate_range",
     "doppler_shift",
     "generate",
+    "Site",
     "Sites",
+    "Event",
+    "SatellitePass",
+    "NodeCrossing",
+    "SunlitPeriod",
+    "EclipsePeriod",
+    "AscendingPeriod",
+    "DescendingPeriod",
+    "find_passes",
+    "find_node_crossings",
+    "find_sunlit_periods",
+    "find_eclipse_periods",
+    "find_ascending_periods",
+    "find_descending_periods",
 ]
