@@ -7,7 +7,7 @@ import numpy as np
 import numpy.typing as npt
 from skyfield.api import EarthSatellite
 
-from thistle.ground_sites import generate_range
+from thistle.ground_sites import _generate_range_single as generate_range
 from thistle.orbit_data import generate_lla
 
 

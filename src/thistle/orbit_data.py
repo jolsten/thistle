@@ -43,21 +43,13 @@ def _propagate(times, satellite):
     return t, satellite.at(t)
 
 
-def generate_eci(
-    times: npt.NDArray[np.datetime64],
-    satellite: EarthSatellite,
-) -> GenerateResult:
-    """Generate ECI (GCRS) position and velocity for the given times.
+# ---------------------------------------------------------------------------
+# Extractors: take pre-computed (t, geocentric) and return GenerateResult.
+# These avoid redundant propagation when multiple groups are requested.
+# ---------------------------------------------------------------------------
 
-    Args:
-        times: Array of datetime64 values.
-        satellite: A Skyfield EarthSatellite object.
 
-    Returns:
-        A dict with keys: eci_x, eci_y, eci_z (m),
-        eci_vx, eci_vy, eci_vz (m/s).
-    """
-    _, geocentric = _propagate(times, satellite)
+def _extract_eci(t, geocentric):
     pos = cast(npt.NDArray, geocentric.xyz.au) * AU_TO_M
     vel = cast(npt.NDArray, geocentric.velocity.au_per_d) * AU_PER_DAY_TO_M_PER_S
     return {
@@ -70,21 +62,7 @@ def generate_eci(
     }
 
 
-def generate_ecef(
-    times: npt.NDArray[np.datetime64],
-    satellite: EarthSatellite,
-) -> GenerateResult:
-    """Generate ECEF (ITRS) position and velocity for the given times.
-
-    Args:
-        times: Array of datetime64 values.
-        satellite: A Skyfield EarthSatellite object.
-
-    Returns:
-        A dict with keys: ecef_x, ecef_y, ecef_z (m),
-        ecef_vx, ecef_vy, ecef_vz (m/s).
-    """
-    _, geocentric = _propagate(times, satellite)
+def _extract_ecef(t, geocentric):
     pos = cast(npt.NDArray, geocentric.frame_xyz(itrs).au) * AU_TO_M
     vel = (
         cast(npt.NDArray, geocentric.frame_xyz_and_velocity(itrs)[1].au_per_d)
@@ -100,20 +78,7 @@ def generate_ecef(
     }
 
 
-def generate_lla(
-    times: npt.NDArray[np.datetime64],
-    satellite: EarthSatellite,
-) -> GenerateResult:
-    """Generate LLA (latitude, longitude, altitude) for the given times.
-
-    Args:
-        times: Array of datetime64 values.
-        satellite: A Skyfield EarthSatellite object.
-
-    Returns:
-        A dict with keys: lat (deg), lon (deg), alt (m).
-    """
-    _, geocentric = _propagate(times, satellite)
+def _extract_lla(t, geocentric):
     subpoint = wgs84.subpoint(geocentric)
     return {
         "lat": cast(npt.NDArray, subpoint.latitude.degrees),
@@ -122,22 +87,7 @@ def generate_lla(
     }
 
 
-def generate_keplerian(
-    times: npt.NDArray[np.datetime64],
-    satellite: EarthSatellite,
-) -> GenerateResult:
-    """Generate osculating Keplerian elements for the given times.
-
-    Args:
-        times: Array of datetime64 values.
-        satellite: A Skyfield EarthSatellite object.
-
-    Returns:
-        A dict with keys: sma (m), ecc, inc (deg), raan (deg),
-        aop (deg), ta (deg), ma (deg), ea (deg), arglat (deg),
-        tlon (deg), mlon (deg), lonper (deg), mm (deg/day).
-    """
-    _, geocentric = _propagate(times, satellite)
+def _extract_keplerian(t, geocentric):
     elems = osculating_elements_of(geocentric)
     return {
         "sma": cast(npt.NDArray, elems.semi_major_axis.km) * 1000.0,
@@ -156,23 +106,7 @@ def generate_keplerian(
     }
 
 
-def generate_equinoctial(
-    times: npt.NDArray[np.datetime64],
-    satellite: EarthSatellite,
-) -> GenerateResult:
-    """Generate modified equinoctial elements for the given times.
-
-    Computed from osculating Keplerian elements using the standard
-    transformation (Walker 1985).
-
-    Args:
-        times: Array of datetime64 values.
-        satellite: A Skyfield EarthSatellite object.
-
-    Returns:
-        A dict with keys: p (m), f, g, h, k, L (deg).
-    """
-    _, geocentric = _propagate(times, satellite)
+def _extract_equinoctial(t, geocentric):
     elems = osculating_elements_of(geocentric)
 
     a = cast(npt.NDArray, elems.semi_major_axis.km) * 1000.0
@@ -192,6 +126,207 @@ def generate_equinoctial(
     return {"p": p, "f": f, "g": g, "h": h, "k": k, "L": L}
 
 
+def _extract_sunlight(t, geocentric):
+    sat_km = cast(npt.NDArray, geocentric.xyz.km)
+    sun_km = cast(npt.NDArray, (eph["sun"] - eph["earth"]).at(t).xyz.km)
+
+    sat_to_sun = sun_km - sat_km
+    sat_to_earth = -sat_km
+
+    d_sun = np.linalg.norm(sat_to_sun, axis=0)
+    d_earth = np.linalg.norm(sat_to_earth, axis=0)
+
+    theta_sun = np.arcsin(R_SUN_KM / d_sun)
+    theta_earth = np.arcsin(R_EARTH_KM / d_earth)
+
+    cos_sep = np.sum(sat_to_sun * sat_to_earth, axis=0) / (d_sun * d_earth)
+    theta_sep = np.arccos(np.clip(cos_sep, -1.0, 1.0))
+
+    n = geocentric.xyz.au.shape[1]
+    result = np.ones(n, dtype=np.int8)  # default penumbra
+    result[theta_sep >= theta_earth + theta_sun] = 2  # sunlit
+    result[theta_sep <= theta_earth - theta_sun] = 0  # umbra
+    return {"sun": result}
+
+
+def _extract_beta(t, geocentric):
+    r = cast(npt.NDArray, geocentric.xyz.km)
+    v = cast(npt.NDArray, geocentric.velocity.km_per_s)
+    orbit_normal = np.cross(r.T, v.T).T
+
+    sun_vec = cast(npt.NDArray, (eph["sun"] - eph["earth"]).at(t).xyz.km)
+
+    beta_rad = angle_between(orbit_normal, sun_vec)
+    return {"beta": 90.0 - np.degrees(beta_rad)}
+
+
+def _extract_lst(t, geocentric):
+    lon_deg = cast(npt.NDArray, wgs84.subpoint(geocentric).longitude.degrees)
+    gmst = cast(npt.NDArray, t.gmst)
+    sun_ra_hours = cast(
+        npt.NDArray, eph["earth"].at(t).observe(eph["sun"]).apparent().radec()[0].hours
+    )
+
+    lst_hours = gmst + lon_deg / 15.0
+    local_solar_time = (lst_hours - sun_ra_hours + 12.0) % 24.0
+    return {"lst": local_solar_time}
+
+
+def _extract_mag_enu_raw(t, geocentric, epoch=None):
+    """Compute IGRF field in ENU and return components with lat/lon."""
+    import ppigrf
+
+    subpoint = wgs84.subpoint(geocentric)
+    lat = cast(npt.NDArray, subpoint.latitude.degrees)
+    lon = cast(npt.NDArray, subpoint.longitude.degrees)
+    alt_km = cast(npt.NDArray, subpoint.elevation.km)
+
+    if epoch is None:
+        epoch = t.utc_datetime()[len(t) // 2].replace(tzinfo=None)
+
+    Be, Bn, Bu = ppigrf.igrf(lon, lat, alt_km, epoch)
+    return Be.ravel(), Bn.ravel(), Bu.ravel(), lat, lon
+
+
+def _extract_mag_enu(t, geocentric):
+    Be, Bn, Bu, _, _ = _extract_mag_enu_raw(t, geocentric)
+    return {"Be": Be, "Bn": Bn, "Bu": Bu}
+
+
+def _extract_mag_total(t, geocentric):
+    Be, Bn, Bu, _, _ = _extract_mag_enu_raw(t, geocentric)
+    return {"Bt": np.sqrt(Be**2 + Bn**2 + Bu**2)}
+
+
+def _extract_mag_ecef(t, geocentric):
+    Be, Bn, Bu, lat_deg, lon_deg = _extract_mag_enu_raw(t, geocentric)
+
+    lat = np.radians(lat_deg)
+    lon = np.radians(lon_deg)
+
+    sin_lat = np.sin(lat)
+    cos_lat = np.cos(lat)
+    sin_lon = np.sin(lon)
+    cos_lon = np.cos(lon)
+
+    Bx = -sin_lon * Be - sin_lat * cos_lon * Bn + cos_lat * cos_lon * Bu
+    By = cos_lon * Be - sin_lat * sin_lon * Bn + cos_lat * sin_lon * Bu
+    Bz = cos_lat * Bn + sin_lat * Bu
+    return {"Bx": Bx, "By": By, "Bz": Bz}
+
+
+_EXTRACTORS = {
+    "eci": _extract_eci,
+    "ecef": _extract_ecef,
+    "lla": _extract_lla,
+    "keplerian": _extract_keplerian,
+    "equinoctial": _extract_equinoctial,
+    "sunlight": _extract_sunlight,
+    "beta": _extract_beta,
+    "lst": _extract_lst,
+    "mag_enu": _extract_mag_enu,
+    "mag_total": _extract_mag_total,
+    "mag_ecef": _extract_mag_ecef,
+}
+
+
+# ---------------------------------------------------------------------------
+# Public generators: thin wrappers that propagate then extract.
+# ---------------------------------------------------------------------------
+
+
+def generate_eci(
+    times: npt.NDArray[np.datetime64],
+    satellite: EarthSatellite,
+) -> GenerateResult:
+    """Generate ECI (GCRS) position and velocity for the given times.
+
+    Args:
+        times: Array of datetime64 values.
+        satellite: A Skyfield EarthSatellite object.
+
+    Returns:
+        A dict with keys: eci_x, eci_y, eci_z (m),
+        eci_vx, eci_vy, eci_vz (m/s).
+    """
+    t, geocentric = _propagate(times, satellite)
+    return _extract_eci(t, geocentric)
+
+
+def generate_ecef(
+    times: npt.NDArray[np.datetime64],
+    satellite: EarthSatellite,
+) -> GenerateResult:
+    """Generate ECEF (ITRS) position and velocity for the given times.
+
+    Args:
+        times: Array of datetime64 values.
+        satellite: A Skyfield EarthSatellite object.
+
+    Returns:
+        A dict with keys: ecef_x, ecef_y, ecef_z (m),
+        ecef_vx, ecef_vy, ecef_vz (m/s).
+    """
+    t, geocentric = _propagate(times, satellite)
+    return _extract_ecef(t, geocentric)
+
+
+def generate_lla(
+    times: npt.NDArray[np.datetime64],
+    satellite: EarthSatellite,
+) -> GenerateResult:
+    """Generate LLA (latitude, longitude, altitude) for the given times.
+
+    Args:
+        times: Array of datetime64 values.
+        satellite: A Skyfield EarthSatellite object.
+
+    Returns:
+        A dict with keys: lat (deg), lon (deg), alt (m).
+    """
+    t, geocentric = _propagate(times, satellite)
+    return _extract_lla(t, geocentric)
+
+
+def generate_keplerian(
+    times: npt.NDArray[np.datetime64],
+    satellite: EarthSatellite,
+) -> GenerateResult:
+    """Generate osculating Keplerian elements for the given times.
+
+    Args:
+        times: Array of datetime64 values.
+        satellite: A Skyfield EarthSatellite object.
+
+    Returns:
+        A dict with keys: sma (m), ecc, inc (deg), raan (deg),
+        aop (deg), ta (deg), ma (deg), ea (deg), arglat (deg),
+        tlon (deg), mlon (deg), lonper (deg), mm (deg/day).
+    """
+    t, geocentric = _propagate(times, satellite)
+    return _extract_keplerian(t, geocentric)
+
+
+def generate_equinoctial(
+    times: npt.NDArray[np.datetime64],
+    satellite: EarthSatellite,
+) -> GenerateResult:
+    """Generate modified equinoctial elements for the given times.
+
+    Computed from osculating Keplerian elements using the standard
+    transformation (Walker 1985).
+
+    Args:
+        times: Array of datetime64 values.
+        satellite: A Skyfield EarthSatellite object.
+
+    Returns:
+        A dict with keys: p (m), f, g, h, k, L (deg).
+    """
+    t, geocentric = _propagate(times, satellite)
+    return _extract_equinoctial(t, geocentric)
+
+
 def generate_sunlight(
     times: npt.NDArray[np.datetime64],
     satellite: EarthSatellite,
@@ -209,26 +344,7 @@ def generate_sunlight(
         A dict with key: sun (int8, 0 = umbra, 1 = penumbra, 2 = sunlit).
     """
     t, geocentric = _propagate(times, satellite)
-    sat_km = cast(npt.NDArray, geocentric.xyz.km)
-
-    sun_km = cast(npt.NDArray, (eph["sun"] - eph["earth"]).at(t).xyz.km)
-
-    sat_to_sun = sun_km - sat_km
-    sat_to_earth = -sat_km
-
-    d_sun = np.linalg.norm(sat_to_sun, axis=0)
-    d_earth = np.linalg.norm(sat_to_earth, axis=0)
-
-    theta_sun = np.arcsin(R_SUN_KM / d_sun)
-    theta_earth = np.arcsin(R_EARTH_KM / d_earth)
-
-    cos_sep = np.sum(sat_to_sun * sat_to_earth, axis=0) / (d_sun * d_earth)
-    theta_sep = np.arccos(np.clip(cos_sep, -1.0, 1.0))
-
-    result = np.ones(len(times), dtype=np.int8)  # default penumbra
-    result[theta_sep >= theta_earth + theta_sun] = 2  # sunlit
-    result[theta_sep <= theta_earth - theta_sun] = 0  # umbra
-    return {"sun": result}
+    return _extract_sunlight(t, geocentric)
 
 
 def generate_beta_angle(
@@ -250,15 +366,7 @@ def generate_beta_angle(
         the orbit plane.
     """
     t, geocentric = _propagate(times, satellite)
-
-    r = cast(npt.NDArray, geocentric.xyz.km)
-    v = cast(npt.NDArray, geocentric.velocity.km_per_s)
-    orbit_normal = np.cross(r.T, v.T).T
-
-    sun_vec = cast(npt.NDArray, (eph["sun"] - eph["earth"]).at(t).xyz.km)
-
-    beta_rad = angle_between(orbit_normal, sun_vec)
-    return {"beta": 90.0 - np.degrees(beta_rad)}
+    return _extract_beta(t, geocentric)
 
 
 def generate_local_solar_time(
@@ -278,34 +386,7 @@ def generate_local_solar_time(
         A dict with key: lst (fractional hours [0, 24)).
     """
     t, geocentric = _propagate(times, satellite)
-
-    lon_deg = cast(npt.NDArray, wgs84.subpoint(geocentric).longitude.degrees)
-    gmst = cast(npt.NDArray, t.gmst)
-    sun_ra_hours = cast(
-        npt.NDArray, eph["earth"].at(t).observe(eph["sun"]).apparent().radec()[0].hours
-    )
-
-    lst_hours = gmst + lon_deg / 15.0
-    local_solar_time = (lst_hours - sun_ra_hours + 12.0) % 24.0
-    return {"lst": local_solar_time}
-
-
-def _magnetic_field_enu(times, satellite, epoch):
-    """Compute IGRF field in ENU and return components with lat/lon."""
-    import ppigrf
-
-    _, geocentric = _propagate(times, satellite)
-    subpoint = wgs84.subpoint(geocentric)
-    lat = cast(npt.NDArray, subpoint.latitude.degrees)
-    lon = cast(npt.NDArray, subpoint.longitude.degrees)
-    alt_km = cast(npt.NDArray, subpoint.elevation.km)
-
-    if epoch is None:
-        mid = times[len(times) // 2]
-        epoch = mid.astype("datetime64[us]").astype(datetime.datetime)
-
-    Be, Bn, Bu = ppigrf.igrf(lon, lat, alt_km, epoch)
-    return Be.ravel(), Bn.ravel(), Bu.ravel(), lat, lon
+    return _extract_lst(t, geocentric)
 
 
 def generate_magnetic_field_enu(
@@ -327,7 +408,8 @@ def generate_magnetic_field_enu(
     Returns:
         A dict with keys: Be, Bn, Bu (nT).
     """
-    Be, Bn, Bu, _, _ = _magnetic_field_enu(times, satellite, epoch)
+    t, geocentric = _propagate(times, satellite)
+    Be, Bn, Bu, _, _ = _extract_mag_enu_raw(t, geocentric, epoch)
     return {"Be": Be, "Bn": Bn, "Bu": Bu}
 
 
@@ -346,7 +428,8 @@ def generate_magnetic_field_total(
     Returns:
         A dict with key: Bt (nT).
     """
-    Be, Bn, Bu, _, _ = _magnetic_field_enu(times, satellite, epoch)
+    t, geocentric = _propagate(times, satellite)
+    Be, Bn, Bu, _, _ = _extract_mag_enu_raw(t, geocentric, epoch)
     return {"Bt": np.sqrt(Be**2 + Bn**2 + Bu**2)}
 
 
@@ -368,7 +451,8 @@ def generate_magnetic_field_ecef(
     Returns:
         A dict with keys: Bx, By, Bz (nT).
     """
-    Be, Bn, Bu, lat_deg, lon_deg = _magnetic_field_enu(times, satellite, epoch)
+    t, geocentric = _propagate(times, satellite)
+    Be, Bn, Bu, lat_deg, lon_deg = _extract_mag_enu_raw(t, geocentric, epoch)
 
     lat = np.radians(lat_deg)
     lon = np.radians(lon_deg)
@@ -455,9 +539,10 @@ def _generate_with_propagator(
     # Process each segment
     segment_results = []
     for t_slice, sat in segments:
+        t, geocentric = _propagate(t_slice, sat)
         segment_data = {}  # type: GenerateResult
         for name in groups:
-            segment_data.update(GENERATORS[name](t_slice, sat))
+            segment_data.update(_EXTRACTORS[name](t, geocentric))
         segment_results.append((len(t_slice), segment_data))
 
     # Merge segments back into full arrays
@@ -510,9 +595,9 @@ def generate(
     """
     # Validate group names
     for name in groups:
-        if name not in GENERATORS:
+        if name not in _EXTRACTORS:
             raise ValueError(
-                f"Unknown group {name!r}, expected one of {list(GENERATORS)}"
+                f"Unknown group {name!r}, expected one of {list(_EXTRACTORS)}"
             )
 
     # Dispatch to appropriate implementation
@@ -521,10 +606,11 @@ def generate(
     if isinstance(satellite, Propagator):
         result = _generate_with_propagator(times, satellite, groups)
     else:
-        # Single satellite case
+        # Single satellite case — propagate once, extract all groups
+        t, geocentric = _propagate(times, satellite)
         result = {}  # type: GenerateResult
         for name in groups:
-            result.update(GENERATORS[name](times, satellite))
+            result.update(_EXTRACTORS[name](t, geocentric))
 
     # Downcast arrays where appropriate
     for key, arr in result.items():

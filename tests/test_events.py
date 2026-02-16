@@ -328,3 +328,168 @@ class TestFindDescendingPeriods:
     def test_start_equals_stop_raises(self):
         with pytest.raises(ValueError):
             find_descending_periods(START_24H, START_24H, SAT)
+
+
+# ---------- Propagator support tests ----------
+
+from thistle.propagator import Propagator
+
+# Single-TLE Propagator: no transitions in the test window, so results
+# should match using the same EarthSatellite directly.
+PROP = Propagator([_tles[0]], method="epoch")
+
+# Multi-TLE Propagator for broader coverage tests
+PROP_MULTI = Propagator(_tles, method="epoch")
+
+
+class TestPropagatorPasses:
+    """Test find_passes with a Propagator."""
+
+    def test_returns_list(self):
+        passes = find_passes(START_24H, STOP_24H, PROP, BOULDER_LAT, BOULDER_LON)
+        assert isinstance(passes, list)
+        for p in passes:
+            assert isinstance(p, SatellitePass)
+
+    def test_matches_single_satellite(self):
+        """Single-TLE Propagator gives same results as EarthSatellite."""
+        prop_passes = find_passes(START_24H, STOP_24H, PROP, BOULDER_LAT, BOULDER_LON)
+        sat_passes = find_passes(START_24H, STOP_24H, SAT, BOULDER_LAT, BOULDER_LON)
+        assert len(prop_passes) == len(sat_passes)
+        for pp, sp in zip(prop_passes, sat_passes):
+            diff = abs((pp.start - sp.start) / np.timedelta64(1, "s"))
+            assert diff < 1.0
+
+
+class TestPropagatorNodeCrossings:
+    """Test find_node_crossings with a Propagator."""
+
+    def test_returns_list(self):
+        crossings = find_node_crossings(START_24H, STOP_24H, PROP)
+        assert isinstance(crossings, list)
+        for c in crossings:
+            assert isinstance(c, NodeCrossing)
+
+    def test_matches_single_satellite(self):
+        prop_crossings = find_node_crossings(START_24H, STOP_24H, PROP)
+        sat_crossings = find_node_crossings(START_24H, STOP_24H, SAT)
+        assert len(prop_crossings) == len(sat_crossings)
+        for pc, sc in zip(prop_crossings, sat_crossings):
+            diff = abs((pc.start - sc.start) / np.timedelta64(1, "s"))
+            assert diff < 1.0
+
+
+class TestPropagatorSunlit:
+    """Test find_sunlit_periods with a Propagator."""
+
+    def test_returns_list(self):
+        periods = find_sunlit_periods(START_24H, STOP_24H, PROP)
+        assert isinstance(periods, list)
+        for p in periods:
+            assert isinstance(p, SunlitPeriod)
+
+    def test_matches_single_satellite(self):
+        prop_periods = find_sunlit_periods(START_24H, STOP_24H, PROP)
+        sat_periods = find_sunlit_periods(START_24H, STOP_24H, SAT)
+        assert len(prop_periods) == len(sat_periods)
+        for pp, sp in zip(prop_periods, sat_periods):
+            diff = abs((pp.start - sp.start) / np.timedelta64(1, "s"))
+            assert diff < 1.0
+
+
+class TestPropagatorEclipse:
+    """Test find_eclipse_periods with a Propagator."""
+
+    def test_returns_list(self):
+        periods = find_eclipse_periods(START_24H, STOP_24H, PROP)
+        assert isinstance(periods, list)
+        for p in periods:
+            assert isinstance(p, EclipsePeriod)
+
+    def test_matches_single_satellite(self):
+        prop_periods = find_eclipse_periods(START_24H, STOP_24H, PROP)
+        sat_periods = find_eclipse_periods(START_24H, STOP_24H, SAT)
+        assert len(prop_periods) == len(sat_periods)
+        for pp, sp in zip(prop_periods, sat_periods):
+            diff = abs((pp.start - sp.start) / np.timedelta64(1, "s"))
+            assert diff < 1.0
+
+
+class TestPropagatorAscending:
+    """Test find_ascending_periods with a Propagator."""
+
+    def test_returns_list(self):
+        periods = find_ascending_periods(START_24H, STOP_24H, PROP)
+        assert isinstance(periods, list)
+        for p in periods:
+            assert isinstance(p, AscendingPeriod)
+
+    def test_matches_single_satellite(self):
+        prop_periods = find_ascending_periods(START_24H, STOP_24H, PROP)
+        sat_periods = find_ascending_periods(START_24H, STOP_24H, SAT)
+        assert len(prop_periods) == len(sat_periods)
+        for pp, sp in zip(prop_periods, sat_periods):
+            diff = abs((pp.start - sp.start) / np.timedelta64(1, "s"))
+            assert diff < 1.0
+
+
+class TestPropagatorDescending:
+    """Test find_descending_periods with a Propagator."""
+
+    def test_returns_list(self):
+        periods = find_descending_periods(START_24H, STOP_24H, PROP)
+        assert isinstance(periods, list)
+        for p in periods:
+            assert isinstance(p, DescendingPeriod)
+
+    def test_matches_single_satellite(self):
+        prop_periods = find_descending_periods(START_24H, STOP_24H, PROP)
+        sat_periods = find_descending_periods(START_24H, STOP_24H, SAT)
+        assert len(prop_periods) == len(sat_periods)
+        for pp, sp in zip(prop_periods, sat_periods):
+            diff = abs((pp.start - sp.start) / np.timedelta64(1, "s"))
+            assert diff < 1.0
+
+
+# ---------- Multi-TLE Propagator tests ----------
+
+
+MULTI_START = np.datetime64("1998-11-20T00:00:00", "us")
+MULTI_STOP = np.datetime64("1998-12-20T00:00:00", "us")
+
+
+class TestMultiTLEPropagator:
+    """Test event functions with a multi-TLE Propagator spanning 30 days."""
+
+    def test_passes_over_long_window(self):
+        passes = find_passes(
+            MULTI_START, MULTI_STOP, PROP_MULTI, BOULDER_LAT, BOULDER_LON
+        )
+        assert len(passes) > 10
+        for p in passes:
+            assert isinstance(p, SatellitePass)
+            assert p.start >= MULTI_START
+            assert p.stop <= MULTI_STOP
+
+    def test_sunlit_no_gaps_at_transitions(self):
+        """Sunlit periods should have no artificial gaps at TLE transitions."""
+        periods = find_sunlit_periods(MULTI_START, MULTI_STOP, PROP_MULTI)
+        assert len(periods) > 100
+        for p in periods:
+            assert p.start < p.stop
+        for i in range(len(periods) - 1):
+            assert periods[i].stop <= periods[i + 1].start
+
+    def test_eclipse_no_gaps_at_transitions(self):
+        periods = find_eclipse_periods(MULTI_START, MULTI_STOP, PROP_MULTI)
+        assert len(periods) > 100
+        for p in periods:
+            assert p.start < p.stop
+        for i in range(len(periods) - 1):
+            assert periods[i].stop <= periods[i + 1].start
+
+    def test_node_crossings_over_long_window(self):
+        crossings = find_node_crossings(MULTI_START, MULTI_STOP, PROP_MULTI)
+        assert len(crossings) > 100
+        for i in range(len(crossings) - 1):
+            assert crossings[i].start < crossings[i + 1].start

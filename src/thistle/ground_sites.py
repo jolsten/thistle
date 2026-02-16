@@ -1,6 +1,6 @@
 """Ground site visibility geometry on the WGS84 ellipsoid."""
 
-from typing import cast
+from typing import Sequence, Union, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -9,8 +9,15 @@ from skyfield.api import EarthSatellite, wgs84
 from thistle.orbit_data import AU_PER_DAY_TO_M_PER_S, AU_TO_M, GenerateResult, ts
 from thistle.utils import jday_datetime64
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from thistle.propagator import Propagator
+
 # WGS84 semi-major axis (m) used to convert Earth-central angle to arc distance.
 _WGS84_A = 6378137.0
+
+SPEED_OF_LIGHT = 299_792_458.0  # m/s
 
 
 def visibility_circle(
@@ -64,17 +71,14 @@ def visibility_circle(
     return lats, lons
 
 
-def generate_range(
+def _generate_range_single(
     times: npt.NDArray[np.datetime64],
     satellite: EarthSatellite,
     lat: float,
     lon: float,
     alt: float = 0.0,
 ) -> GenerateResult:
-    """Generate slant range and range rate from a ground site to a satellite.
-
-    Computes the topocentric range (distance) and range rate (time derivative
-    of range) from a WGS84 ground site to the satellite at each time step.
+    """Generate slant range and range rate for a single site and satellite.
 
     Args:
         times: Array of datetime64 values.
@@ -100,3 +104,117 @@ def generate_range(
     range_rate = np.sum(r * v, axis=0) / slant_range
 
     return {"range": slant_range, "range_rate": range_rate}
+
+
+def _normalize_site(site: tuple) -> tuple[float, float, float]:
+    """Normalize a site tuple to (lat, lon, alt), defaulting alt to 0.0."""
+    if len(site) == 2:
+        return (float(site[0]), float(site[1]), 0.0)
+    elif len(site) == 3:
+        return (float(site[0]), float(site[1]), float(site[2]))
+    else:
+        raise ValueError(f"Site tuple must have 2 or 3 elements, got {len(site)}")
+
+
+def generate_range(
+    times: npt.NDArray[np.datetime64],
+    satellite: Union[EarthSatellite, "Propagator"],
+    sites: Union[Sequence[tuple], dict[str, tuple]],
+) -> GenerateResult:
+    """Generate slant range and range rate from ground sites to a satellite.
+
+    Computes the topocentric range (distance) and range rate (time derivative
+    of range) from one or more WGS84 ground sites to the satellite at each
+    time step.
+
+    Args:
+        times: Array of datetime64 values.
+        satellite: A Skyfield EarthSatellite or a Propagator object.
+        sites: Ground sites, either as:
+            - A sequence of (lat, lon) or (lat, lon, alt) tuples.
+              Keys are indexed: range_0, range_rate_0, range_1, ...
+            - A dict mapping site names to (lat, lon) or (lat, lon, alt) tuples.
+              Keys use the name: range_ksc, range_rate_ksc, ...
+
+    Returns:
+        A dict with keys range_{suffix} (m) and range_rate_{suffix} (m/s)
+        for each site.
+    """
+    from thistle.propagator import Propagator
+
+    # Build ordered list of (suffix, lat, lon, alt)
+    if isinstance(sites, dict):
+        site_list = [
+            (name, *_normalize_site(coords))
+            for name, coords in sites.items()
+        ]
+    else:
+        site_list = [
+            (str(i), *_normalize_site(coords))
+            for i, coords in enumerate(sites)
+        ]
+
+    is_propagator = isinstance(satellite, Propagator)
+    result: GenerateResult = {}
+
+    for suffix, lat, lon, alt in site_list:
+        if is_propagator:
+            site_data = _generate_range_propagator(times, satellite, lat, lon, alt)
+        else:
+            site_data = _generate_range_single(times, satellite, lat, lon, alt)
+
+        result[f"range_{suffix}"] = site_data["range"]
+        result[f"range_rate_{suffix}"] = site_data["range_rate"]
+
+    return result
+
+
+def _generate_range_propagator(
+    times: npt.NDArray[np.datetime64],
+    propagator: "Propagator",
+    lat: float,
+    lon: float,
+    alt: float,
+) -> GenerateResult:
+    """Generate range/range_rate using a Propagator with TLE switching.
+
+    Splits the time array into segments and processes each with the
+    appropriate satellite, then merges results.
+    """
+    segments = propagator.segment_times(times)
+
+    segment_results = []
+    for t_slice, sat in segments:
+        seg_data = _generate_range_single(t_slice, sat, lat, lon, alt)
+        segment_results.append((len(t_slice), seg_data))
+
+    result: GenerateResult = {}
+    if segment_results:
+        for key in ("range", "range_rate"):
+            output = np.empty(len(times), dtype=np.float64)
+            offset = 0
+            for n, seg_data in segment_results:
+                output[offset : offset + n] = seg_data[key]
+                offset += n
+            result[key] = output
+
+    return result
+
+
+def doppler_shift(
+    range_rate: npt.NDArray,
+    freq: float,
+) -> npt.NDArray:
+    """Compute Doppler frequency shift from range rate.
+
+    Uses the classical (non-relativistic) Doppler formula:
+        doppler = -freq * range_rate / c
+
+    Args:
+        range_rate: Range rate in m/s (positive = receding).
+        freq: Transmit frequency in Hz.
+
+    Returns:
+        Doppler shift in Hz (positive = approaching / compression).
+    """
+    return -freq * range_rate / SPEED_OF_LIGHT
