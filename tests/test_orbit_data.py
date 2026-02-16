@@ -5,6 +5,7 @@ import pytest
 from skyfield.api import EarthSatellite, load
 
 from thistle.utils import read_tle
+from thistle.ground_sites import generate_range
 from thistle.orbit_data import (
     GENERATORS,
     generate,
@@ -471,3 +472,65 @@ class TestGenerate:
                 rtol=1e-10,
                 err_msg=f"{key} mismatch"
             )
+
+
+# ---------------------------------------------------------------------------
+# generate() with sites
+# ---------------------------------------------------------------------------
+SITE_LAT, SITE_LON = 40.0, -105.0
+
+
+class TestGenerateWithSites:
+    """Tests for generate() with the sites parameter."""
+
+    def test_sites_list_keys(self):
+        """Indexed site produces range_0, range_rate_0."""
+        result = generate(TIMES, SAT, ["eci"], sites=[(SITE_LAT, SITE_LON)])
+        assert "range_0" in result
+        assert "range_rate_0" in result
+
+    def test_sites_dict_keys(self):
+        """Named site produces range_ksc, range_rate_ksc."""
+        result = generate(TIMES, SAT, ["eci"], sites={"ksc": (SITE_LAT, SITE_LON)})
+        assert "range_ksc" in result
+        assert "range_rate_ksc" in result
+
+    def test_sites_and_groups_coexist(self):
+        """Orbit groups and range keys coexist in the result."""
+        result = generate(TIMES, SAT, ["eci", "lla"], sites=[(SITE_LAT, SITE_LON)])
+        assert "eci_x" in result
+        assert "lat" in result
+        assert "range_0" in result
+        assert "range_rate_0" in result
+
+    def test_sites_shape_and_dtype(self):
+        """Range arrays have correct shape and stay float64."""
+        result = generate(TIMES, SAT, ["eci"], sites=[(SITE_LAT, SITE_LON)])
+        assert result["range_0"].shape == (N,)
+        assert result["range_rate_0"].shape == (N,)
+        assert result["range_0"].dtype == np.float64
+        assert result["range_rate_0"].dtype == np.float64
+
+    def test_sites_matches_standalone(self):
+        """Integrated range matches standalone generate_range (no light-time)."""
+        integrated = generate(TIMES, SAT, ["eci"], sites=[(SITE_LAT, SITE_LON)])
+        standalone = generate_range(TIMES, SAT, sites=[(SITE_LAT, SITE_LON)])
+        # Should be very close — only difference is light-time correction
+        np.testing.assert_allclose(
+            integrated["range_0"], standalone["range_0"], rtol=1e-6
+        )
+        np.testing.assert_allclose(
+            integrated["range_rate_0"], standalone["range_rate_0"], rtol=1e-4
+        )
+
+    def test_sites_with_propagator(self):
+        """Propagator + sites produces correct shapes."""
+        prop = Propagator(_tles[:1], method="epoch")
+        result = generate(TIMES, prop, ["eci"], sites=[(SITE_LAT, SITE_LON)])
+        assert result["range_0"].shape == (N,)
+        assert result["range_rate_0"].shape == (N,)
+
+    def test_no_sites_no_range_keys(self):
+        """Omitting sites produces no range keys."""
+        result = generate(TIMES, SAT, ["eci"])
+        assert not any(k.startswith("range") for k in result)

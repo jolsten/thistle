@@ -1,13 +1,13 @@
 """Ground site visibility geometry on the WGS84 ellipsoid."""
 
-from typing import Sequence, Union, cast
+from typing import Union, cast
 
 import numpy as np
 import numpy.typing as npt
 from skyfield.api import EarthSatellite, wgs84
 
-from thistle.orbit_data import AU_PER_DAY_TO_M_PER_S, AU_TO_M, GenerateResult, ts
-from thistle.utils import jday_datetime64
+from thistle.orbit_data import AU_PER_DAY_TO_M_PER_S, AU_TO_M, GenerateResult, Sites, _normalize_site, ts
+from thistle.utils import dt64_to_time
 
 from typing import TYPE_CHECKING
 
@@ -92,8 +92,7 @@ def _generate_range_single(
     """
     topos = wgs84.latlon(lat, lon, elevation_m=alt)
 
-    jd, fr = jday_datetime64(times)
-    t = ts.tt_jd(jd, fr)
+    t = dt64_to_time(times, ts)
 
     topo_pos = (satellite - topos).at(t)
 
@@ -106,20 +105,10 @@ def _generate_range_single(
     return {"range": slant_range, "range_rate": range_rate}
 
 
-def _normalize_site(site: tuple) -> tuple[float, float, float]:
-    """Normalize a site tuple to (lat, lon, alt), defaulting alt to 0.0."""
-    if len(site) == 2:
-        return (float(site[0]), float(site[1]), 0.0)
-    elif len(site) == 3:
-        return (float(site[0]), float(site[1]), float(site[2]))
-    else:
-        raise ValueError(f"Site tuple must have 2 or 3 elements, got {len(site)}")
-
-
 def generate_range(
     times: npt.NDArray[np.datetime64],
     satellite: Union[EarthSatellite, "Propagator"],
-    sites: Union[Sequence[tuple], dict[str, tuple]],
+    sites: Sites,
 ) -> GenerateResult:
     """Generate slant range and range rate from ground sites to a satellite.
 

@@ -35,6 +35,17 @@ ts = load.timescale()
 eph = load(str(_DATA_DIR / "de421.bsp"))
 
 GenerateResult = Dict[str, npt.NDArray]
+Sites = Union[Sequence[tuple], dict[str, tuple]]
+
+
+def _normalize_site(site: tuple) -> tuple[float, float, float]:
+    """Normalize a site tuple to (lat, lon, alt), defaulting alt to 0.0."""
+    if len(site) == 2:
+        return (float(site[0]), float(site[1]), 0.0)
+    elif len(site) == 3:
+        return (float(site[0]), float(site[1]), float(site[2]))
+    else:
+        raise ValueError(f"Site tuple must have 2 or 3 elements, got {len(site)}")
 
 
 def _propagate(times, satellite):
@@ -228,6 +239,35 @@ _EXTRACTORS = {
     "mag_total": _extract_mag_total,
     "mag_ecef": _extract_mag_ecef,
 }
+
+
+def _extract_range(t, geocentric, sites):
+    """Compute slant range and range rate from pre-computed geocentric state.
+
+    Reuses the satellite geocentric result to avoid redundant SGP4 propagation.
+    Ground site positions are computed via Earth rotation only.
+
+    Args:
+        t: Skyfield Time array.
+        geocentric: Skyfield Geocentric from satellite.at(t).
+        sites: List of (suffix, lat, lon, alt) tuples.
+
+    Returns:
+        Dict with range_{suffix} (m) and range_rate_{suffix} (m/s) per site.
+    """
+    result: GenerateResult = {}
+    for suffix, lat, lon, alt in sites:
+        ground = wgs84.latlon(lat, lon, elevation_m=alt).at(t)
+        r = (cast(npt.NDArray, geocentric.xyz.au) - cast(npt.NDArray, ground.xyz.au)) * AU_TO_M
+        v = (
+            cast(npt.NDArray, geocentric.velocity.au_per_d)
+            - cast(npt.NDArray, ground.velocity.au_per_d)
+        ) * AU_PER_DAY_TO_M_PER_S
+        slant_range = np.sqrt(np.sum(r**2, axis=0))
+        range_rate = np.sum(r * v, axis=0) / slant_range
+        result[f"range_{suffix}"] = slant_range
+        result[f"range_rate_{suffix}"] = range_rate
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +560,7 @@ def _generate_with_propagator(
     times: npt.NDArray[np.datetime64],
     propagator: "Propagator",
     groups: Sequence[str],
+    site_list: Optional[list] = None,
 ) -> GenerateResult:
     """Generate data using a Propagator with automatic TLE switching.
 
@@ -530,6 +571,7 @@ def _generate_with_propagator(
         times: Array of datetime64 values.
         propagator: A Propagator object.
         groups: Which data groups to compute.
+        site_list: Normalized site list [(suffix, lat, lon, alt), ...].
 
     Returns:
         A dict with all requested data groups.
@@ -543,6 +585,8 @@ def _generate_with_propagator(
         segment_data = {}  # type: GenerateResult
         for name in groups:
             segment_data.update(_EXTRACTORS[name](t, geocentric))
+        if site_list:
+            segment_data.update(_extract_range(t, geocentric, site_list))
         segment_results.append((len(t_slice), segment_data))
 
     # Merge segments back into full arrays
@@ -567,13 +611,13 @@ def generate(
     times: npt.NDArray[np.datetime64],
     satellite: Union[EarthSatellite, "Propagator"],
     groups: Sequence[str],
+    sites: Optional[Sites] = None,
 ) -> GenerateResult:
     """Run one or more generate functions and merge the results.
 
     Arrays are downcast where full float64 precision is unnecessary:
-    float32 for angles, dimensionless elements, and magnetic field;
-    float16 for local solar time. Positions and velocities in meters
-    remain float64.
+    float32 for angles, dimensionless elements, and magnetic field.
+    Positions, velocities, range, and range rate remain float64.
 
     When a Propagator is provided, the time array is split into segments
     based on the transition times in the propagator, and each segment is
@@ -586,6 +630,10 @@ def generate(
         groups: Which data groups to compute. Valid names:
             eci, ecef, lla, keplerian, equinoctial, sunlight,
             beta, lst, mag_enu, mag_total, mag_ecef.
+        sites: Optional ground sites for range/range_rate computation.
+            A sequence of (lat, lon) or (lat, lon, alt) tuples (keys
+            indexed: range_0, range_rate_0, ...) or a dict mapping
+            names to tuples (keys named: range_ksc, range_rate_ksc, ...).
 
     Returns:
         A single dict merging all requested groups.
@@ -600,17 +648,33 @@ def generate(
                 f"Unknown group {name!r}, expected one of {list(_EXTRACTORS)}"
             )
 
+    # Build normalized site list
+    site_list = None
+    if sites is not None:
+        if isinstance(sites, dict):
+            site_list = [
+                (name, *_normalize_site(coords))
+                for name, coords in sites.items()
+            ]
+        else:
+            site_list = [
+                (str(i), *_normalize_site(coords))
+                for i, coords in enumerate(sites)
+            ]
+
     # Dispatch to appropriate implementation
     from thistle.propagator import Propagator
 
     if isinstance(satellite, Propagator):
-        result = _generate_with_propagator(times, satellite, groups)
+        result = _generate_with_propagator(times, satellite, groups, site_list)
     else:
         # Single satellite case — propagate once, extract all groups
         t, geocentric = _propagate(times, satellite)
         result = {}  # type: GenerateResult
         for name in groups:
             result.update(_EXTRACTORS[name](t, geocentric))
+        if site_list:
+            result.update(_extract_range(t, geocentric, site_list))
 
     # Downcast arrays where appropriate
     for key, arr in result.items():

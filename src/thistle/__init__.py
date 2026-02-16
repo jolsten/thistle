@@ -6,7 +6,7 @@ except ImportError:
     __version__ = version("thistle")
 
 from thistle.ground_sites import doppler_shift, generate_range, visibility_circle
-from thistle.orbit_data import generate
+from thistle.orbit_data import Sites, generate
 from thistle.propagator import (
     EpochSwitchStrategy,
     MidpointSwitchStrategy,
@@ -25,4 +25,5 @@ __all__ = [
     "generate_range",
     "doppler_shift",
     "generate",
+    "Sites",
 ]
