@@ -213,3 +213,7 @@ Thistle treats UTC as UT1, introducing ~0.2-0.9 seconds of time offset (~1-7 m p
 ### Coordinate system
 
 ECI outputs use the ICRF (International Celestial Reference Frame), equivalent to J2000 for most applications.
+
+## License
+
+MIT. See [LICENSE](LICENSE) for details.
