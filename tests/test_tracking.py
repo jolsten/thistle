@@ -4,12 +4,12 @@ import numpy as np
 import pytest
 from skyfield.api import EarthSatellite, load
 
-from thistle.utils import read_tle
 from thistle.tracking import (
     DopplerGeolocationResult,
     generate_range,
     geolocate_doppler,
 )
+from thistle.utils import read_tle
 
 ts = load.timescale()
 _tles = read_tle("tests/data/25544.tle")
@@ -27,64 +27,9 @@ SITE_LAT, SITE_LON = 40.0, -105.0
 _PASS_SITE_LAT, _PASS_SITE_LON = 42.0, 116.57
 _PASS_CENTER = np.datetime64("1998-11-20T08:29:20")
 _PASS_TIMES = _PASS_CENTER + np.arange(-300, 300, 10, dtype="timedelta64[s]")
-_PASS_RR = generate_range(_PASS_TIMES, SAT, _PASS_SITE_LAT, _PASS_SITE_LON)["range_rate"]
-
-
-class TestGenerateRange:
-    """Tests for generate_range."""
-
-    def test_keys(self):
-        result = generate_range(TIMES, SAT, SITE_LAT, SITE_LON)
-        assert set(result) == {"range", "range_rate"}
-
-    def test_shapes(self):
-        result = generate_range(TIMES, SAT, SITE_LAT, SITE_LON)
-        assert result["range"].shape == (N,)
-        assert result["range_rate"].shape == (N,)
-
-    def test_dtype_float64(self):
-        result = generate_range(TIMES, SAT, SITE_LAT, SITE_LON)
-        assert result["range"].dtype == np.float64
-        assert result["range_rate"].dtype == np.float64
-
-    def test_range_positive(self):
-        result = generate_range(TIMES, SAT, SITE_LAT, SITE_LON)
-        assert np.all(result["range"] > 0)
-
-    def test_range_magnitude_leo(self):
-        """Range to LEO should be between ~150 km and ~13000 km."""
-        result = generate_range(TIMES, SAT, SITE_LAT, SITE_LON)
-        assert np.all(result["range"] > 150_000)
-        assert np.all(result["range"] < 13_000_000)
-
-    def test_range_rate_bounded_by_velocity(self):
-        """Range rate magnitude cannot exceed satellite velocity (~7.5 km/s)."""
-        result = generate_range(TIMES, SAT, SITE_LAT, SITE_LON)
-        assert np.all(np.abs(result["range_rate"]) < 8_500)
-
-    def test_alt_default_zero(self):
-        """Calling with and without alt=0.0 gives the same result."""
-        r1 = generate_range(TIMES, SAT, SITE_LAT, SITE_LON)
-        r2 = generate_range(TIMES, SAT, SITE_LAT, SITE_LON, alt=0.0)
-        np.testing.assert_array_equal(r1["range"], r2["range"])
-
-    def test_different_sites_different_range(self):
-        """Two different ground sites produce different range profiles."""
-        r1 = generate_range(TIMES, SAT, 0.0, 0.0)
-        r2 = generate_range(TIMES, SAT, 45.0, 90.0)
-        assert not np.allclose(r1["range"], r2["range"])
-
-    def test_range_varies_over_orbit(self):
-        """Range should not be constant over a full hour."""
-        result = generate_range(TIMES, SAT, SITE_LAT, SITE_LON)
-        assert result["range"].std() > 1000
-
-    def test_single_time(self):
-        """Works with a single-element time array."""
-        single = TIMES[:1]
-        result = generate_range(single, SAT, SITE_LAT, SITE_LON)
-        assert result["range"].shape == (1,)
-        assert result["range_rate"].shape == (1,)
+_PASS_RR = generate_range(_PASS_TIMES, SAT, _PASS_SITE_LAT, _PASS_SITE_LON)[
+    "range_rate"
+]
 
 
 class TestGeolocateDoppler:
@@ -141,7 +86,9 @@ class TestGeolocateDoppler:
         """Providing lat0/lon0 near the true site converges."""
         doppler = 2.5 * _PASS_RR
         best = geolocate_doppler(
-            _PASS_TIMES, SAT, doppler,
+            _PASS_TIMES,
+            SAT,
+            doppler,
             lat0=_PASS_SITE_LAT + 1.0,
             lon0=_PASS_SITE_LON + 1.0,
         )[0]

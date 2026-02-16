@@ -5,53 +5,10 @@ from typing import Optional, Tuple, cast
 
 import numpy as np
 import numpy.typing as npt
-from skyfield.api import EarthSatellite, wgs84
+from skyfield.api import EarthSatellite
 
-from thistle.orbit_data import AU_PER_DAY_TO_M_PER_S, AU_TO_M, GenerateResult, generate_lla, ts
-from thistle.utils import jday_datetime64
-
-
-def generate_range(
-    times: npt.NDArray[np.datetime64],
-    satellite: EarthSatellite,
-    lat: float,
-    lon: float,
-    alt: float = 0.0,
-) -> GenerateResult:
-    """Generate slant range and range rate from a ground site to a satellite.
-
-    Computes the topocentric range (distance) and range rate (time derivative
-    of range) from a WGS84 ground site to the satellite at each time step.
-
-    Args:
-        times: Array of datetime64 values.
-        satellite: A Skyfield EarthSatellite object.
-        lat: Ground site geodetic latitude (deg).
-        lon: Ground site geodetic longitude (deg).
-        alt: Ground site altitude above the WGS84 ellipsoid (m).
-
-    Returns:
-        A dict with keys: range (m), range_rate (m/s).
-    """
-    topos = wgs84.latlon(lat, lon, elevation_m=alt)
-
-    jd, fr = jday_datetime64(times)
-    t = ts.tt_jd(jd, fr)
-
-    topo_pos = (satellite - topos).at(t)
-
-    r = cast(npt.NDArray, topo_pos.xyz.au) * AU_TO_M
-    v = cast(npt.NDArray, topo_pos.velocity.au_per_d) * AU_PER_DAY_TO_M_PER_S
-
-    slant_range = np.sqrt(np.sum(r**2, axis=0))
-    range_rate = np.sum(r * v, axis=0) / slant_range
-
-    return {"range": slant_range, "range_rate": range_rate}
-
-
-# ---------------------------------------------------------------------------
-# Doppler geolocation
-# ---------------------------------------------------------------------------
+from thistle.ground_sites import generate_range
+from thistle.orbit_data import generate_lla
 
 
 @dataclasses.dataclass
@@ -122,15 +79,20 @@ def _reflect_across_ground_track(
     geod = Geodesic.WGS84
 
     # Sub-satellite point at TCA
-    t_arr = np.array([tca_time - np.timedelta64(10, "s"),
-                      tca_time + np.timedelta64(10, "s")])
+    t_arr = np.array(
+        [tca_time - np.timedelta64(10, "s"), tca_time + np.timedelta64(10, "s")]
+    )
     lla = generate_lla(t_arr, satellite)
     ssp_lat = float(np.mean(lla["lat"]))
     ssp_lon = float(np.mean(lla["lon"]))
 
     # Ground track bearing at TCA
-    inv_track = geod.Inverse(float(lla["lat"][0]), float(lla["lon"][0]),
-                             float(lla["lat"][1]), float(lla["lon"][1]))
+    inv_track = geod.Inverse(
+        float(lla["lat"][0]),
+        float(lla["lon"][0]),
+        float(lla["lat"][1]),
+        float(lla["lon"][1]),
+    )
     track_az = inv_track["azi1"]
 
     # Azimuth and distance from SSP to the candidate point
@@ -239,11 +201,16 @@ def geolocate_doppler(
     opts = {"xatol": 1e-4, "fatol": 1e-10, "maxiter": 200}
 
     # Try side A (initial guess)
-    result_a = minimize(_cost, x0=[lat_guess, lon_guess], method="Nelder-Mead", options=opts)
+    result_a = minimize(
+        _cost, x0=[lat_guess, lon_guess], method="Nelder-Mead", options=opts
+    )
 
     # Try side B (reflect side A's converged solution across ground track)
     lat0_b, lon0_b = _reflect_across_ground_track(
-        float(result_a.x[0]), float(result_a.x[1]), tca_time, satellite,
+        float(result_a.x[0]),
+        float(result_a.x[1]),
+        tca_time,
+        satellite,
     )
     result_b = minimize(_cost, x0=[lat0_b, lon0_b], method="Nelder-Mead", options=opts)
 

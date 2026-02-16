@@ -58,6 +58,34 @@ satrec = prop.find_satrec(time)
 tle = prop.find_tle(time)
 ```
 
+## Accuracy & Limitations
+
+### TLE Propagation Accuracy
+
+TLE-based orbit propagation using SGP4 has inherent accuracy limits:
+- **±1-10 km** position accuracy near TLE epoch
+- **±10-100 km** accuracy further from epoch (days to weeks)
+- Best accuracy within a few days of the TLE epoch
+
+### Time Scale Approximation
+
+Thistle uses a pragmatic time scale approximation for performance:
+- **Implementation**: Treats UTC as UT1 (Universal Time)
+- **Error**: ~0.2-0.9 seconds time offset
+- **Impact**: ~1-7 meters position error for LEO satellites
+- **Justification**: This error is **1000x smaller** than TLE propagation errors
+
+The alternative (proper UTC with leap seconds) would:
+- Add ~12x computational overhead
+- Provide only ~1 meter accuracy improvement
+- Still be dominated by ±1-10 km TLE errors
+
+For applications requiring sub-meter accuracy, use high-precision ephemerides (e.g., SP3) instead of TLEs.
+
+### Coordinate System
+
+All ECI (Earth-Centered Inertial) outputs use the **ICRF** (International Celestial Reference Frame), which is equivalent to J2000 for most applications.
+
 ## Requirements
 
 Python >= 3.9

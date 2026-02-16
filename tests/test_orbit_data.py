@@ -20,6 +20,7 @@ from thistle.orbit_data import (
     generate_magnetic_field_total,
     generate_sunlight,
 )
+from thistle.propagator import Propagator
 
 ts = load.timescale()
 _tles = read_tle("tests/data/25544.tle")
@@ -422,3 +423,51 @@ class TestGenerate:
         result = generate(TIMES, SAT, ["eci"])
         for key in ("eci_x", "eci_y", "eci_z"):
             assert result[key].dtype == np.float64, f"{key} not float64"
+
+    def test_generate_with_propagator(self):
+        """Test generate() with a Propagator object."""
+        # Load multiple TLEs
+        tles = read_tle("tests/data/25544.tle")[:3]  # Use first 3 TLEs
+
+        # Create a propagator
+        propagator = Propagator(tles, method="epoch")
+
+        # Generate data across time range that spans multiple TLEs
+        times = T0 + np.arange(0, 10 * 24 * 60 * 60, 60 * 60, dtype="timedelta64[s]")
+        result = generate(times, propagator, ["eci", "lla"])
+
+        # Verify all expected keys are present
+        assert "eci_x" in result
+        assert "eci_y" in result
+        assert "eci_z" in result
+        assert "lat" in result
+        assert "lon" in result
+        assert "alt" in result
+
+        # Verify output shapes match input times
+        for key in result:
+            assert result[key].shape == (len(times),), f"{key} shape mismatch"
+
+        # Verify position magnitude is reasonable for LEO
+        r = np.sqrt(result["eci_x"]**2 + result["eci_y"]**2 + result["eci_z"]**2)
+        assert np.all(r > 6_300_000)
+        assert np.all(r < 7_200_000)
+
+    def test_generate_with_propagator_matches_single_satellite(self):
+        """Test that Propagator with single TLE matches EarthSatellite result."""
+        # Create a propagator with a single TLE
+        tles = read_tle("tests/data/25544.tle")[:1]
+        propagator = Propagator(tles, method="epoch")
+
+        # Generate with both methods
+        result_prop = generate(TIMES, propagator, ["eci", "lla"])
+        result_sat = generate(TIMES, SAT, ["eci", "lla"])
+
+        # Results should be identical
+        for key in result_prop:
+            np.testing.assert_allclose(
+                result_prop[key],
+                result_sat[key],
+                rtol=1e-10,
+                err_msg=f"{key} mismatch"
+            )

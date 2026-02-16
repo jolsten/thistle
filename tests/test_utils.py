@@ -19,6 +19,7 @@ from thistle.utils import (
     datetime_to_dt64,
     datetime_to_tle_epoch,
     dt64_to_datetime,
+    dt64_to_time,
     ensure_alpha5,
     from_alpha5,
     group_by,
@@ -105,6 +106,67 @@ def test_jday_datetime64(dt_list: list[datetime.datetime]) -> None:
 
     assert jd == pytest.approx(exp_jd.tolist())
     assert fr == pytest.approx(exp_fr.tolist())
+
+
+# ---------------------------------------------------------------------------
+# dt64_to_time
+# ---------------------------------------------------------------------------
+
+
+def test_dt64_to_time_not_tt():
+    """Verify dt64_to_time uses UT1, not TT (which would cause ~69s error)."""
+    from skyfield.api import load
+
+    ts = load.timescale()
+
+    # Test time: 2020-04-01 00:00:00 UTC
+    times = np.array(['2020-04-01T00:00:00'], dtype='datetime64[us]')
+
+    # Convert using our function (should use UT1)
+    t_ut1 = dt64_to_time(times, ts)
+
+    # Convert using Skyfield's native UTC (correct reference)
+    t_utc = ts.utc(2020, 4, 1, 0, 0, 0)
+
+    # Compare TT Julian dates - they should be very close (< 1 second difference)
+    # UT1 and UTC differ by < 0.9 seconds (DUT1)
+    # If we were incorrectly using TT, the difference would be ~69 seconds
+    diff_seconds = abs(t_ut1.tt - t_utc.tt) * 86400
+
+    # Allow 1 second tolerance (UT1-UTC difference)
+    assert diff_seconds < 1.0, (
+        f"Time difference {diff_seconds:.3f}s suggests wrong time scale. "
+        f"Expected < 1s (UT1-UTC), got {diff_seconds:.3f}s. "
+        f"If ~69s, this indicates TT bug!"
+    )
+
+
+def test_dt64_to_time_array():
+    """Test dt64_to_time works with arrays of times."""
+    from skyfield.api import load
+
+    ts = load.timescale()
+
+    # Array of times
+    times = np.array([
+        '2020-04-01T00:00:00',
+        '2020-04-01T01:00:00',
+        '2020-04-01T02:00:00',
+    ], dtype='datetime64[us]')
+
+    t = dt64_to_time(times, ts)
+
+    # Verify we get an array of times back
+    assert hasattr(t, 'tt')
+    assert len(t.tt) == 3
+
+    # Verify the times are in the right order and spaced correctly
+    # Should be 1 hour apart in TT (approximately)
+    tt_diff_1 = (t.tt[1] - t.tt[0]) * 24  # Convert days to hours
+    tt_diff_2 = (t.tt[2] - t.tt[1]) * 24
+
+    assert abs(tt_diff_1 - 1.0) < 0.01, f"Expected 1 hour, got {tt_diff_1:.6f}"
+    assert abs(tt_diff_2 - 1.0) < 0.01, f"Expected 1 hour, got {tt_diff_2:.6f}"
 
 
 # ---------------------------------------------------------------------------

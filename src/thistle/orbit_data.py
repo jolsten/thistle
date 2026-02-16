@@ -6,7 +6,7 @@ magnetic field in nanoTesla, and local solar time in fractional hours.
 
 import datetime
 import pathlib
-from typing import Dict, Optional, Sequence, cast
+from typing import Dict, Optional, Sequence, Union, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -15,7 +15,13 @@ from skyfield.elementslib import osculating_elements_of
 from skyfield.framelib import itrs
 from skyfield.functions import angle_between
 
-from thistle.utils import jday_datetime64
+from thistle.utils import dt64_to_time
+
+# Import TYPE_CHECKING to avoid circular imports
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from thistle.propagator import Propagator
 
 AU_TO_M = 149_597_870_700.0
 AU_PER_DAY_TO_M_PER_S = AU_TO_M / 86_400.0
@@ -33,8 +39,7 @@ GenerateResult = Dict[str, npt.NDArray]
 
 def _propagate(times, satellite):
     """Convert datetime64 array to Skyfield Time and propagate."""
-    jd, fr = jday_datetime64(times)
-    t = ts.tt_jd(jd, fr)
+    t = dt64_to_time(times, ts)
     return t, satellite.at(t)
 
 
@@ -427,9 +432,63 @@ _F32_KEYS = {
 }
 
 
+def _generate_with_propagator(
+    times: npt.NDArray[np.datetime64],
+    propagator: "Propagator",
+    groups: Sequence[str],
+) -> GenerateResult:
+    """Generate data using a Propagator with automatic TLE switching.
+
+    Splits the time array into segments based on transition times and
+    processes each segment with the appropriate satellite.
+
+    Args:
+        times: Array of datetime64 values.
+        propagator: A Propagator object.
+        groups: Which data groups to compute.
+
+    Returns:
+        A dict with all requested data groups.
+    """
+    from thistle.propagator import _slices_by_transitions
+
+    # Split time array based on transition times
+    segments = _slices_by_transitions(propagator.switcher.transitions, times)
+
+    # Process each segment
+    segment_results = []
+    for sat_idx, time_indices in segments:
+        segment_times = times[time_indices]
+        segment_satellite = propagator.switcher.satellites[sat_idx]
+
+        # Compute data for this segment
+        segment_data = {}  # type: GenerateResult
+        for name in groups:
+            segment_data.update(GENERATORS[name](segment_times, segment_satellite))
+
+        segment_results.append((time_indices, segment_data))
+
+    # Merge segments back into full arrays
+    result = {}  # type: GenerateResult
+    if segment_results:
+        all_keys = set(segment_results[0][1].keys())
+        for key in all_keys:
+            # Create output array with same shape as input times
+            first_segment_value = segment_results[0][1][key]
+            output_array = np.empty(len(times), dtype=first_segment_value.dtype)
+
+            # Fill in values from each segment
+            for time_indices, segment_data in segment_results:
+                output_array[time_indices] = segment_data[key]
+
+            result[key] = output_array
+
+    return result
+
+
 def generate(
     times: npt.NDArray[np.datetime64],
-    satellite: EarthSatellite,
+    satellite: Union[EarthSatellite, "Propagator"],
     groups: Sequence[str],
 ) -> GenerateResult:
     """Run one or more generate functions and merge the results.
@@ -439,9 +498,14 @@ def generate(
     float16 for local solar time. Positions and velocities in meters
     remain float64.
 
+    When a Propagator is provided, the time array is split into segments
+    based on the transition times in the propagator, and each segment is
+    computed using the appropriate EarthSatellite object. Results are
+    merged at the end.
+
     Args:
         times: Array of datetime64 values.
-        satellite: A Skyfield EarthSatellite object.
+        satellite: A Skyfield EarthSatellite object or a Propagator.
         groups: Which data groups to compute. Valid names:
             eci, ecef, lla, keplerian, equinoctial, sunlight,
             beta, lst, mag_enu, mag_total, mag_ecef.
@@ -452,14 +516,25 @@ def generate(
     Raises:
         ValueError: If a group name is not recognized.
     """
-    result = {}  # type: GenerateResult
+    # Validate group names
     for name in groups:
         if name not in GENERATORS:
             raise ValueError(
                 f"Unknown group {name!r}, expected one of {list(GENERATORS)}"
             )
-        result.update(GENERATORS[name](times, satellite))
 
+    # Dispatch to appropriate implementation
+    from thistle.propagator import Propagator
+
+    if isinstance(satellite, Propagator):
+        result = _generate_with_propagator(times, satellite, groups)
+    else:
+        # Single satellite case
+        result = {}  # type: GenerateResult
+        for name in groups:
+            result.update(GENERATORS[name](times, satellite))
+
+    # Downcast arrays where appropriate
     for key, arr in result.items():
         if key in _F32_KEYS:
             result[key] = arr.astype(np.float32)

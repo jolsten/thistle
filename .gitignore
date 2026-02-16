@@ -131,3 +131,6 @@ dmypy.json
 
 # hatch-vcs
 _version.py
+
+# github
+.github
