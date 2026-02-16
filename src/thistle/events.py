@@ -5,77 +5,16 @@ from typing import Optional, Union, cast
 import numpy as np
 import numpy.typing as npt
 import skyfield.timelib
-from pydantic import BaseModel, ConfigDict
 from skyfield import almanac
 from skyfield.api import EarthSatellite, wgs84
 
-from thistle.orbit_data import eph, ts
+from thistle._core import eph, ts
 from thistle.utils import jday_datetime64, time_to_dt64
 
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from thistle.propagator import Propagator
-
-
-class Event(BaseModel):
-    """Base class for all satellite events.
-
-    Attributes:
-        start: Start time of the event.
-        stop: End time of the event. Equal to start for instantaneous events.
-    """
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    start: np.datetime64
-    stop: np.datetime64
-
-
-class SatellitePass(Event):
-    """A satellite pass over a ground site.
-
-    Attributes:
-        start: Time the satellite rises above the minimum elevation.
-        stop: Time the satellite sets below the minimum elevation.
-        peak_time: Time of maximum elevation (culmination).
-        peak_elevation: Maximum elevation angle (deg).
-    """
-
-    peak_time: np.datetime64
-    peak_elevation: float
-
-
-class NodeCrossing(Event):
-    """An orbital node crossing (equator crossing).
-
-    start and stop are both set to the crossing time.
-
-    Attributes:
-        start: Time of the equator crossing.
-        stop: Time of the equator crossing (same as start).
-        longitude: Geodetic longitude at the crossing (deg).
-        ascending: True if the satellite is moving northbound.
-    """
-
-    longitude: float
-    ascending: bool
-
-
-class SunlitPeriod(Event):
-    """A period during which the satellite is in sunlight."""
-
-
-class EclipsePeriod(Event):
-    """A period during which the satellite is in Earth's shadow."""
-
-
-class AscendingPeriod(Event):
-    """A period during which the satellite latitude is increasing (moving northward)."""
-
-
-class DescendingPeriod(Event):
-    """A period during which the satellite latitude is decreasing (moving southward)."""
 
 
 # ---------------------------------------------------------------------------
@@ -106,14 +45,14 @@ def _split_window(
     return result
 
 
-def _merge_periods(periods: list, cls: type) -> list:
+def _merge_periods(periods: list[dict]) -> list[dict]:
     """Merge consecutive periods that touch at a boundary."""
     if not periods:
         return periods
     merged = [periods[0]]
     for p in periods[1:]:
-        if p.start == merged[-1].stop:
-            merged[-1] = cls(start=merged[-1].start, stop=p.stop)
+        if p["start"] == merged[-1]["stop"]:
+            merged[-1] = {"start": merged[-1]["start"], "stop": p["stop"]}
         else:
             merged.append(p)
     return merged
@@ -136,10 +75,9 @@ def _group_periods(
     event_dt64: npt.NDArray[np.datetime64],
     event_values: npt.NDArray,
     active_at_start: bool,
-    cls: type,
-) -> list:
-    """Group boolean transitions into start/stop period objects."""
-    periods = []
+) -> list[dict]:
+    """Group boolean transitions into start/stop period dicts."""
+    periods: list[dict] = []
     period_start: Optional[np.datetime64] = start if active_at_start else None
 
     for dt, val in zip(event_dt64, event_values):
@@ -147,12 +85,12 @@ def _group_periods(
             period_start = dt
         else:  # transition to inactive
             if period_start is not None:
-                periods.append(cls(start=period_start, stop=dt))
+                periods.append({"start": period_start, "stop": dt})
                 period_start = None
 
     # Close open period at window end
     if period_start is not None:
-        periods.append(cls(start=period_start, stop=stop))
+        periods.append({"start": period_start, "stop": stop})
 
     return periods
 
@@ -170,7 +108,7 @@ def find_passes(
     lon: float,
     alt: float = 0.0,
     min_elevation: float = 5.0,
-) -> list[SatellitePass]:
+) -> list[dict]:
     """Find satellite passes over a ground site within a time window.
 
     Uses Skyfield's event detection with a padded search window to
@@ -188,7 +126,7 @@ def find_passes(
         min_elevation: Minimum elevation angle (deg).
 
     Returns:
-        A list of SatellitePass objects sorted by rise time.
+        A list of dicts with keys: start, stop, peak_time, peak_elevation.
 
     Raises:
         ValueError: If start >= stop.
@@ -199,7 +137,7 @@ def find_passes(
     from thistle.propagator import Propagator
 
     if isinstance(satellite, Propagator):
-        passes: list[SatellitePass] = []
+        passes: list[dict] = []
         for sub_start, sub_stop, sat in _split_window(start, stop, satellite):
             passes.extend(
                 find_passes(sub_start, sub_stop, sat, lat, lon, alt, min_elevation)
@@ -247,14 +185,12 @@ def find_passes(
                 # where find_events produced spurious events
                 peak_el = _peak_elevation(peak_t, satellite, topos)
                 if peak_el >= min_elevation:
-                    passes.append(
-                        SatellitePass(
-                            start=rise_t,
-                            stop=set_t,
-                            peak_time=peak_t,
-                            peak_elevation=peak_el,
-                        )
-                    )
+                    passes.append({
+                        "start": rise_t,
+                        "stop": set_t,
+                        "peak_time": peak_t,
+                        "peak_elevation": peak_el,
+                    })
             rise = None
             peak = None
 
@@ -263,14 +199,12 @@ def find_passes(
         peak_t = peak if peak is not None else rise
         peak_el = _peak_elevation(peak_t, satellite, topos)
         if peak_el >= min_elevation:
-            passes.append(
-                SatellitePass(
-                    start=rise,
-                    stop=stop,
-                    peak_time=peak_t,
-                    peak_elevation=peak_el,
-                )
-            )
+            passes.append({
+                "start": rise,
+                "stop": stop,
+                "peak_time": peak_t,
+                "peak_elevation": peak_el,
+            })
 
     return passes
 
@@ -279,7 +213,7 @@ def find_node_crossings(
     start: np.datetime64,
     stop: np.datetime64,
     satellite: Union[EarthSatellite, "Propagator"],
-) -> list[NodeCrossing]:
+) -> list[dict]:
     """Find orbital node crossings (equator crossings) within a time window.
 
     Args:
@@ -288,7 +222,7 @@ def find_node_crossings(
         satellite: A Skyfield EarthSatellite or Propagator object.
 
     Returns:
-        A list of NodeCrossing objects sorted by time.
+        A list of dicts with keys: start, stop, longitude, ascending.
 
     Raises:
         ValueError: If start >= stop.
@@ -299,7 +233,7 @@ def find_node_crossings(
     from thistle.propagator import Propagator
 
     if isinstance(satellite, Propagator):
-        crossings: list[NodeCrossing] = []
+        crossings: list[dict] = []
         for sub_start, sub_stop, sat in _split_window(start, stop, satellite):
             crossings.extend(find_node_crossings(sub_start, sub_stop, sat))
         return crossings
@@ -321,14 +255,12 @@ def find_node_crossings(
     for dt, t_sky, val in zip(event_dt64, event_times, event_values):
         geo = satellite.at(t_sky)
         lon = float(cast(npt.NDArray, wgs84.subpoint(geo).longitude.degrees))
-        crossings.append(
-            NodeCrossing(
-                start=dt,
-                stop=dt,
-                longitude=lon,
-                ascending=bool(val),
-            )
-        )
+        crossings.append({
+            "start": dt,
+            "stop": dt,
+            "longitude": lon,
+            "ascending": bool(val),
+        })
 
     return crossings
 
@@ -337,7 +269,7 @@ def find_sunlit_periods(
     start: np.datetime64,
     stop: np.datetime64,
     satellite: Union[EarthSatellite, "Propagator"],
-) -> list[SunlitPeriod]:
+) -> list[dict]:
     """Find periods when the satellite is in sunlight within a time window.
 
     Args:
@@ -346,7 +278,7 @@ def find_sunlit_periods(
         satellite: A Skyfield EarthSatellite or Propagator object.
 
     Returns:
-        A list of SunlitPeriod objects sorted by start time.
+        A list of dicts with keys: start, stop.
 
     Raises:
         ValueError: If start >= stop.
@@ -357,10 +289,10 @@ def find_sunlit_periods(
     from thistle.propagator import Propagator
 
     if isinstance(satellite, Propagator):
-        periods: list[SunlitPeriod] = []
+        periods: list[dict] = []
         for sub_start, sub_stop, sat in _split_window(start, stop, satellite):
             periods.extend(find_sunlit_periods(sub_start, sub_stop, sat))
-        return _merge_periods(periods, SunlitPeriod)
+        return _merge_periods(periods)
 
     t0 = _to_skyfield(start)
     t1 = _to_skyfield(stop)
@@ -380,16 +312,14 @@ def find_sunlit_periods(
     # Determine state at start
     sunlit_at_start = bool(satellite.at(t0).is_sunlit(eph))
 
-    return _group_periods(
-        start, stop, event_dt64, event_values, sunlit_at_start, SunlitPeriod
-    )
+    return _group_periods(start, stop, event_dt64, event_values, sunlit_at_start)
 
 
 def find_eclipse_periods(
     start: np.datetime64,
     stop: np.datetime64,
     satellite: Union[EarthSatellite, "Propagator"],
-) -> list[EclipsePeriod]:
+) -> list[dict]:
     """Find periods when the satellite is in Earth's shadow within a time window.
 
     Args:
@@ -398,7 +328,7 @@ def find_eclipse_periods(
         satellite: A Skyfield EarthSatellite or Propagator object.
 
     Returns:
-        A list of EclipsePeriod objects sorted by start time.
+        A list of dicts with keys: start, stop.
 
     Raises:
         ValueError: If start >= stop.
@@ -409,10 +339,10 @@ def find_eclipse_periods(
     from thistle.propagator import Propagator
 
     if isinstance(satellite, Propagator):
-        periods: list[EclipsePeriod] = []
+        periods: list[dict] = []
         for sub_start, sub_stop, sat in _split_window(start, stop, satellite):
             periods.extend(find_eclipse_periods(sub_start, sub_stop, sat))
-        return _merge_periods(periods, EclipsePeriod)
+        return _merge_periods(periods)
 
     t0 = _to_skyfield(start)
     t1 = _to_skyfield(stop)
@@ -433,16 +363,14 @@ def find_eclipse_periods(
     eclipse_at_start = not bool(satellite.at(t0).is_sunlit(eph))
     inv_values = ~np.array(event_values, dtype=bool)
 
-    return _group_periods(
-        start, stop, event_dt64, inv_values, eclipse_at_start, EclipsePeriod
-    )
+    return _group_periods(start, stop, event_dt64, inv_values, eclipse_at_start)
 
 
 def find_ascending_periods(
     start: np.datetime64,
     stop: np.datetime64,
     satellite: Union[EarthSatellite, "Propagator"],
-) -> list[AscendingPeriod]:
+) -> list[dict]:
     """Find periods when the satellite latitude is increasing (moving northward).
 
     Ascending periods run from the minimum latitude point (southernmost)
@@ -454,7 +382,7 @@ def find_ascending_periods(
         satellite: A Skyfield EarthSatellite or Propagator object.
 
     Returns:
-        A list of AscendingPeriod objects sorted by start time.
+        A list of dicts with keys: start, stop.
 
     Raises:
         ValueError: If start >= stop.
@@ -465,10 +393,10 @@ def find_ascending_periods(
     from thistle.propagator import Propagator
 
     if isinstance(satellite, Propagator):
-        periods: list[AscendingPeriod] = []
+        periods: list[dict] = []
         for sub_start, sub_stop, sat in _split_window(start, stop, satellite):
             periods.extend(find_ascending_periods(sub_start, sub_stop, sat))
-        return _merge_periods(periods, AscendingPeriod)
+        return _merge_periods(periods)
 
     t0 = _to_skyfield(start)
     t1 = _to_skyfield(stop)
@@ -488,16 +416,14 @@ def find_ascending_periods(
 
     ascending_at_start = bool(_is_ascending(t0))
 
-    return _group_periods(
-        start, stop, event_dt64, event_values, ascending_at_start, AscendingPeriod
-    )
+    return _group_periods(start, stop, event_dt64, event_values, ascending_at_start)
 
 
 def find_descending_periods(
     start: np.datetime64,
     stop: np.datetime64,
     satellite: Union[EarthSatellite, "Propagator"],
-) -> list[DescendingPeriod]:
+) -> list[dict]:
     """Find periods when the satellite latitude is decreasing (moving southward).
 
     Descending periods run from the maximum latitude point (northernmost)
@@ -509,7 +435,7 @@ def find_descending_periods(
         satellite: A Skyfield EarthSatellite or Propagator object.
 
     Returns:
-        A list of DescendingPeriod objects sorted by start time.
+        A list of dicts with keys: start, stop.
 
     Raises:
         ValueError: If start >= stop.
@@ -520,10 +446,10 @@ def find_descending_periods(
     from thistle.propagator import Propagator
 
     if isinstance(satellite, Propagator):
-        periods: list[DescendingPeriod] = []
+        periods: list[dict] = []
         for sub_start, sub_stop, sat in _split_window(start, stop, satellite):
             periods.extend(find_descending_periods(sub_start, sub_stop, sat))
-        return _merge_periods(periods, DescendingPeriod)
+        return _merge_periods(periods)
 
     t0 = _to_skyfield(start)
     t1 = _to_skyfield(stop)
@@ -544,6 +470,4 @@ def find_descending_periods(
     descending_at_start = not bool(_is_ascending(t0))
     inv_values = ~np.array(event_values, dtype=bool)
 
-    return _group_periods(
-        start, stop, event_dt64, inv_values, descending_at_start, DescendingPeriod
-    )
+    return _group_periods(start, stop, event_dt64, inv_values, descending_at_start)

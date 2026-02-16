@@ -484,3 +484,62 @@ class TestSegmentTimes:
             mid = t_slice[len(t_slice) // 2]
             expected_sat = self.propagator.find_satellite(mid)
             assert export_tle(sat.model) == export_tle(expected_sat.model)
+
+
+class TestStrategyInstance:
+    """Test passing a SwitchingStrategy instance to Propagator."""
+
+    def test_epoch_instance(self):
+        """Passing an EpochSwitchStrategy instance works like method='epoch'."""
+        prop_str = Propagator(ISS_TLES, method="epoch")
+        prop_inst = Propagator(ISS_TLES, method=EpochSwitchStrategy([]))
+        np.testing.assert_array_equal(
+            prop_str.switcher.transitions, prop_inst.switcher.transitions
+        )
+
+    def test_midpoint_instance(self):
+        """Passing a MidpointSwitchStrategy instance works like method='midpoint'."""
+        prop_str = Propagator(ISS_TLES, method="midpoint")
+        prop_inst = Propagator(ISS_TLES, method=MidpointSwitchStrategy([]))
+        np.testing.assert_array_equal(
+            prop_str.switcher.transitions, prop_inst.switcher.transitions
+        )
+
+    def test_tca_instance(self):
+        """Passing a TCASwitchStrategy instance works like method='tca'."""
+        ts = load.timescale()
+        tles = ISS_TLES[:20]
+        prop_str = Propagator(tles, method="tca")
+        prop_inst = Propagator(tles, method=TCASwitchStrategy([], ts=ts))
+        np.testing.assert_array_equal(
+            prop_str.switcher.transitions, prop_inst.switcher.transitions
+        )
+
+    def test_instance_satellites_replaced(self):
+        """Strategy instance's satellites are replaced with those built from TLEs."""
+        strategy = EpochSwitchStrategy([])
+        assert len(strategy.satellites) == 0
+        prop = Propagator(ISS_TLES, method=strategy)
+        assert len(prop.switcher.satellites) == len(ISS_TLES)
+
+    def test_instance_with_start_stop(self):
+        """Strategy instance respects start/stop filtering."""
+        strategy = MidpointSwitchStrategy([])
+        prop = Propagator(
+            ISS_TLES,
+            method=strategy,
+            start=datetime.datetime(1998, 11, 25),
+            stop=datetime.datetime(1998, 12, 5),
+        )
+        assert len(prop.satellites) < len(ISS_TLES)
+
+    def test_instance_is_same_object(self):
+        """The Propagator uses the same strategy instance passed in."""
+        strategy = EpochSwitchStrategy([])
+        prop = Propagator(ISS_TLES, method=strategy)
+        assert prop.switcher is strategy
+
+    def test_invalid_method_type_raises(self):
+        """Passing an invalid type raises TypeError."""
+        with pytest.raises(TypeError, match="strategy name or SwitchingStrategy"):
+            Propagator(ISS_TLES, method=42)

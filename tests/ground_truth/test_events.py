@@ -93,32 +93,32 @@ class TestAccessGroundTruth:
 
     def test_start_times(self, computed_passes, truth_accesses):
         for computed, truth in zip(computed_passes, truth_accesses):
-            diff = abs((computed.start - truth["start"]) / np.timedelta64(1, "s"))
+            diff = abs((computed["start"] - truth["start"]) / np.timedelta64(1, "s"))
             assert diff < 30.0, (
-                f"Start time mismatch: {computed.start} vs {truth['start']}, "
+                f"Start time mismatch: {computed['start']} vs {truth['start']}, "
                 f"diff {diff:.1f}s"
             )
 
     def test_stop_times(self, computed_passes, truth_accesses):
         for computed, truth in zip(computed_passes, truth_accesses):
-            diff = abs((computed.stop - truth["stop"]) / np.timedelta64(1, "s"))
+            diff = abs((computed["stop"] - truth["stop"]) / np.timedelta64(1, "s"))
             assert diff < 30.0, (
-                f"Stop time mismatch: {computed.stop} vs {truth['stop']}, "
+                f"Stop time mismatch: {computed['stop']} vs {truth['stop']}, "
                 f"diff {diff:.1f}s"
             )
 
     def test_durations(self, computed_passes, truth_accesses):
         for computed, truth in zip(computed_passes, truth_accesses):
-            computed_dur = (computed.stop - computed.start) / np.timedelta64(1, "s")
+            computed_dur = (computed["stop"] - computed["start"]) / np.timedelta64(1, "s")
             assert abs(computed_dur - truth["duration_sec"]) < 60.0
 
     def test_passes_ordered(self, computed_passes):
         for i in range(len(computed_passes) - 1):
-            assert computed_passes[i].start < computed_passes[i + 1].start
+            assert computed_passes[i]["start"] < computed_passes[i + 1]["start"]
 
     def test_peak_elevation_positive(self, computed_passes):
         for p in computed_passes:
-            assert p.peak_elevation > 0.0
+            assert p["peak_elevation"] > 0.0
 
 
 # ---------- sunlit period tests ----------
@@ -142,32 +142,32 @@ class TestSunlitGroundTruth:
 
     def test_start_times(self, computed_sunlit, truth_sunlit):
         for computed, truth in zip(computed_sunlit, truth_sunlit):
-            diff = abs((computed.start - truth["start"]) / np.timedelta64(1, "s"))
+            diff = abs((computed["start"] - truth["start"]) / np.timedelta64(1, "s"))
             assert diff < 30.0, (
-                f"Sunlit start mismatch: {computed.start} vs {truth['start']}, "
+                f"Sunlit start mismatch: {computed['start']} vs {truth['start']}, "
                 f"diff {diff:.1f}s"
             )
 
     def test_stop_times(self, computed_sunlit, truth_sunlit):
         for computed, truth in zip(computed_sunlit, truth_sunlit):
-            diff = abs((computed.stop - truth["stop"]) / np.timedelta64(1, "s"))
+            diff = abs((computed["stop"] - truth["stop"]) / np.timedelta64(1, "s"))
             assert diff < 30.0, (
-                f"Sunlit stop mismatch: {computed.stop} vs {truth['stop']}, "
+                f"Sunlit stop mismatch: {computed['stop']} vs {truth['stop']}, "
                 f"diff {diff:.1f}s"
             )
 
     def test_durations(self, computed_sunlit, truth_sunlit):
         for computed, truth in zip(computed_sunlit, truth_sunlit):
-            computed_dur = (computed.stop - computed.start) / np.timedelta64(1, "s")
+            computed_dur = (computed["stop"] - computed["start"]) / np.timedelta64(1, "s")
             assert abs(computed_dur - truth["duration_sec"]) < 60.0
 
     def test_periods_ordered(self, computed_sunlit):
         for i in range(len(computed_sunlit) - 1):
-            assert computed_sunlit[i].start < computed_sunlit[i + 1].start
+            assert computed_sunlit[i]["start"] < computed_sunlit[i + 1]["start"]
 
     def test_no_overlap(self, computed_sunlit):
         for i in range(len(computed_sunlit) - 1):
-            assert computed_sunlit[i].stop <= computed_sunlit[i + 1].start
+            assert computed_sunlit[i]["stop"] <= computed_sunlit[i + 1]["start"]
 
 
 # ---------- eclipse (umbra) period tests ----------
@@ -197,34 +197,34 @@ class TestEclipseGroundTruth:
     def test_start_times(self, computed_eclipse, truth_umbra):
         """Eclipse start should be near umbra start (within penumbra + tolerance)."""
         for computed, truth in zip(computed_eclipse, truth_umbra):
-            diff = abs((computed.start - truth["start"]) / np.timedelta64(1, "s"))
+            diff = abs((computed["start"] - truth["start"]) / np.timedelta64(1, "s"))
             assert diff < 30.0, (
-                f"Eclipse start mismatch: {computed.start} vs {truth['start']}, "
+                f"Eclipse start mismatch: {computed['start']} vs {truth['start']}, "
                 f"diff {diff:.1f}s"
             )
 
     def test_stop_times(self, computed_eclipse, truth_umbra):
         """Eclipse stop should be near umbra stop (within penumbra + tolerance)."""
         for computed, truth in zip(computed_eclipse, truth_umbra):
-            diff = abs((computed.stop - truth["stop"]) / np.timedelta64(1, "s"))
+            diff = abs((computed["stop"] - truth["stop"]) / np.timedelta64(1, "s"))
             assert diff < 30.0, (
-                f"Eclipse stop mismatch: {computed.stop} vs {truth['stop']}, "
+                f"Eclipse stop mismatch: {computed['stop']} vs {truth['stop']}, "
                 f"diff {diff:.1f}s"
             )
 
     def test_eclipse_longer_than_umbra(self, computed_eclipse, truth_umbra):
         """Eclipse (penumbra + umbra) should be at least as long as umbra alone."""
         for computed, truth in zip(computed_eclipse, truth_umbra):
-            computed_dur = (computed.stop - computed.start) / np.timedelta64(1, "s")
+            computed_dur = (computed["stop"] - computed["start"]) / np.timedelta64(1, "s")
             assert computed_dur >= truth["duration_sec"] - 30.0
 
     def test_periods_ordered(self, computed_eclipse):
         for i in range(len(computed_eclipse) - 1):
-            assert computed_eclipse[i].start < computed_eclipse[i + 1].start
+            assert computed_eclipse[i]["start"] < computed_eclipse[i + 1]["start"]
 
     def test_no_overlap(self, computed_eclipse):
         for i in range(len(computed_eclipse) - 1):
-            assert computed_eclipse[i].stop <= computed_eclipse[i + 1].start
+            assert computed_eclipse[i]["stop"] <= computed_eclipse[i + 1]["start"]
 
 
 # ---------- ascending node crossing tests ----------
@@ -245,33 +245,33 @@ class TestAscendingNodeGroundTruth:
 
     def test_ascending_count(self, computed_node_crossings, truth_ascending_nodes):
         """Number of ascending crossings matches ground truth."""
-        ascending = [c for c in computed_node_crossings if c.ascending and c.start >= T0]
+        ascending = [c for c in computed_node_crossings if c["ascending"] and c["start"] >= T0]
         assert len(ascending) == len(truth_ascending_nodes)
 
     def test_ascending_times(self, computed_node_crossings, truth_ascending_nodes):
         """Ascending node times match ground truth within 30 seconds."""
-        ascending = [c for c in computed_node_crossings if c.ascending and c.start >= T0]
+        ascending = [c for c in computed_node_crossings if c["ascending"] and c["start"] >= T0]
         for computed, truth_time in zip(ascending, truth_ascending_nodes):
-            diff = abs((computed.start - truth_time) / np.timedelta64(1, "s"))
+            diff = abs((computed["start"] - truth_time) / np.timedelta64(1, "s"))
             assert diff < 30.0, (
-                f"Node crossing mismatch: {computed.start} vs {truth_time}, "
+                f"Node crossing mismatch: {computed['start']} vs {truth_time}, "
                 f"diff {diff:.1f}s"
             )
 
     def test_ascending_longitude_range(self, computed_node_crossings):
         """Ascending node longitudes should be in [-180, 180]."""
-        ascending = [c for c in computed_node_crossings if c.ascending]
+        ascending = [c for c in computed_node_crossings if c["ascending"]]
         for c in ascending:
-            assert -180.0 <= c.longitude <= 180.0
+            assert -180.0 <= c["longitude"] <= 180.0
 
     def test_crossings_alternate(self, computed_node_crossings):
         """Node crossings should alternate between ascending and descending."""
         for i in range(len(computed_node_crossings) - 1):
-            assert computed_node_crossings[i].ascending != computed_node_crossings[i + 1].ascending
+            assert computed_node_crossings[i]["ascending"] != computed_node_crossings[i + 1]["ascending"]
 
     def test_crossings_ordered(self, computed_node_crossings):
         for i in range(len(computed_node_crossings) - 1):
-            assert computed_node_crossings[i].start < computed_node_crossings[i + 1].start
+            assert computed_node_crossings[i]["start"] < computed_node_crossings[i + 1]["start"]
 
 
 # ---------- visibility circle cross-validation ----------
@@ -288,13 +288,13 @@ class TestVisibilityCircleCrossValidation:
     def test_subsatellite_distance_matches_visibility_radius(
         self, iss_satellite, computed_passes
     ):
-        """At computed pass boundaries, subsatellite distance ≈ visibility radius."""
+        """At computed pass boundaries, subsatellite distance ~ visibility radius."""
         from geographiclib.geodesic import Geodesic
 
         geod = Geodesic.WGS84
 
         for p in computed_passes:
-            for boundary_time in [p.start, p.stop]:
+            for boundary_time in [p["start"], p["stop"]]:
                 # ISS position at boundary time
                 t = dt64_to_time(np.atleast_1d(boundary_time), ts)
                 geo = iss_satellite.at(t)

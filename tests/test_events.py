@@ -6,13 +6,6 @@ from skyfield.api import EarthSatellite, load
 
 from thistle.utils import read_tle
 from thistle.events import (
-    AscendingPeriod,
-    DescendingPeriod,
-    EclipsePeriod,
-    Event,
-    NodeCrossing,
-    SatellitePass,
-    SunlitPeriod,
     find_ascending_periods,
     find_descending_periods,
     find_eclipse_periods,
@@ -34,31 +27,18 @@ BOULDER_LAT = 40.0150
 BOULDER_LON = -105.2705
 
 
-class TestEventBase:
-    """Tests for the Event base model."""
-
-    def test_all_subclass_event(self):
-        """All event types should be subclasses of Event."""
-        for cls in (SatellitePass, NodeCrossing, SunlitPeriod, EclipsePeriod,
-                    AscendingPeriod, DescendingPeriod):
-            assert issubclass(cls, Event)
-
-    def test_event_has_start_stop(self):
-        t = np.datetime64("1998-11-20T00:00:00", "us")
-        e = Event(start=t, stop=t)
-        assert e.start == t
-        assert e.stop == t
-
-
 class TestFindPasses:
     """Tests for find_passes."""
 
-    def test_returns_list_of_satellite_pass(self):
+    def test_returns_list_of_dicts(self):
         passes = find_passes(START_24H, STOP_24H, SAT, BOULDER_LAT, BOULDER_LON)
         assert isinstance(passes, list)
         for p in passes:
-            assert isinstance(p, SatellitePass)
-            assert isinstance(p, Event)
+            assert isinstance(p, dict)
+            assert "start" in p
+            assert "stop" in p
+            assert "peak_time" in p
+            assert "peak_elevation" in p
 
     def test_expected_count(self):
         """ISS over Boulder should have a handful of passes in 24h."""
@@ -70,8 +50,8 @@ class TestFindPasses:
         """start <= peak_time <= stop for each pass."""
         passes = find_passes(START_24H, STOP_24H, SAT, BOULDER_LAT, BOULDER_LON)
         for p in passes:
-            assert p.start <= p.peak_time
-            assert p.peak_time <= p.stop
+            assert p["start"] <= p["peak_time"]
+            assert p["peak_time"] <= p["stop"]
 
     def test_peak_elevation_above_minimum(self):
         """Peak elevation should be at or above the minimum."""
@@ -81,12 +61,12 @@ class TestFindPasses:
             min_elevation=min_el,
         )
         for p in passes:
-            assert p.peak_elevation >= min_el - 0.5  # small tolerance
+            assert p["peak_elevation"] >= min_el - 0.5  # small tolerance
 
     def test_passes_sorted_by_start(self):
         passes = find_passes(START_24H, STOP_24H, SAT, BOULDER_LAT, BOULDER_LON)
         for i in range(len(passes) - 1):
-            assert passes[i].start <= passes[i + 1].start
+            assert passes[i]["start"] <= passes[i + 1]["start"]
 
     def test_empty_for_short_window(self):
         """A very short window with no pass should return empty list."""
@@ -115,18 +95,21 @@ class TestFindPasses:
 class TestFindNodeCrossings:
     """Tests for find_node_crossings."""
 
-    def test_returns_list_of_node_crossing(self):
+    def test_returns_list_of_dicts(self):
         crossings = find_node_crossings(START_24H, STOP_24H, SAT)
         assert isinstance(crossings, list)
         for c in crossings:
-            assert isinstance(c, NodeCrossing)
-            assert isinstance(c, Event)
+            assert isinstance(c, dict)
+            assert "start" in c
+            assert "stop" in c
+            assert "longitude" in c
+            assert "ascending" in c
 
     def test_start_equals_stop(self):
         """Node crossings are instantaneous: start == stop."""
         crossings = find_node_crossings(START_24H, STOP_24H, SAT)
         for c in crossings:
-            assert c.start == c.stop
+            assert c["start"] == c["stop"]
 
     def test_expected_count(self):
         """ISS makes ~16 orbits/day -> ~32 node crossings."""
@@ -138,18 +121,18 @@ class TestFindNodeCrossings:
         """Node crossings should alternate between ascending and descending."""
         crossings = find_node_crossings(START_24H, STOP_24H, SAT)
         for i in range(len(crossings) - 1):
-            assert crossings[i].ascending != crossings[i + 1].ascending
+            assert crossings[i]["ascending"] != crossings[i + 1]["ascending"]
 
     def test_longitude_range(self):
         """Longitude should be in [-180, 180]."""
         crossings = find_node_crossings(START_24H, STOP_24H, SAT)
         for c in crossings:
-            assert -180.0 <= c.longitude <= 180.0
+            assert -180.0 <= c["longitude"] <= 180.0
 
     def test_times_within_window(self):
         crossings = find_node_crossings(START_24H, STOP_24H, SAT)
         for c in crossings:
-            assert START_24H <= c.start <= STOP_24H
+            assert START_24H <= c["start"] <= STOP_24H
 
     def test_start_equals_stop_raises(self):
         with pytest.raises(ValueError):
@@ -159,12 +142,13 @@ class TestFindNodeCrossings:
 class TestFindSunlitPeriods:
     """Tests for find_sunlit_periods."""
 
-    def test_returns_list_of_sunlit_period(self):
+    def test_returns_list_of_dicts(self):
         periods = find_sunlit_periods(START_24H, STOP_24H, SAT)
         assert isinstance(periods, list)
         for p in periods:
-            assert isinstance(p, SunlitPeriod)
-            assert isinstance(p, Event)
+            assert isinstance(p, dict)
+            assert "start" in p
+            assert "stop" in p
 
     def test_expected_count(self):
         """ISS should have ~16 sunlit periods in 24h."""
@@ -175,19 +159,19 @@ class TestFindSunlitPeriods:
     def test_start_before_stop(self):
         periods = find_sunlit_periods(START_24H, STOP_24H, SAT)
         for p in periods:
-            assert p.start < p.stop
+            assert p["start"] < p["stop"]
 
     def test_no_overlap(self):
         """Sunlit periods should not overlap."""
         periods = find_sunlit_periods(START_24H, STOP_24H, SAT)
         for i in range(len(periods) - 1):
-            assert periods[i].stop <= periods[i + 1].start
+            assert periods[i]["stop"] <= periods[i + 1]["start"]
 
     def test_times_within_window(self):
         periods = find_sunlit_periods(START_24H, STOP_24H, SAT)
         for p in periods:
-            assert p.start >= START_24H
-            assert p.stop <= STOP_24H
+            assert p["start"] >= START_24H
+            assert p["stop"] <= STOP_24H
 
     def test_start_equals_stop_raises(self):
         with pytest.raises(ValueError):
@@ -197,12 +181,13 @@ class TestFindSunlitPeriods:
 class TestFindEclipsePeriods:
     """Tests for find_eclipse_periods."""
 
-    def test_returns_list_of_eclipse_period(self):
+    def test_returns_list_of_dicts(self):
         periods = find_eclipse_periods(START_24H, STOP_24H, SAT)
         assert isinstance(periods, list)
         for p in periods:
-            assert isinstance(p, EclipsePeriod)
-            assert isinstance(p, Event)
+            assert isinstance(p, dict)
+            assert "start" in p
+            assert "stop" in p
 
     def test_expected_count(self):
         """ISS should have ~16 eclipse periods in 24h."""
@@ -213,13 +198,13 @@ class TestFindEclipsePeriods:
     def test_start_before_stop(self):
         periods = find_eclipse_periods(START_24H, STOP_24H, SAT)
         for p in periods:
-            assert p.start < p.stop
+            assert p["start"] < p["stop"]
 
     def test_no_overlap(self):
         """Eclipse periods should not overlap."""
         periods = find_eclipse_periods(START_24H, STOP_24H, SAT)
         for i in range(len(periods) - 1):
-            assert periods[i].stop <= periods[i + 1].start
+            assert periods[i]["stop"] <= periods[i + 1]["start"]
 
     def test_sunlit_and_eclipse_complementary(self):
         """Sunlit and eclipse periods should cover the full window with no gaps."""
@@ -229,11 +214,11 @@ class TestFindEclipsePeriods:
         # Merge and sort all transitions
         transitions = []
         for p in sunlit:
-            transitions.append((p.start, "sunlit_start"))
-            transitions.append((p.stop, "sunlit_stop"))
+            transitions.append((p["start"], "sunlit_start"))
+            transitions.append((p["stop"], "sunlit_stop"))
         for p in eclipse:
-            transitions.append((p.start, "eclipse_start"))
-            transitions.append((p.stop, "eclipse_stop"))
+            transitions.append((p["start"], "eclipse_start"))
+            transitions.append((p["stop"], "eclipse_stop"))
         transitions.sort(key=lambda x: x[0])
 
         # Verify that stops and starts match up (no gaps)
@@ -251,12 +236,13 @@ class TestFindEclipsePeriods:
 class TestFindAscendingPeriods:
     """Tests for find_ascending_periods."""
 
-    def test_returns_list_of_ascending_period(self):
+    def test_returns_list_of_dicts(self):
         periods = find_ascending_periods(START_24H, STOP_24H, SAT)
         assert isinstance(periods, list)
         for p in periods:
-            assert isinstance(p, AscendingPeriod)
-            assert isinstance(p, Event)
+            assert isinstance(p, dict)
+            assert "start" in p
+            assert "stop" in p
 
     def test_expected_count(self):
         """ISS makes ~16 orbits/day -> ~16 ascending periods."""
@@ -267,12 +253,12 @@ class TestFindAscendingPeriods:
     def test_start_before_stop(self):
         periods = find_ascending_periods(START_24H, STOP_24H, SAT)
         for p in periods:
-            assert p.start < p.stop
+            assert p["start"] < p["stop"]
 
     def test_no_overlap(self):
         periods = find_ascending_periods(START_24H, STOP_24H, SAT)
         for i in range(len(periods) - 1):
-            assert periods[i].stop <= periods[i + 1].start
+            assert periods[i]["stop"] <= periods[i + 1]["start"]
 
     def test_start_equals_stop_raises(self):
         with pytest.raises(ValueError):
@@ -282,12 +268,13 @@ class TestFindAscendingPeriods:
 class TestFindDescendingPeriods:
     """Tests for find_descending_periods."""
 
-    def test_returns_list_of_descending_period(self):
+    def test_returns_list_of_dicts(self):
         periods = find_descending_periods(START_24H, STOP_24H, SAT)
         assert isinstance(periods, list)
         for p in periods:
-            assert isinstance(p, DescendingPeriod)
-            assert isinstance(p, Event)
+            assert isinstance(p, dict)
+            assert "start" in p
+            assert "stop" in p
 
     def test_expected_count(self):
         """ISS makes ~16 orbits/day -> ~16 descending periods."""
@@ -298,12 +285,12 @@ class TestFindDescendingPeriods:
     def test_start_before_stop(self):
         periods = find_descending_periods(START_24H, STOP_24H, SAT)
         for p in periods:
-            assert p.start < p.stop
+            assert p["start"] < p["stop"]
 
     def test_no_overlap(self):
         periods = find_descending_periods(START_24H, STOP_24H, SAT)
         for i in range(len(periods) - 1):
-            assert periods[i].stop <= periods[i + 1].start
+            assert periods[i]["stop"] <= periods[i + 1]["start"]
 
     def test_ascending_and_descending_complementary(self):
         """Ascending and descending periods should cover the full window with no gaps."""
@@ -312,11 +299,11 @@ class TestFindDescendingPeriods:
 
         transitions = []
         for p in asc:
-            transitions.append((p.start, "asc_start"))
-            transitions.append((p.stop, "asc_stop"))
+            transitions.append((p["start"], "asc_start"))
+            transitions.append((p["stop"], "asc_stop"))
         for p in desc:
-            transitions.append((p.start, "desc_start"))
-            transitions.append((p.stop, "desc_stop"))
+            transitions.append((p["start"], "desc_start"))
+            transitions.append((p["stop"], "desc_stop"))
         transitions.sort(key=lambda x: x[0])
 
         for i in range(len(transitions) - 1):
@@ -349,7 +336,7 @@ class TestPropagatorPasses:
         passes = find_passes(START_24H, STOP_24H, PROP, BOULDER_LAT, BOULDER_LON)
         assert isinstance(passes, list)
         for p in passes:
-            assert isinstance(p, SatellitePass)
+            assert isinstance(p, dict)
 
     def test_matches_single_satellite(self):
         """Single-TLE Propagator gives same results as EarthSatellite."""
@@ -357,7 +344,7 @@ class TestPropagatorPasses:
         sat_passes = find_passes(START_24H, STOP_24H, SAT, BOULDER_LAT, BOULDER_LON)
         assert len(prop_passes) == len(sat_passes)
         for pp, sp in zip(prop_passes, sat_passes):
-            diff = abs((pp.start - sp.start) / np.timedelta64(1, "s"))
+            diff = abs((pp["start"] - sp["start"]) / np.timedelta64(1, "s"))
             assert diff < 1.0
 
 
@@ -368,14 +355,14 @@ class TestPropagatorNodeCrossings:
         crossings = find_node_crossings(START_24H, STOP_24H, PROP)
         assert isinstance(crossings, list)
         for c in crossings:
-            assert isinstance(c, NodeCrossing)
+            assert isinstance(c, dict)
 
     def test_matches_single_satellite(self):
         prop_crossings = find_node_crossings(START_24H, STOP_24H, PROP)
         sat_crossings = find_node_crossings(START_24H, STOP_24H, SAT)
         assert len(prop_crossings) == len(sat_crossings)
         for pc, sc in zip(prop_crossings, sat_crossings):
-            diff = abs((pc.start - sc.start) / np.timedelta64(1, "s"))
+            diff = abs((pc["start"] - sc["start"]) / np.timedelta64(1, "s"))
             assert diff < 1.0
 
 
@@ -386,14 +373,14 @@ class TestPropagatorSunlit:
         periods = find_sunlit_periods(START_24H, STOP_24H, PROP)
         assert isinstance(periods, list)
         for p in periods:
-            assert isinstance(p, SunlitPeriod)
+            assert isinstance(p, dict)
 
     def test_matches_single_satellite(self):
         prop_periods = find_sunlit_periods(START_24H, STOP_24H, PROP)
         sat_periods = find_sunlit_periods(START_24H, STOP_24H, SAT)
         assert len(prop_periods) == len(sat_periods)
         for pp, sp in zip(prop_periods, sat_periods):
-            diff = abs((pp.start - sp.start) / np.timedelta64(1, "s"))
+            diff = abs((pp["start"] - sp["start"]) / np.timedelta64(1, "s"))
             assert diff < 1.0
 
 
@@ -404,14 +391,14 @@ class TestPropagatorEclipse:
         periods = find_eclipse_periods(START_24H, STOP_24H, PROP)
         assert isinstance(periods, list)
         for p in periods:
-            assert isinstance(p, EclipsePeriod)
+            assert isinstance(p, dict)
 
     def test_matches_single_satellite(self):
         prop_periods = find_eclipse_periods(START_24H, STOP_24H, PROP)
         sat_periods = find_eclipse_periods(START_24H, STOP_24H, SAT)
         assert len(prop_periods) == len(sat_periods)
         for pp, sp in zip(prop_periods, sat_periods):
-            diff = abs((pp.start - sp.start) / np.timedelta64(1, "s"))
+            diff = abs((pp["start"] - sp["start"]) / np.timedelta64(1, "s"))
             assert diff < 1.0
 
 
@@ -422,14 +409,14 @@ class TestPropagatorAscending:
         periods = find_ascending_periods(START_24H, STOP_24H, PROP)
         assert isinstance(periods, list)
         for p in periods:
-            assert isinstance(p, AscendingPeriod)
+            assert isinstance(p, dict)
 
     def test_matches_single_satellite(self):
         prop_periods = find_ascending_periods(START_24H, STOP_24H, PROP)
         sat_periods = find_ascending_periods(START_24H, STOP_24H, SAT)
         assert len(prop_periods) == len(sat_periods)
         for pp, sp in zip(prop_periods, sat_periods):
-            diff = abs((pp.start - sp.start) / np.timedelta64(1, "s"))
+            diff = abs((pp["start"] - sp["start"]) / np.timedelta64(1, "s"))
             assert diff < 1.0
 
 
@@ -440,14 +427,14 @@ class TestPropagatorDescending:
         periods = find_descending_periods(START_24H, STOP_24H, PROP)
         assert isinstance(periods, list)
         for p in periods:
-            assert isinstance(p, DescendingPeriod)
+            assert isinstance(p, dict)
 
     def test_matches_single_satellite(self):
         prop_periods = find_descending_periods(START_24H, STOP_24H, PROP)
         sat_periods = find_descending_periods(START_24H, STOP_24H, SAT)
         assert len(prop_periods) == len(sat_periods)
         for pp, sp in zip(prop_periods, sat_periods):
-            diff = abs((pp.start - sp.start) / np.timedelta64(1, "s"))
+            diff = abs((pp["start"] - sp["start"]) / np.timedelta64(1, "s"))
             assert diff < 1.0
 
 
@@ -467,29 +454,29 @@ class TestMultiTLEPropagator:
         )
         assert len(passes) > 10
         for p in passes:
-            assert isinstance(p, SatellitePass)
-            assert p.start >= MULTI_START
-            assert p.stop <= MULTI_STOP
+            assert isinstance(p, dict)
+            assert p["start"] >= MULTI_START
+            assert p["stop"] <= MULTI_STOP
 
     def test_sunlit_no_gaps_at_transitions(self):
         """Sunlit periods should have no artificial gaps at TLE transitions."""
         periods = find_sunlit_periods(MULTI_START, MULTI_STOP, PROP_MULTI)
         assert len(periods) > 100
         for p in periods:
-            assert p.start < p.stop
+            assert p["start"] < p["stop"]
         for i in range(len(periods) - 1):
-            assert periods[i].stop <= periods[i + 1].start
+            assert periods[i]["stop"] <= periods[i + 1]["start"]
 
     def test_eclipse_no_gaps_at_transitions(self):
         periods = find_eclipse_periods(MULTI_START, MULTI_STOP, PROP_MULTI)
         assert len(periods) > 100
         for p in periods:
-            assert p.start < p.stop
+            assert p["start"] < p["stop"]
         for i in range(len(periods) - 1):
-            assert periods[i].stop <= periods[i + 1].start
+            assert periods[i]["stop"] <= periods[i + 1]["start"]
 
     def test_node_crossings_over_long_window(self):
         crossings = find_node_crossings(MULTI_START, MULTI_STOP, PROP_MULTI)
         assert len(crossings) > 100
         for i in range(len(crossings) - 1):
-            assert crossings[i].start < crossings[i + 1].start
+            assert crossings[i]["start"] < crossings[i + 1]["start"]

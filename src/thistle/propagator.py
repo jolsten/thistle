@@ -308,7 +308,7 @@ class Propagator:
         self,
         tles: list[TLETuple],
         *,
-        method: SwitchingStrategies = "epoch",
+        method: Union[SwitchingStrategies, SwitchingStrategy] = "epoch",
         start: Union[datetime.datetime, None] = None,
         stop: Union[datetime.datetime, None] = None,
     ) -> None:
@@ -316,15 +316,19 @@ class Propagator:
 
         Args:
             tles: List of (line1, line2) TLE tuples for a single satellite.
-            method: TLE switching strategy. One of ``"epoch"``,
-                ``"midpoint"``, or ``"tca"``.
+            method: TLE switching strategy. Either a strategy name
+                (``"epoch"``, ``"midpoint"``, ``"tca"``) or a
+                :class:`SwitchingStrategy` instance. When a strategy
+                instance is provided, its ``satellites`` are replaced
+                with the satellites built from *tles*.
             start: Optional start time to filter TLEs. Only TLEs relevant
                 to this time range will be kept.
             stop: Optional stop time to filter TLEs. Only TLEs relevant
                 to this time range will be kept.
 
         Raises:
-            ValueError: If method is not a valid switching strategy.
+            ValueError: If method is a string that is not a valid strategy name.
+            TypeError: If method is neither a string nor a SwitchingStrategy.
         """
         self.ts = load.timescale()
         self.satellites = [EarthSatellite(a, b, ts=self.ts) for a, b in tles]
@@ -348,19 +352,28 @@ class Propagator:
 
             self.satellites = self.satellites[lo:hi]
 
-        strategy = method.lower()
-        switcher: SwitchingStrategy
-        if strategy == "epoch":
-            switcher = EpochSwitchStrategy(self.satellites)
-        elif strategy == "midpoint":
-            switcher = MidpointSwitchStrategy(self.satellites)
-        elif strategy == "tca":
-            switcher = TCASwitchStrategy(self.satellites, ts=self.ts)
+        if isinstance(method, SwitchingStrategy):
+            method.satellites = sorted(
+                self.satellites, key=lambda sat: sat.epoch.utc_datetime()
+            )
+            self.switcher = method
+        elif isinstance(method, str):
+            strategy = method.lower()
+            if strategy == "epoch":
+                self.switcher = EpochSwitchStrategy(self.satellites)
+            elif strategy == "midpoint":
+                self.switcher = MidpointSwitchStrategy(self.satellites)
+            elif strategy == "tca":
+                self.switcher = TCASwitchStrategy(self.satellites, ts=self.ts)
+            else:
+                msg = f"Switching method {strategy!r} must be in {get_args(SwitchingStrategies)!r}"
+                raise ValueError(msg)
         else:
-            msg = f"Switching method {strategy!r} must be in {get_args(SwitchingStrategies)!r}"
-            raise ValueError(msg)
+            raise TypeError(
+                f"method must be a strategy name or SwitchingStrategy instance, "
+                f"got {type(method).__name__}"
+            )
 
-        self.switcher = switcher
         self.switcher.compute_transitions()
 
     def find_satellite(self, time: DateTime) -> EarthSatellite:

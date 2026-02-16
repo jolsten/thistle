@@ -5,54 +5,34 @@ magnetic field in nanoTesla, and local solar time in fractional hours.
 """
 
 import datetime
-import pathlib
-from typing import Dict, Optional, Sequence, Tuple, Union, cast
+from typing import Optional, Sequence, Union, cast
 
 import numpy as np
 import numpy.typing as npt
-from skyfield.api import EarthSatellite, load, wgs84
+from skyfield.api import EarthSatellite, wgs84
 from skyfield.elementslib import osculating_elements_of
 from skyfield.framelib import itrs
 from skyfield.functions import angle_between
 
-from thistle.utils import dt64_to_time
+from thistle._core import (
+    AU_PER_DAY_TO_M_PER_S,
+    AU_TO_M,
+    GenerateResult,
+    R_EARTH_KM,
+    R_SUN_KM,
+    Site,
+    Sites,
+    eph,
+    extract_range,
+    normalize_site,
+    propagate_sat,
+    ts,
+)
 
-# Import TYPE_CHECKING to avoid circular imports
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from thistle.propagator import Propagator
-
-AU_TO_M = 149_597_870_700.0
-AU_PER_DAY_TO_M_PER_S = AU_TO_M / 86_400.0
-
-R_EARTH_KM = 6_371.0
-R_SUN_KM = 696_340.0
-
-_DATA_DIR = pathlib.Path(__file__).parent / "data"
-
-ts = load.timescale()
-eph = load(str(_DATA_DIR / "de421.bsp"))
-
-GenerateResult = Dict[str, npt.NDArray]
-Site = Union[Tuple[float, float], Tuple[float, float, float]]
-Sites = Union[Sequence[Site], Dict[str, Site]]
-
-
-def _normalize_site(site: tuple) -> tuple[float, float, float]:
-    """Normalize a site tuple to (lat, lon, alt), defaulting alt to 0.0."""
-    if len(site) == 2:
-        return (float(site[0]), float(site[1]), 0.0)
-    elif len(site) == 3:
-        return (float(site[0]), float(site[1]), float(site[2]))
-    else:
-        raise ValueError(f"Site tuple must have 2 or 3 elements, got {len(site)}")
-
-
-def _propagate(times, satellite):
-    """Convert datetime64 array to Skyfield Time and propagate."""
-    t = dt64_to_time(times, ts)
-    return t, satellite.at(t)
 
 
 # ---------------------------------------------------------------------------
@@ -242,35 +222,6 @@ _EXTRACTORS = {
 }
 
 
-def _extract_range(t, geocentric, sites):
-    """Compute slant range and range rate from pre-computed geocentric state.
-
-    Reuses the satellite geocentric result to avoid redundant SGP4 propagation.
-    Ground site positions are computed via Earth rotation only.
-
-    Args:
-        t: Skyfield Time array.
-        geocentric: Skyfield Geocentric from satellite.at(t).
-        sites: List of (suffix, lat, lon, alt) tuples.
-
-    Returns:
-        Dict with range_{suffix} (m) and range_rate_{suffix} (m/s) per site.
-    """
-    result: GenerateResult = {}
-    for suffix, lat, lon, alt in sites:
-        ground = wgs84.latlon(lat, lon, elevation_m=alt).at(t)
-        r = (cast(npt.NDArray, geocentric.xyz.au) - cast(npt.NDArray, ground.xyz.au)) * AU_TO_M
-        v = (
-            cast(npt.NDArray, geocentric.velocity.au_per_d)
-            - cast(npt.NDArray, ground.velocity.au_per_d)
-        ) * AU_PER_DAY_TO_M_PER_S
-        slant_range = np.sqrt(np.sum(r**2, axis=0))
-        range_rate = np.sum(r * v, axis=0) / slant_range
-        result[f"range_{suffix}"] = slant_range
-        result[f"range_rate_{suffix}"] = range_rate
-    return result
-
-
 # ---------------------------------------------------------------------------
 # Public generators: thin wrappers that propagate then extract.
 # ---------------------------------------------------------------------------
@@ -290,7 +241,7 @@ def generate_eci(
         A dict with keys: eci_x, eci_y, eci_z (m),
         eci_vx, eci_vy, eci_vz (m/s).
     """
-    t, geocentric = _propagate(times, satellite)
+    t, geocentric = propagate_sat(times, satellite)
     return _extract_eci(t, geocentric)
 
 
@@ -308,7 +259,7 @@ def generate_ecef(
         A dict with keys: ecef_x, ecef_y, ecef_z (m),
         ecef_vx, ecef_vy, ecef_vz (m/s).
     """
-    t, geocentric = _propagate(times, satellite)
+    t, geocentric = propagate_sat(times, satellite)
     return _extract_ecef(t, geocentric)
 
 
@@ -325,7 +276,7 @@ def generate_lla(
     Returns:
         A dict with keys: lat (deg), lon (deg), alt (m).
     """
-    t, geocentric = _propagate(times, satellite)
+    t, geocentric = propagate_sat(times, satellite)
     return _extract_lla(t, geocentric)
 
 
@@ -344,7 +295,7 @@ def generate_keplerian(
         aop (deg), ta (deg), ma (deg), ea (deg), arglat (deg),
         tlon (deg), mlon (deg), lonper (deg), mm (deg/day).
     """
-    t, geocentric = _propagate(times, satellite)
+    t, geocentric = propagate_sat(times, satellite)
     return _extract_keplerian(t, geocentric)
 
 
@@ -364,7 +315,7 @@ def generate_equinoctial(
     Returns:
         A dict with keys: p (m), f, g, h, k, L (deg).
     """
-    t, geocentric = _propagate(times, satellite)
+    t, geocentric = propagate_sat(times, satellite)
     return _extract_equinoctial(t, geocentric)
 
 
@@ -384,7 +335,7 @@ def generate_sunlight(
     Returns:
         A dict with key: sun (int8, 0 = umbra, 1 = penumbra, 2 = sunlit).
     """
-    t, geocentric = _propagate(times, satellite)
+    t, geocentric = propagate_sat(times, satellite)
     return _extract_sunlight(t, geocentric)
 
 
@@ -406,7 +357,7 @@ def generate_beta_angle(
         A dict with key: beta (deg). Positive when the Sun is above
         the orbit plane.
     """
-    t, geocentric = _propagate(times, satellite)
+    t, geocentric = propagate_sat(times, satellite)
     return _extract_beta(t, geocentric)
 
 
@@ -426,7 +377,7 @@ def generate_local_solar_time(
     Returns:
         A dict with key: lst (fractional hours [0, 24)).
     """
-    t, geocentric = _propagate(times, satellite)
+    t, geocentric = propagate_sat(times, satellite)
     return _extract_lst(t, geocentric)
 
 
@@ -449,7 +400,7 @@ def generate_magnetic_field_enu(
     Returns:
         A dict with keys: Be, Bn, Bu (nT).
     """
-    t, geocentric = _propagate(times, satellite)
+    t, geocentric = propagate_sat(times, satellite)
     Be, Bn, Bu, _, _ = _extract_mag_enu_raw(t, geocentric, epoch)
     return {"Be": Be, "Bn": Bn, "Bu": Bu}
 
@@ -469,7 +420,7 @@ def generate_magnetic_field_total(
     Returns:
         A dict with key: Bt (nT).
     """
-    t, geocentric = _propagate(times, satellite)
+    t, geocentric = propagate_sat(times, satellite)
     Be, Bn, Bu, _, _ = _extract_mag_enu_raw(t, geocentric, epoch)
     return {"Bt": np.sqrt(Be**2 + Bn**2 + Bu**2)}
 
@@ -492,7 +443,7 @@ def generate_magnetic_field_ecef(
     Returns:
         A dict with keys: Bx, By, Bz (nT).
     """
-    t, geocentric = _propagate(times, satellite)
+    t, geocentric = propagate_sat(times, satellite)
     Be, Bn, Bu, lat_deg, lon_deg = _extract_mag_enu_raw(t, geocentric, epoch)
 
     lat = np.radians(lat_deg)
@@ -582,16 +533,16 @@ def _generate_with_propagator(
     # Process each segment
     segment_results = []
     for t_slice, sat in segments:
-        t, geocentric = _propagate(t_slice, sat)
-        segment_data = {}  # type: GenerateResult
+        t, geocentric = propagate_sat(t_slice, sat)
+        segment_data: GenerateResult = {}
         for name in groups:
             segment_data.update(_EXTRACTORS[name](t, geocentric))
         if site_list:
-            segment_data.update(_extract_range(t, geocentric, site_list))
+            segment_data.update(extract_range(t, geocentric, site_list))
         segment_results.append((len(t_slice), segment_data))
 
     # Merge segments back into full arrays
-    result = {}  # type: GenerateResult
+    result: GenerateResult = {}
     if segment_results:
         all_keys = set(segment_results[0][1].keys())
         for key in all_keys:
@@ -654,12 +605,12 @@ def generate(
     if sites is not None:
         if isinstance(sites, dict):
             site_list = [
-                (name, *_normalize_site(coords))
+                (name, *normalize_site(coords))
                 for name, coords in sites.items()
             ]
         else:
             site_list = [
-                (str(i), *_normalize_site(coords))
+                (str(i), *normalize_site(coords))
                 for i, coords in enumerate(sites)
             ]
 
@@ -670,12 +621,12 @@ def generate(
         result = _generate_with_propagator(times, satellite, groups, site_list)
     else:
         # Single satellite case — propagate once, extract all groups
-        t, geocentric = _propagate(times, satellite)
-        result = {}  # type: GenerateResult
+        t, geocentric = propagate_sat(times, satellite)
+        result: GenerateResult = {}
         for name in groups:
             result.update(_EXTRACTORS[name](t, geocentric))
         if site_list:
-            result.update(_extract_range(t, geocentric, site_list))
+            result.update(extract_range(t, geocentric, site_list))
 
     # Downcast arrays where appropriate
     for key, arr in result.items():

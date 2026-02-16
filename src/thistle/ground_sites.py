@@ -6,7 +6,7 @@ import numpy as np
 import numpy.typing as npt
 from skyfield.api import EarthSatellite, wgs84
 
-from thistle.orbit_data import AU_PER_DAY_TO_M_PER_S, AU_TO_M, GenerateResult, Sites, _normalize_site, ts
+from thistle._core import AU_PER_DAY_TO_M_PER_S, AU_TO_M, GenerateResult, Sites, normalize_site, ts
 from thistle.utils import dt64_to_time
 
 from typing import TYPE_CHECKING
@@ -134,12 +134,12 @@ def generate_range(
     # Build ordered list of (suffix, lat, lon, alt)
     if isinstance(sites, dict):
         site_list = [
-            (name, *_normalize_site(coords))
+            (name, *normalize_site(coords))
             for name, coords in sites.items()
         ]
     else:
         site_list = [
-            (str(i), *_normalize_site(coords))
+            (str(i), *normalize_site(coords))
             for i, coords in enumerate(sites)
         ]
 

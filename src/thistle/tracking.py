@@ -7,7 +7,8 @@ import numpy as np
 import numpy.typing as npt
 from skyfield.api import EarthSatellite
 
-from thistle.orbit_data import _extract_range, _propagate, generate_lla
+from thistle._core import extract_range, propagate_sat
+from thistle.orbit_data import generate_lla
 
 
 @dataclasses.dataclass
@@ -116,7 +117,7 @@ def _extract_solution(
 ) -> DopplerGeolocationResult:
     """Build a DopplerGeolocationResult from a scipy OptimizeResult."""
     lat_sol, lon_sol = float(opt_result.x[0]), float(opt_result.x[1])
-    rr = _extract_range(t, geocentric, [("0", lat_sol, lon_sol, alt)])
+    rr = extract_range(t, geocentric, [("0", lat_sol, lon_sol, alt)])
     model_rr = cast(npt.NDArray, rr["range_rate_0"])
     scale_sol = float(np.dot(doppler, model_rr) / np.dot(model_rr, model_rr))
     residuals = doppler - scale_sol * model_rr
@@ -180,7 +181,7 @@ def geolocate_doppler(
         raise ValueError("Need at least 3 measurements")
 
     # Propagate once — reused by every optimizer iteration
-    t, geocentric = _propagate(times, satellite)
+    t, geocentric = propagate_sat(times, satellite)
 
     # Initial guess from TCA sub-satellite point
     tca_time = _find_doppler_tca(times, doppler)
@@ -191,7 +192,7 @@ def geolocate_doppler(
     lon_guess: float = lon0
 
     def _cost(x: npt.NDArray) -> float:
-        rr = _extract_range(t, geocentric, [("0", float(x[0]), float(x[1]), alt)])
+        rr = extract_range(t, geocentric, [("0", float(x[0]), float(x[1]), alt)])
         model_rr = cast(npt.NDArray, rr["range_rate_0"])
         denom = np.dot(model_rr, model_rr)
         if denom < 1e-30:

@@ -10,8 +10,6 @@ dependencies = [
     "geographiclib>=2.0",
     "numpy>=1.22",
     "ppigrf>=2.1.0",
-    "pydantic>=2",
-    "pyright>=1.1.408",
     "scipy>=1.13.1",
     "sgp4>=2.23",
     "skyfield>=1.53",
@@ -34,6 +32,7 @@ dev = [
     "hypothesis>=6",
     "jupyterlab>=4.5.4",
     "matplotlib>=3.9.4",
+    "pyright>=1.1.408",
     "pytest>=7",
 ]
 
