@@ -393,6 +393,12 @@ class TestGenerateMagneticFieldECEF:
 class TestGenerate:
     """Tests for the generate() wrapper."""
 
+    def test_times_key(self):
+        """generate() always includes the input time array as 'times'."""
+        result = generate(TIMES, SAT, ["eci"])
+        np.testing.assert_array_equal(result["times"], TIMES)
+        assert list(result.keys())[0] == "times"
+
     def test_single_group(self):
         result = generate(TIMES, SAT, ["eci"])
         assert "eci_x" in result
@@ -464,8 +470,10 @@ class TestGenerate:
         result_prop = generate(TIMES, propagator, ["eci", "lla"])
         result_sat = generate(TIMES, SAT, ["eci", "lla"])
 
-        # Results should be identical
+        # Results should be identical (skip 'times' — not numeric)
         for key in result_prop:
+            if key == "times":
+                continue
             np.testing.assert_allclose(
                 result_prop[key],
                 result_sat[key],
@@ -534,3 +542,64 @@ class TestGenerateWithSites:
         """Omitting sites produces no range keys."""
         result = generate(TIMES, SAT, ["eci"])
         assert not any(k.startswith("range") for k in result)
+
+
+# ---------------------------------------------------------------------------
+# generate() with various datetime64 resolutions
+# ---------------------------------------------------------------------------
+# The reference resolution used throughout the library.
+_REF_TIMES = T0 + np.arange(0, 60 * 60, 60, dtype="timedelta64[s]")
+_REF_RESULT = generate(_REF_TIMES, SAT, ["eci", "lla"])
+
+
+def _make_times(resolution: str) -> np.ndarray:
+    """Build times identical to _REF_TIMES but cast to *resolution*."""
+    t0 = np.datetime64("1998-11-20T06:50:00", resolution)
+    return t0 + np.arange(0, 60 * 60, 60, dtype="timedelta64[s]")
+
+
+@pytest.mark.parametrize("resolution", ["s", "ms", "us", "ns"])
+class TestGenerateTimeResolutions:
+    """generate() must accept datetime64 arrays of any sub-second resolution."""
+
+    def test_eci_keys_and_shapes(self, resolution):
+        times = _make_times(resolution)
+        result = generate(times, SAT, ["eci"])
+        assert set(result) == {
+            "times", "eci_x", "eci_y", "eci_z", "eci_vx", "eci_vy", "eci_vz",
+        }
+        for arr in result.values():
+            assert arr.shape == (len(times),)
+
+    def test_lla_bounds(self, resolution):
+        times = _make_times(resolution)
+        result = generate(times, SAT, ["lla"])
+        assert np.all(result["lat"] >= -90) and np.all(result["lat"] <= 90)
+        assert np.all(result["lon"] >= -180) and np.all(result["lon"] <= 180)
+
+    def test_results_match_us_reference(self, resolution):
+        """All resolutions must produce the same positions as datetime64[us]."""
+        times = _make_times(resolution)
+        result = generate(times, SAT, ["eci", "lla"])
+        for key in _REF_RESULT:
+            if key == "times":
+                continue
+            np.testing.assert_allclose(
+                result[key],
+                _REF_RESULT[key],
+                rtol=1e-6,
+                err_msg=f"{key} differs for resolution '{resolution}'",
+            )
+
+    def test_propagator_path(self, resolution):
+        """Propagator code-path handles the resolution too."""
+        prop = Propagator(_tles[:1], method="epoch")
+        times = _make_times(resolution)
+        result = generate(times, prop, ["eci"])
+        for key in ("eci_x", "eci_y", "eci_z"):
+            np.testing.assert_allclose(
+                result[key],
+                _REF_RESULT[key],
+                rtol=1e-10,
+                err_msg=f"Propagator {key} differs for resolution '{resolution}'",
+            )

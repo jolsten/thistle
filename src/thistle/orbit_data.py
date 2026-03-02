@@ -633,4 +633,5 @@ def generate(
         if key in _F32_KEYS:
             result[key] = arr.astype(np.float32)
 
-    return result
+    # Prepend the input time array so callers always have it.
+    return {"times": times, **result}

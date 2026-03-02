@@ -176,8 +176,9 @@ def jday_datetime64(
     Returns:
         A tuple of (integer Julian day, fractional day) arrays.
     """
+    array_us = array.astype("datetime64[us]")
     times = (
-        (array - np.datetime64("1957-01-01", "us")).astype("i8") / 86_400 / 1_000_000
+        (array_us - np.datetime64("1957-01-01", "us")).astype("i8") / 86_400 / 1_000_000
     )
     jd = np.floor(times)
     fr = times - jd
