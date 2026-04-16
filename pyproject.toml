@@ -31,6 +31,14 @@ dependencies = [
 ]
 dynamic = ["version"]
 
+[project.optional-dependencies]
+cli = [
+    "typer>=0.12",
+]
+
+[project.scripts]
+thistle = "thistle.cli:main"
+
 [project.urls]
 Source = "https://github.com/jolsten/thistle"
 Issues = "https://github.com/jolsten/thistle/issues"

@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.4.0]
+
+### Added
+
+- Command-line interface (`thistle` entry point) with six subcommands:
+  - `inspect` -- parse TLE files and display orbital parameters as a table
+  - `find-tle` -- find the correct TLE for given timestamps via a switching
+    strategy
+  - `summary` -- summarize TLE data quality for a single object (epoch range,
+    interval stats, gap detection)
+  - `catalog` -- summarize TLE data across a directory (aggregate interval
+    stats and gap detection)
+  - `filter` -- filter TLEs by epoch time, NORAD catalog number, or orbital
+    elements (inclination, eccentricity, period, SMA, perigee, apogee,
+    revolution number)
+  - `propagate` -- propagate TLEs and generate orbital data from stdin
+    timestamps
+- `cli` optional dependency group (`pip install 'thistle[cli]'`) pulling in
+  `typer`. The CLI fails gracefully with a helpful install hint when the
+  extra is not installed.
+
 ## [0.3.0]
 
 ### Fixed
