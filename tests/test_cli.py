@@ -7,6 +7,9 @@ import sys
 
 import pytest
 
+if sys.version_info < (3, 10):
+    pytest.skip("thistle CLI requires Python 3.10+", allow_module_level=True)
+
 typer = pytest.importorskip("typer")
 from typer.testing import CliRunner  # noqa: E402
 

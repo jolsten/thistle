@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.1]
+
+### Fixed
+
+- The CLI (`thistle` entry point and the `cli` extra) now requires Python 3.10+.
+  On 3.9, typer's argument parsing misbehaved on several subcommand invocations,
+  so the CLI never worked there. The `typer` dependency in the `cli` extra now
+  carries a `python_version >= '3.10'` marker, and the `thistle` entry point
+  prints a clear message and exits 1 when invoked on Python 3.9.
+- The library itself continues to support Python 3.9.
+
 ## [0.4.0]
 
 ### Added

@@ -11,8 +11,16 @@ import sys
 def main() -> None:
     """Entry point for the ``thistle`` CLI.
 
-    Fails gracefully with a helpful message if CLI dependencies aren't installed.
+    Fails gracefully with a helpful message if CLI dependencies aren't installed
+    or the Python version is too old.
     """
+    if sys.version_info < (3, 10):
+        print(
+            "thistle: the CLI requires Python 3.10 or newer "
+            f"(current: {sys.version_info.major}.{sys.version_info.minor}).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     try:
         from thistle.cli._app import app
     except ImportError as e:
