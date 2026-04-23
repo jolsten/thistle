@@ -32,6 +32,57 @@ jobs:
       - name: Run tests
         run: uv run pytest tests
 
+  cli-install:
+    name: cli-extra-install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv and set the python version
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install thistle with cli extra, no dev
+        run: uv sync --extra cli --no-dev
+
+      - name: Verify CLI runs
+        run: |
+          uv run thistle --help
+          uv run thistle inspect --columns
+
+  cli-missing:
+    name: cli-missing-graceful
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv and set the python version
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install thistle without cli extra
+        run: uv sync --no-dev
+
+      - name: Verify graceful failure
+        run: |
+          set +e
+          output=$(uv run thistle --help 2>&1)
+          exit_code=$?
+          set -e
+          echo "Exit code: $exit_code"
+          echo "Output:"
+          echo "$output"
+          if [ "$exit_code" -ne 1 ]; then
+            echo "Expected exit code 1, got $exit_code"
+            exit 1
+          fi
+          if ! echo "$output" | grep -qF "pip install 'thistle[cli]'"; then
+            echo "Expected output to contain install hint"
+            exit 1
+          fi
+
   numpy:
     name: numpy-versions
     runs-on: ubuntu-latest
