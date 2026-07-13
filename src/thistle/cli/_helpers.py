@@ -11,6 +11,7 @@ from sgp4.api import Satrec
 
 MU = 398600.4418  # Earth gravitational parameter (km^3/s^2)
 RE = 6371.0  # Earth mean radius (km)
+J2 = 1.08262668e-3  # Earth J2 zonal harmonic
 
 DEFAULT_COLUMNS = [
     # (name, width, description, numeric?)
@@ -125,6 +126,67 @@ def parse_tle_pair(line1: str, line2: str, include_all: bool = False) -> list[st
         str(sat.elnum),
         str(sat.revnum),
     ]
+
+
+def nodal_rate_rev_per_day(sat: Satrec) -> float:
+    """Nodal revolution rate: mean motion plus the J2 apsidal precession rate.
+
+    Revolutions are counted at ascending-node crossings, so the relevant rate
+    is d(argument of latitude)/dt = n + argp_dot, not the mean-anomaly rate.
+    """
+    n0 = sat.no_kozai * 1440.0 / (2.0 * math.pi)  # rev/day
+    mm_rad_per_sec = sat.no_kozai / 60.0
+    sma_km = (MU / (mm_rad_per_sec**2)) ** (1.0 / 3.0)
+    p = sma_km * (1.0 - sat.ecco**2)
+    cos_i = math.cos(sat.inclo)
+    argp_dot = 0.75 * n0 * J2 * (RE / p) ** 2 * (5.0 * cos_i**2 - 1.0)  # rev/day
+    return n0 + argp_dot
+
+
+def ndot_rev_per_day2(sat: Satrec) -> float:
+    """The TLE line-1 first-derivative field (already n-dot/2) in rev/day^2.
+
+    sgp4 stores ndot in rad/min^2; this inverts its read-time conversion.
+    """
+    return sat.ndot * 1440.0**2 / (2.0 * math.pi)
+
+
+def _rev_phase(sat: Satrec) -> float:
+    """Fraction of the current revolution completed at the TLE epoch."""
+    u0 = (sat.argpo + sat.mo) % (2.0 * math.pi)  # mean argument of latitude
+    return u0 / (2.0 * math.pi)
+
+
+def revnum_at(sat: Satrec, dt: datetime) -> float:
+    """Estimated fractional revolution number at ``dt``.
+
+    Integer part is the current rev (increments at the ascending node);
+    the fraction is the portion of that rev completed.
+    """
+    epoch = epoch_to_datetime(sat.epochyr, sat.epochdays)
+    dt_days = (dt - epoch).total_seconds() / 86400.0
+    n = nodal_rate_rev_per_day(sat)
+    c = ndot_rev_per_day2(sat)
+    return sat.revnum + _rev_phase(sat) + n * dt_days + c * dt_days**2
+
+
+def rev_bounds(sat: Satrec, revnum: int) -> tuple[datetime, datetime]:
+    """Estimated (start, stop) ascending-node crossing times of rev ``revnum``."""
+    epoch = epoch_to_datetime(sat.epochyr, sat.epochdays)
+    n = nodal_rate_rev_per_day(sat)
+    c = ndot_rev_per_day2(sat)
+
+    def invert(drev: float) -> datetime:
+        # Solve c*t^2 + n*t - drev = 0 for elapsed days t.
+        disc = n**2 + 4.0 * c * drev
+        if abs(c) < 1e-12 or disc < 0.0:
+            dt_days = drev / n
+        else:
+            dt_days = (-n + math.sqrt(disc)) / (2.0 * c)
+        return epoch + timedelta(days=dt_days)
+
+    drev_start = (revnum - sat.revnum) - _rev_phase(sat)
+    return invert(drev_start), invert(drev_start + 1.0)
 
 
 def parse_site(

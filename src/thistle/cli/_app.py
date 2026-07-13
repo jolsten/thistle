@@ -6,7 +6,7 @@ import json
 import math
 import pathlib
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Optional
 
@@ -23,9 +23,12 @@ from thistle.cli._helpers import (
     RE,
     AlignedWriter,
     epoch_to_datetime,
+    nodal_rate_rev_per_day,
     parse_site,
     parse_tle_epochs,
     read_and_emit_tles,
+    rev_bounds,
+    revnum_at,
     warn_if_tty,
 )
 
@@ -163,6 +166,227 @@ def find_tle(
             seen.add(key)
 
         sys.stdout.write(line1 + "\n" + line2 + "\n")
+
+
+# ---------------------------------------------------------------------------
+# revnum
+# ---------------------------------------------------------------------------
+
+
+def _parse_rev_or_time(value: str) -> int | datetime:
+    """Classify a CLI value as a revnum (int) or an epoch (datetime)."""
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError(
+            f"expected a revolution number or ISO 8601 timestamp, got: {value}"
+        )
+
+
+def _ascending_crossings(
+    line1: str, line2: str, start: datetime, stop: datetime
+) -> list[datetime]:
+    """SGP4-exact ascending-node crossing times within [start, stop]."""
+    from skyfield.api import EarthSatellite
+
+    from thistle.events import find_node_crossings
+
+    satellite = EarthSatellite(line1, line2)
+    crossings = find_node_crossings(
+        np.datetime64(start.isoformat(), "us"),
+        np.datetime64(stop.isoformat(), "us"),
+        satellite,
+    )
+    return [
+        c["start"].astype("datetime64[us]").item()
+        for c in crossings
+        if c["ascending"]
+    ]
+
+
+@app.command("revnum")
+def revnum_cmd(
+    file: Annotated[pathlib.Path, typer.Argument(help="TLE file path")],
+    value: Annotated[
+        str,
+        typer.Argument(
+            help="Revolution number (integer) or epoch (ISO 8601). "
+            "Integers always parse as revnums, so 20240315 is a revnum, not a date."
+        ),
+    ],
+    value2: Annotated[
+        Optional[str],
+        typer.Argument(
+            help="Optional second value: give one revnum and one epoch "
+            "(either order) to find which object(s) match"
+        ),
+    ] = None,
+    refine: Annotated[
+        bool,
+        typer.Option(
+            "--refine",
+            help="Snap to SGP4-exact ascending-node crossings. Trusts the "
+            "estimate to be within half a rev for the integer count, so "
+            "accuracy degrades far from the TLE epoch. Convert modes only.",
+        ),
+    ] = False,
+    tol: Annotated[
+        float,
+        typer.Option("--tol", help="Match-mode tolerance in revolutions"),
+    ] = 1.0,
+) -> None:
+    """Convert between revolution number and epoch, or match objects to a rev.
+
+    Revolutions are counted at ascending-node crossings. With a revnum,
+    prints the estimated start and stop of that revolution. With an epoch,
+    prints the estimated fractional revnum at that time. With both, scans a
+    multi-object TLE file for objects on that revnum (within --tol) at that
+    time. Note: the TLE revnum field is 5 digits and rolls over at 100000;
+    rollover is not handled.
+    """
+    try:
+        parsed_values = [_parse_rev_or_time(value)]
+        if value2 is not None:
+            parsed_values.append(_parse_rev_or_time(value2))
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise typer.Exit(code=2)
+
+    try:
+        f = open(file)
+    except FileNotFoundError:
+        print(f"Error: TLE file not found: {file}", file=sys.stderr)
+        raise typer.Exit(code=2)
+
+    with f:
+        tles = parse_tle_epochs(f)
+
+    if not tles:
+        print(f"Error: no TLEs found in {file}", file=sys.stderr)
+        raise typer.Exit(code=2)
+
+    revs = [v for v in parsed_values if isinstance(v, int)]
+    times = [v for v in parsed_values if isinstance(v, datetime)]
+
+    if len(parsed_values) == 2:
+        if len(revs) != 1 or len(times) != 1:
+            print(
+                "Error: match mode requires one revnum and one timestamp",
+                file=sys.stderr,
+            )
+            raise typer.Exit(code=2)
+        _revnum_match(tles, revs[0], times[0], tol, refine)
+    elif revs:
+        _rev_to_epoch(tles, revs[0], refine)
+    else:
+        _epoch_to_rev(tles, times[0], refine)
+
+
+def _rev_to_epoch(
+    tles: list[tuple[str, str, Satrec]], target: int, refine: bool
+) -> None:
+    line1, line2, sat = min(tles, key=lambda t: abs(t[2].revnum - target))
+    start, stop = rev_bounds(sat, target)
+
+    if refine:
+        period = timedelta(days=1.0 / nodal_rate_rev_per_day(sat))
+        crossings = _ascending_crossings(
+            line1, line2, start - 1.5 * period, stop + 1.5 * period
+        )
+        if crossings:
+            start = min(crossings, key=lambda c: abs(c - start))
+            stop = min(crossings, key=lambda c: abs(c - stop))
+        else:
+            print(
+                "Warning: no ascending-node crossings found; "
+                "falling back to estimate",
+                file=sys.stderr,
+            )
+
+    print(f"{start.isoformat()} {stop.isoformat()}")
+
+
+def _epoch_to_rev(
+    tles: list[tuple[str, str, Satrec]], t: datetime, refine: bool
+) -> None:
+    def epoch_dist(item: tuple[str, str, Satrec]) -> float:
+        sat = item[2]
+        return abs((epoch_to_datetime(sat.epochyr, sat.epochdays) - t).total_seconds())
+
+    line1, line2, sat = min(tles, key=epoch_dist)
+    result = revnum_at(sat, t)
+
+    if refine:
+        period = timedelta(days=1.0 / nodal_rate_rev_per_day(sat))
+        crossings = _ascending_crossings(
+            line1, line2, t - 1.5 * period, t + 0.5 * period
+        )
+        prev = [c for c in crossings if c <= t]
+        nxt = [c for c in crossings if c > t]
+        if prev:
+            t_prev = max(prev)
+            t_next = min(nxt) if nxt else t_prev + period
+            whole = round(revnum_at(sat, t_prev))
+            frac = (t - t_prev).total_seconds() / (t_next - t_prev).total_seconds()
+            result = whole + frac
+        else:
+            print(
+                "Warning: no ascending-node crossings found; "
+                "falling back to estimate",
+                file=sys.stderr,
+            )
+
+    print(f"{result:.3f}")
+
+
+def _revnum_match(
+    tles: list[tuple[str, str, Satrec]],
+    target: int,
+    t: datetime,
+    tol: float,
+    refine: bool,
+) -> None:
+    if refine:
+        print(
+            "Note: --refine is ignored in match mode (estimates only)",
+            file=sys.stderr,
+        )
+
+    best_by_satnum: dict[int, Satrec] = {}
+    for _, _, sat in tles:
+        age = abs((epoch_to_datetime(sat.epochyr, sat.epochdays) - t).total_seconds())
+        current = best_by_satnum.get(sat.satnum)
+        if current is None or age < abs(
+            (epoch_to_datetime(current.epochyr, current.epochdays) - t).total_seconds()
+        ):
+            best_by_satnum[sat.satnum] = sat
+
+    matches = []
+    for sat in best_by_satnum.values():
+        est = revnum_at(sat, t)
+        delta = est - target
+        if abs(math.floor(est) - target) <= tol:
+            age_days = (
+                t - epoch_to_datetime(sat.epochyr, sat.epochdays)
+            ).total_seconds() / 86400.0
+            matches.append((sat, est, delta, age_days))
+
+    matches.sort(key=lambda m: abs(m[2]))
+
+    writer = AlignedWriter(" ", numeric=[True, False, True, True, True])
+    for sat, est, delta, age_days in matches:
+        writer.add_row([
+            str(sat.satnum),
+            sat.intldesg.strip(),
+            f"{est:.3f}",
+            f"{delta:+.3f}",
+            f"{age_days:.2f}",
+        ])
+    writer.flush()
 
 
 # ---------------------------------------------------------------------------
