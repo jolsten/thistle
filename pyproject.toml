@@ -1,97 +1,23 @@
-[project]
-name = "thistle"
-description = "Satellite orbit propagation and data generation with automatic TLE switching"
-readme = "README.md"
-license = "MIT"
-authors = [
-    { name = "Jonathan Olsten", email = "jonathan.olsten@gmail.com" }
-]
-requires-python = ">=3.9"
-classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Topic :: Scientific/Engineering",
-    "Topic :: Scientific/Engineering :: Astronomy",
-    "Topic :: Scientific/Engineering :: Physics",
-]
-dependencies = [
-    "geographiclib>=2.0",
-    "numpy>=1.22",
-    "ppigrf>=2.1.0",
-    "scipy>=1.13.1",
-    "sgp4>=2.23",
-    "skyfield>=1.53",
-]
-dynamic = ["version"]
-
-[project.optional-dependencies]
-cli = [
-    "typer>=0.12; python_version >= '3.10'",
-]
-plot = [
-    "thistle[cli]",
-    "matplotlib>=3.8; python_version >= '3.10'",
-    "cartopy>=0.23; python_version >= '3.10'",
-]
-
-[project.scripts]
-thistle = "thistle.cli:main"
-
-[project.urls]
-Source = "https://github.com/jolsten/thistle"
-Issues = "https://github.com/jolsten/thistle/issues"
-
-[build-system]
-requires = ["hatchling", "hatch-vcs"]
-build-backend = "hatchling.build"
-
-[tool.hatch.version]
-source = "vcs"
-
-[tool.hatch.build.hooks.vcs]
-version-file = "src/thistle/_version.py"
+[tool.uv.workspace]
+members = ["packages/*"]
 
 [dependency-groups]
 dev = [
+    # shared
+    "pytest>=8",
+    "pyright>=1.1.408",
+    "ruff>=0.8",
+    # thistle
     "cartopy>=0.23.0",
     "hypothesis>=6",
     "jupyterlab>=4.5.4",
     "matplotlib>=3.9.4",
-    "pyright>=1.1.408",
-    "pytest>=7",
+    # thistle-db
+    "psycopg[binary]>=3.2",
+    "pymysql>=1.1",
+    "requests>=2.32",
+    "spacetrack>=1.4",
 ]
 
-[tool.pyright]
-# Suppress type errors from third-party libraries without complete type stubs
-reportAttributeAccessIssue = "none"
-reportOperatorIssue = "none"
-reportOptionalMemberAccess = "none"
-
-# Only apply to third-party modules
-[[tool.pyright.executionEnvironments]]
-root = "."
-include = ["src", "tests"]
-reportMissingTypeStubs = false
-
-[tool.mypy]
-python_version = "3.9"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = false
-ignore_missing_imports = true
-
-# Per-module options for third-party libraries
-[[tool.mypy.overrides]]
-module = [
-    "skyfield.*",
-    "sgp4.*",
-]
-ignore_missing_imports = true
-ignore_errors = true
+[tool.pytest.ini_options]
+testpaths = ["tests"]
