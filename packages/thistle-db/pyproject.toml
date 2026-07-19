@@ -1,0 +1,50 @@
+[project]
+name = "thistle-db"
+dynamic = ["version"]
+description = "Orbital element database management tool"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Jonathan Olsten", email = "jolsten@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "loguru>=0.7.3",
+    "pydantic-settings>=2.9.1",
+    "sgp4>=2.24",
+    "sqlalchemy>=2.0.40",
+    "typer>=0.27.0",
+]
+
+[project.optional-dependencies]
+mysql = ["pymysql>=1.1"]
+
+[project.scripts]
+thistle-db = "thistle_db:main"
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+root = "../.."
+git_describe_command = [
+    "git",
+    "describe",
+    "--dirty",
+    "--tags",
+    "--long",
+    "--match",
+    "thistle-db-v[0-9]*",
+]
+tag_regex = "^thistle-db-v(?P<version>.+)$"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/thistle_db/_version.py"
+
+[tool.pyright]
+# scripts/ holds untyped dev utilities (spacetrack proxies defeat pyright)
+include = ["src"]
