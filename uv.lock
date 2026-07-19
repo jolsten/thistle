@@ -4263,6 +4263,11 @@ dependencies = [
 cli = [
     { name = "typer", marker = "python_full_version >= '3.10'" },
 ]
+plot = [
+    { name = "cartopy", version = "0.25.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+    { name = "matplotlib", version = "3.10.8", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+    { name = "typer", marker = "python_full_version >= '3.10'" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -4278,15 +4283,18 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cartopy", marker = "python_full_version >= '3.10' and extra == 'plot'", specifier = ">=0.23" },
     { name = "geographiclib", specifier = ">=2.0" },
+    { name = "matplotlib", marker = "python_full_version >= '3.10' and extra == 'plot'", specifier = ">=3.8" },
     { name = "numpy", specifier = ">=1.22" },
     { name = "ppigrf", specifier = ">=2.1.0" },
     { name = "scipy", specifier = ">=1.13.1" },
     { name = "sgp4", specifier = ">=2.23" },
     { name = "skyfield", specifier = ">=1.53" },
     { name = "typer", marker = "python_full_version >= '3.10' and extra == 'cli'", specifier = ">=0.12" },
+    { name = "typer", marker = "python_full_version >= '3.10' and extra == 'plot'", specifier = ">=0.12" },
 ]
-provides-extras = ["cli"]
+provides-extras = ["cli", "plot"]
 
 [package.metadata.requires-dev]
 dev = [

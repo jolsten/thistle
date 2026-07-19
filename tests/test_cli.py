@@ -24,6 +24,13 @@ ISS_TLE = """\
 """
 
 
+@pytest.fixture(autouse=True)
+def _clean_thistle_env(monkeypatch):
+    """Keep the developer's real THISTLE_* environment out of the suite."""
+    monkeypatch.delenv("THISTLE_TLE_DIR", raising=False)
+    monkeypatch.delenv("THISTLE_TLE_EXT", raising=False)
+
+
 @pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
@@ -46,10 +53,12 @@ def test_help(runner):
         "inspect",
         "find-tle",
         "summary",
-        "catalog",
         "filter",
         "propagate",
         "revnum",
+        "plot",
+        "maneuvers",
+        "groundtrack",
     ]:
         assert cmd in result.stdout
 
@@ -99,29 +108,6 @@ def test_summary_json(runner, tle_file):
 
 def test_summary_missing_file(runner):
     result = runner.invoke(app, ["summary", "/nonexistent/file.tle"])
-    assert result.exit_code == 2
-
-
-# ---- catalog --------------------------------------------------------------
-
-
-def test_catalog(runner, tmp_path, tle_file):
-    result = runner.invoke(app, ["catalog", str(tmp_path)])
-    assert result.exit_code == 0
-    assert "Directory:" in result.stdout
-    assert "TLE count:  2" in result.stdout
-
-
-def test_catalog_json(runner, tmp_path, tle_file):
-    result = runner.invoke(app, ["catalog", str(tmp_path), "--json"])
-    assert result.exit_code == 0
-    data = json.loads(result.stdout)
-    assert data["tle_count"] == 2
-    assert data["objects"] == 1
-
-
-def test_catalog_not_a_dir(runner, tle_file):
-    result = runner.invoke(app, ["catalog", str(tle_file)])
     assert result.exit_code == 2
 
 
@@ -329,6 +315,293 @@ def test_revnum_match_mode_arg_order(runner, multi_object_file):
     assert a.stdout == b.stdout
 
 
+# ---- plot -----------------------------------------------------------------
+
+
+@pytest.fixture
+def agg_backend(monkeypatch):
+    monkeypatch.setenv("MPLBACKEND", "Agg")
+
+
+def test_plot_save_png(runner, tle_file, tmp_path, agg_backend):
+    pytest.importorskip("matplotlib")
+    out = tmp_path / "out.png"
+    result = runner.invoke(app, ["plot", str(tle_file), "-o", str(out)])
+    assert result.exit_code == 0
+    assert out.read_bytes()[:4] == b"\x89PNG"
+
+
+def test_plot_save_svg(runner, tle_file, tmp_path, agg_backend):
+    pytest.importorskip("matplotlib")
+    out = tmp_path / "out.svg"
+    result = runner.invoke(app, ["plot", str(tle_file), "-o", str(out)])
+    assert result.exit_code == 0
+    assert b"<svg" in out.read_bytes()
+
+
+def test_plot_stdin(runner, tmp_path, agg_backend):
+    pytest.importorskip("matplotlib")
+    out = tmp_path / "out.png"
+    result = runner.invoke(app, ["plot", "-o", str(out)], input=ISS_TLE)
+    assert result.exit_code == 0
+    assert out.exists()
+
+
+def test_plot_fields_subset(runner, tle_file, tmp_path, agg_backend):
+    pytest.importorskip("matplotlib")
+    out = tmp_path / "out.png"
+    result = runner.invoke(
+        app, ["plot", str(tle_file), "--fields", "sma,ecc", "-o", str(out)]
+    )
+    assert result.exit_code == 0
+
+
+def test_plot_maneuvers_flag(runner, tle_file, tmp_path, agg_backend):
+    pytest.importorskip("matplotlib")
+    out = tmp_path / "out.png"
+    result = runner.invoke(
+        app, ["plot", str(tle_file), "--maneuvers", "-o", str(out)]
+    )
+    assert result.exit_code == 0
+
+
+def test_plot_unknown_field(runner, tle_file):
+    result = runner.invoke(app, ["plot", str(tle_file), "--fields", "sma,bogus"])
+    assert result.exit_code == 2
+
+
+def test_plot_multi_object(runner, multi_object_file, tmp_path):
+    out = tmp_path / "out.png"
+    result = runner.invoke(app, ["plot", str(multi_object_file), "-o", str(out)])
+    assert result.exit_code == 2
+    assert "filter --satnum" in result.stderr
+
+
+def test_plot_missing_file(runner):
+    result = runner.invoke(app, ["plot", "/nonexistent/file.tle", "-o", "x.png"])
+    assert result.exit_code == 2
+
+
+def test_plot_without_matplotlib(runner, tle_file, tmp_path, monkeypatch):
+    """Missing matplotlib exits 1 with an install hint."""
+    for name in list(sys.modules):
+        if name == "matplotlib" or name.startswith("matplotlib."):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.setitem(sys.modules, "matplotlib", None)
+
+    result = runner.invoke(
+        app, ["plot", str(tle_file), "-o", str(tmp_path / "x.png")]
+    )
+    assert result.exit_code == 1
+    assert "thistle[plot]" in result.stderr
+
+
+def test_plot_empty_file(runner, tmp_path):
+    path = tmp_path / "empty.tle"
+    path.write_text("no tles here\n")
+    result = runner.invoke(app, ["plot", str(path), "-o", "x.png"])
+    assert result.exit_code == 2
+
+
+# ---- plot presets and derived fields --------------------------------------
+
+# Two consecutive stationkept TLEs of a GEO object at ~145 deg E
+# (from tests/data/obj/50001.txt)
+GEO_TLE = """\
+1 50001U 21123A   25059.54220164 -.00000245  00000-0  00000-0 0  9992
+2 50001   0.0208 235.3877 0000111  15.3569 248.0225  1.00271703 11797
+1 50001U 21123A   25059.83517034 -.00000246  00000-0  00000-0 0  9990
+2 50001   0.0174 227.4075 0000104  26.3443 350.7728  1.00271584 11792
+"""
+
+
+@pytest.fixture
+def geo_file(tmp_path):
+    path = tmp_path / "geo.tle"
+    path.write_text(GEO_TLE)
+    return path
+
+
+def test_plot_preset(runner, geo_file, tmp_path, agg_backend):
+    pytest.importorskip("matplotlib")
+    out = tmp_path / "out.png"
+    result = runner.invoke(app, ["plot", str(geo_file), "--preset", "geo", "-o", str(out)])
+    assert result.exit_code == 0
+    assert out.read_bytes()[:4] == b"\x89PNG"
+
+
+def test_plot_preset_unknown(runner, tle_file):
+    result = runner.invoke(app, ["plot", str(tle_file), "--preset", "bogus"])
+    assert result.exit_code == 2
+
+
+def test_plot_preset_fields_exclusive(runner, tle_file):
+    result = runner.invoke(
+        app, ["plot", str(tle_file), "--preset", "leo", "--fields", "sma"]
+    )
+    assert result.exit_code == 2
+    assert "mutually exclusive" in result.stderr
+
+
+def test_plot_fields_lon_ltan(runner, geo_file, tmp_path, agg_backend):
+    pytest.importorskip("matplotlib")
+    out = tmp_path / "out.png"
+    result = runner.invoke(
+        app, ["plot", str(geo_file), "--fields", "lon,ltan", "-o", str(out)]
+    )
+    assert result.exit_code == 0
+
+
+def test_lon_series_stationkept_geo():
+    """Both TLEs of a stationkept GEO bird resolve to the same slot."""
+    from sgp4.api import Satrec
+
+    from thistle.cli._plot import _lon_series
+
+    lines = GEO_TLE.splitlines()
+    sats = [
+        Satrec.twoline2rv(lines[0], lines[1]),
+        Satrec.twoline2rv(lines[2], lines[3]),
+    ]
+    lon = _lon_series(sats)
+    assert all(-180.0 <= v < 180.0 for v in lon)
+    assert lon[0] == pytest.approx(145.0, abs=1.0)
+    assert lon[0] == pytest.approx(lon[1], abs=0.5)
+
+
+def test_ltan_series_at_equinox():
+    """Near the equinox the sun's RA is ~0, so LTAN ~= RAAN/15 + 12."""
+    from sgp4.api import Satrec
+
+    from thistle.cli._plot import _ltan_series
+
+    # ISS_TLE line 1 with the epoch moved to 2024 day 80.5 (Mar 20, equinox)
+    line1 = "1 25544U 98067A   24080.50000000  .00016717  00000-0  10270-3 0  9005"
+    line2 = ISS_TLE.splitlines()[1]
+    sat = Satrec.twoline2rv(line1, line2)
+    ltan = _ltan_series([sat])
+    expected = (208.9163 / 15.0 + 12.0) % 24.0
+    assert ltan[0] == pytest.approx(expected, abs=0.2)
+
+
+# ---- maneuvers ------------------------------------------------------------
+
+GEO_HISTORY = "tests/data/obj/50001.txt"
+
+
+def test_maneuvers_real_data(runner):
+    from datetime import datetime
+
+    result = runner.invoke(app, ["maneuvers", GEO_HISTORY])
+    assert result.exit_code == 0
+    lines = result.stdout.strip().splitlines()
+    assert len(lines) >= 1
+    epochs = [datetime.fromisoformat(line) for line in lines]
+    assert epochs == sorted(epochs)
+
+
+def test_maneuvers_matches_api(runner):
+    from thistle.cli._helpers import (
+        epoch_to_datetime,
+        maneuver_epochs,
+        parse_tle_epochs,
+    )
+
+    with open(GEO_HISTORY) as f:
+        parsed = parse_tle_epochs(f)
+    sats = sorted(
+        (s for _, _, s in parsed),
+        key=lambda s: epoch_to_datetime(s.epochyr, s.epochdays),
+    )
+    expected = [e.isoformat() for e in maneuver_epochs(sats, 10.0)]
+
+    result = runner.invoke(app, ["maneuvers", GEO_HISTORY])
+    assert result.stdout.strip().splitlines() == expected
+
+
+def test_maneuvers_huge_threshold(runner):
+    result = runner.invoke(app, ["maneuvers", GEO_HISTORY, "--threshold", "1e9"])
+    assert result.exit_code == 0
+    assert result.stdout == ""
+
+
+def test_maneuvers_short_series(runner, tle_file):
+    result = runner.invoke(app, ["maneuvers", str(tle_file)])
+    assert result.exit_code == 0
+    assert result.stdout == ""
+
+
+def test_maneuvers_stdin(runner):
+    result = runner.invoke(app, ["maneuvers"], input=ISS_TLE)
+    assert result.exit_code == 0
+
+
+def test_maneuvers_multi_object(runner, multi_object_file):
+    result = runner.invoke(app, ["maneuvers", str(multi_object_file)])
+    assert result.exit_code == 2
+    assert "filter --satnum" in result.stderr
+
+
+def test_maneuvers_missing_file(runner):
+    result = runner.invoke(app, ["maneuvers", "/nonexistent/file.tle"])
+    assert result.exit_code == 2
+
+
+def test_maneuvers_empty_file(runner, tmp_path):
+    path = tmp_path / "empty.tle"
+    path.write_text("no tles here\n")
+    result = runner.invoke(app, ["maneuvers", str(path)])
+    assert result.exit_code == 2
+
+
+# ---- detect_maneuvers (no matplotlib required) ----------------------------
+
+
+def _daily_times(n):
+    from datetime import datetime, timedelta
+
+    return [datetime(2024, 1, 1) + timedelta(days=i) for i in range(n)]
+
+
+def _noisy_series(n):
+    import math
+
+    # varied (non-degenerate) small noise so the MAD of deltas is nonzero
+    return [1.0 + 0.001 * math.sin(1.7 * i) for i in range(n)]
+
+
+def test_detect_maneuvers_finds_jump():
+    from thistle.cli._helpers import detect_maneuvers
+
+    times = _daily_times(20)
+    values = _noisy_series(20)
+    for i in range(10, 20):
+        values[i] += 1.0
+    events = detect_maneuvers(times, values, threshold=10.0)
+    assert events == [times[10]]
+
+
+def test_detect_maneuvers_pure_noise():
+    from thistle.cli._helpers import detect_maneuvers
+
+    times = _daily_times(20)
+    assert detect_maneuvers(times, _noisy_series(20), threshold=10.0) == []
+
+
+def test_detect_maneuvers_constant_series():
+    from thistle.cli._helpers import detect_maneuvers
+
+    times = _daily_times(20)
+    assert detect_maneuvers(times, [1.0] * 20, threshold=10.0) == []
+
+
+def test_detect_maneuvers_short_series():
+    from thistle.cli._helpers import detect_maneuvers
+
+    times = _daily_times(5)
+    assert detect_maneuvers(times, [1.0, 1.0, 5.0, 5.0, 5.0], threshold=10.0) == []
+
+
 # ---- propagate ------------------------------------------------------------
 
 
@@ -345,6 +618,245 @@ def test_propagate_requires_group(runner, tle_file):
         app, ["propagate", str(tle_file)], input="2024-01-01T12:00:00\n"
     )
     assert result.exit_code == 2
+
+
+# ---- groundtrack -----------------------------------------------------------
+
+SPEC_LINE = "2024-01-01T12:00:00 2024-01-01T13:30:00"
+
+
+def test_parse_spec_line_full():
+    from thistle.cli._map import parse_spec_line
+
+    spec = parse_spec_line(
+        f"{SPEC_LINE} color=red style=-- width=2 alpha=0.5 marker=. "
+        "label=ISS sat=25544"
+    )
+    assert spec is not None
+    assert spec.sat == "25544"
+    assert spec.plot_kwargs == {
+        "color": "red",
+        "linestyle": "--",
+        "linewidth": 2.0,
+        "alpha": 0.5,
+        "marker": ".",
+        "label": "ISS",
+    }
+
+
+def test_parse_spec_line_unknown_key_survives(capsys):
+    from thistle.cli._map import parse_spec_line
+
+    spec = parse_spec_line(f"{SPEC_LINE} bogus=1 color=red")
+    assert spec is not None
+    assert spec.plot_kwargs == {"color": "red"}
+    assert "unknown option" in capsys.readouterr().err
+
+
+def test_parse_spec_line_rejects():
+    from thistle.cli._map import parse_spec_line
+
+    assert parse_spec_line("") is None
+    assert parse_spec_line("# comment") is None
+    assert parse_spec_line("not-a-time also-not") is None
+    # stop before start
+    assert (
+        parse_spec_line("2024-01-02T00:00:00 2024-01-01T00:00:00") is None
+    )
+
+
+def test_groundtrack_stdin(runner, tle_file, tmp_path, agg_backend):
+    pytest.importorskip("cartopy")
+    out = tmp_path / "map.png"
+    result = runner.invoke(
+        app,
+        ["groundtrack", str(tle_file), "-o", str(out)],
+        input=f"{SPEC_LINE} color=red label=ISS\n",
+    )
+    assert result.exit_code == 0
+    assert out.read_bytes()[:4] == b"\x89PNG"
+
+
+def test_groundtrack_per_line_sat(runner, tmp_path, monkeypatch, agg_backend):
+    pytest.importorskip("cartopy")
+    d = tmp_path / "tledir"
+    d.mkdir()
+    (d / "25544.tle").write_text(ISS_TLE)
+    monkeypatch.setenv("THISTLE_TLE_DIR", str(d))
+    out = tmp_path / "map.png"
+    result = runner.invoke(
+        app,
+        ["groundtrack", "-o", str(out)],
+        input=f"{SPEC_LINE} sat=25544\n",
+    )
+    assert result.exit_code == 0
+    assert out.exists()
+
+
+def test_groundtrack_site_ring(runner, tle_file, tmp_path, agg_backend):
+    pytest.importorskip("cartopy")
+    out = tmp_path / "map.png"
+    result = runner.invoke(
+        app,
+        [
+            "groundtrack", str(tle_file),
+            "--site", "HAWAII:19.8:-155.5",
+            "--min-el", "5",
+            "-o", str(out),
+        ],
+        input=f"{SPEC_LINE}\n",
+    )
+    assert result.exit_code == 0
+    assert out.exists()
+
+
+def test_groundtrack_no_object(runner, tmp_path):
+    result = runner.invoke(
+        app,
+        ["groundtrack", "-o", str(tmp_path / "map.png")],
+        input=f"{SPEC_LINE}\n",
+    )
+    assert result.exit_code == 2
+    assert "no valid traces" in result.stderr
+
+
+def test_groundtrack_spec_file(runner, tle_file, tmp_path, agg_backend):
+    pytest.importorskip("cartopy")
+    spec = tmp_path / "spec.txt"
+    spec.write_text(f"# demo\n{SPEC_LINE} color=green\n")
+    out = tmp_path / "map.png"
+    result = runner.invoke(
+        app,
+        ["groundtrack", str(tle_file), "--spec", str(spec), "-o", str(out)],
+    )
+    assert result.exit_code == 0
+
+
+def test_groundtrack_missing_spec_file(runner, tle_file):
+    result = runner.invoke(
+        app, ["groundtrack", str(tle_file), "--spec", "/nonexistent/spec.txt"]
+    )
+    assert result.exit_code == 2
+
+
+def test_groundtrack_bad_site(runner, tle_file):
+    result = runner.invoke(
+        app, ["groundtrack", str(tle_file), "--site", "badsite"],
+        input=f"{SPEC_LINE}\n",
+    )
+    assert result.exit_code == 2
+
+
+# ---- config / catalog-ID resolution ---------------------------------------
+
+
+@pytest.fixture
+def tle_dir(tmp_path, monkeypatch):
+    """A THISTLE_TLE_DIR containing 25544.tle (ISS_TLE)."""
+    d = tmp_path / "tledir"
+    d.mkdir()
+    (d / "25544.tle").write_text(ISS_TLE)
+    monkeypatch.setenv("THISTLE_TLE_DIR", str(d))
+    return d
+
+
+def test_resolve_id_summary(runner, tle_dir):
+    result = runner.invoke(app, ["summary", "25544"])
+    assert result.exit_code == 0
+    assert "25544" in result.stdout
+
+
+def test_resolve_id_revnum(runner, tle_dir):
+    result = runner.invoke(app, ["revnum", "25544", "101"])
+    assert result.exit_code == 0
+    assert len(result.stdout.split()) == 2
+
+
+def test_resolve_id_custom_ext(runner, tmp_path, monkeypatch):
+    d = tmp_path / "tledir"
+    d.mkdir()
+    (d / "25544.txt").write_text(ISS_TLE)
+    monkeypatch.setenv("THISTLE_TLE_DIR", str(d))
+    for ext in (".txt", "txt"):  # with and without leading dot
+        monkeypatch.setenv("THISTLE_TLE_EXT", ext)
+        result = runner.invoke(app, ["summary", "25544"])
+        assert result.exit_code == 0
+
+
+def test_resolve_alpha5(runner, tmp_path, monkeypatch):
+    d = tmp_path / "tledir"
+    d.mkdir()
+    (d / "A0001.tle").write_text(ISS_TLE)
+    monkeypatch.setenv("THISTLE_TLE_DIR", str(d))
+    assert runner.invoke(app, ["summary", "A0001"]).exit_code == 0
+    # lowercase input resolves via the uppercase retry
+    assert runner.invoke(app, ["summary", "a0001"]).exit_code == 0
+
+
+def test_resolve_alpha5_excluded_letters(runner, tmp_path, monkeypatch):
+    d = tmp_path / "tledir"
+    d.mkdir()
+    (d / "I0001.tle").write_text(ISS_TLE)
+    monkeypatch.setenv("THISTLE_TLE_DIR", str(d))
+    # I and O are not valid Alpha-5 letters; not treated as a catalog ID
+    result = runner.invoke(app, ["summary", "I0001"])
+    assert result.exit_code == 2
+    assert "also tried" not in result.stderr
+
+
+def test_resolve_literal_path_wins(runner, tmp_path, tle_dir):
+    # A real file named like an ID is used directly, not looked up in tle_dir
+    literal = tmp_path / "25544"
+    literal.write_text(VANGUARD_TLE)
+    result = runner.invoke(app, ["summary", str(literal)])
+    assert result.exit_code == 0
+    assert "59001A" in result.stdout  # Vanguard, not the ISS TLE from tle_dir
+
+
+def test_resolve_id_miss_names_both_paths(runner, tle_dir):
+    result = runner.invoke(app, ["summary", "99999"])
+    assert result.exit_code == 2
+    assert "99999" in result.stderr
+    assert "also tried" in result.stderr
+    assert str(tle_dir) in result.stderr
+
+
+def test_resolve_id_without_env_unchanged(runner):
+    result = runner.invoke(app, ["summary", "25544"])
+    assert result.exit_code == 2
+    assert "also tried" not in result.stderr
+
+
+def test_config_not_set(runner):
+    result = runner.invoke(app, ["config"])
+    assert result.exit_code == 0
+    assert "(not set)" in result.stdout
+    assert "tle_ext: .tle" in result.stdout
+
+
+def test_config_from_env(runner, tle_dir, monkeypatch):
+    monkeypatch.setenv("THISTLE_TLE_EXT", "txt")
+    result = runner.invoke(app, ["config"])
+    assert result.exit_code == 0
+    assert str(tle_dir) in result.stdout
+    assert "THISTLE_TLE_DIR" in result.stdout
+    assert "tle_ext: .txt" in result.stdout
+
+
+def test_config_json(runner, tle_dir):
+    result = runner.invoke(app, ["config", "--json"])
+    data = json.loads(result.stdout)
+    assert data["tle_dir"] == str(tle_dir)
+    assert data["tle_dir_source"] == "THISTLE_TLE_DIR"
+    assert data["tle_ext"] == ".tle"
+    assert data["tle_ext_source"] == "default"
+
+
+def test_config_warns_missing_dir(runner, monkeypatch, tmp_path):
+    monkeypatch.setenv("THISTLE_TLE_DIR", str(tmp_path / "nope"))
+    result = runner.invoke(app, ["config"])
+    assert result.exit_code == 0
+    assert "non-existent" in result.stderr
 
 
 # ---- graceful failure when typer is unavailable --------------------------

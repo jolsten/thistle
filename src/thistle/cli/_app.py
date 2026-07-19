@@ -8,7 +8,7 @@ import pathlib
 import sys
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Optional
+from typing import NoReturn, Optional
 
 import numpy as np
 import typer
@@ -23,6 +23,7 @@ from thistle.cli._helpers import (
     RE,
     AlignedWriter,
     epoch_to_datetime,
+    maneuver_epochs,
     nodal_rate_rev_per_day,
     parse_site,
     parse_tle_epochs,
@@ -32,19 +33,64 @@ from thistle.cli._helpers import (
     warn_if_tty,
 )
 
+from thistle.cli._config import (
+    TLE_DIR_ENV,
+    TLE_EXT_ENV,
+    candidate_names,
+    is_catalog_id,
+    load_config,
+)
+
 app = typer.Typer(
     name="thistle",
-    help="Satellite orbit propagation and TLE analysis tools.",
+    help="Satellite orbit propagation and TLE analysis tools.\n\n"
+    f"Environment: set {TLE_DIR_ENV} to a directory of per-object TLE files "
+    "to pass NORAD catalog IDs (e.g. 25544 or A0001) instead of file paths; "
+    f"{TLE_EXT_ENV} sets their extension (default .tle). See 'thistle config'.",
     no_args_is_help=True,
     add_completion=False,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 
 
+def _resolve_tle_path(file: pathlib.Path) -> pathlib.Path:
+    """Resolve a FILE argument, treating catalog IDs via THISTLE_TLE_DIR.
+
+    A path that exists is always used verbatim. A non-existent all-digit or
+    Alpha-5 argument is looked up as {tle_dir}/{id}{ext}; a miss there is a
+    hard error naming every path tried. Anything else passes through for the
+    caller's normal file-not-found handling.
+    """
+    if file.exists():
+        return file
+    cfg = load_config()
+    name = str(file)
+    if cfg.tle_dir is not None and is_catalog_id(name):
+        tried = []
+        for cand in candidate_names(name):
+            candidate = cfg.tle_dir / f"{cand}{cfg.tle_ext}"
+            if candidate.exists():
+                return candidate
+            tried.append(str(candidate))
+        print(
+            f"Error: TLE file not found: {file} (also tried {', '.join(tried)})",
+            file=sys.stderr,
+        )
+        raise typer.Exit(code=2)
+    return file
+
+
 class SwitchStrategy(str, Enum):
     epoch = "epoch"
     midpoint = "midpoint"
     tca = "tca"
+
+
+class PlotPreset(str, Enum):
+    leo = "leo"
+    geo = "geo"
+    sunsync = "sunsync"
+    heo = "heo"
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +140,7 @@ def inspect(
         writer.add_row([name for name, _, _, _ in col_defs])
 
     if file is not None:
+        file = _resolve_tle_path(file)
         try:
             with open(file) as f:
                 read_and_emit_tles(f, writer, include_all=all_fields)
@@ -127,6 +174,7 @@ def find_tle(
     """Find the correct TLE for given timestamps read from stdin."""
     from thistle import Propagator, read_tle as read_tle_file
 
+    file = _resolve_tle_path(file)
     try:
         tles = read_tle_file(file)
     except FileNotFoundError:
@@ -256,6 +304,7 @@ def revnum_cmd(
         print(f"Error: {e}", file=sys.stderr)
         raise typer.Exit(code=2)
 
+    file = _resolve_tle_path(file)
     try:
         f = open(file)
     except FileNotFoundError:
@@ -390,6 +439,417 @@ def _revnum_match(
 
 
 # ---------------------------------------------------------------------------
+# plot
+# ---------------------------------------------------------------------------
+
+
+@app.command("plot")
+def plot_cmd(
+    file: Annotated[
+        Optional[pathlib.Path],
+        typer.Argument(help="TLE file path, single object (default: stdin)"),
+    ] = None,
+    output: Annotated[
+        Optional[pathlib.Path],
+        typer.Option(
+            "-o",
+            "--output",
+            help="Save figure to file (format from extension: png/pdf/svg). "
+            "Without -o, opens an interactive window.",
+        ),
+    ] = None,
+    fields: Annotated[
+        Optional[str],
+        typer.Option(
+            "--fields",
+            help="Comma-separated panels: sma, mm, ecc, inc, raan, aop, "
+            "bstar, peri, apo, revnum, lon, ltan",
+        ),
+    ] = None,
+    preset: Annotated[
+        Optional[PlotPreset],
+        typer.Option(
+            "--preset",
+            help="Panel preset for an orbit regime: leo (decay), geo "
+            "(stationkeeping/longitude), sunsync (LTAN drift), heo "
+            "(frozen perigee). Mutually exclusive with --fields.",
+        ),
+    ] = None,
+    maneuvers: Annotated[
+        bool,
+        typer.Option(
+            "--maneuvers",
+            help="Mark discrete jumps in mean motion (likely maneuvers) "
+            "with vertical lines",
+        ),
+    ] = False,
+    threshold: Annotated[
+        float,
+        typer.Option(
+            "--threshold",
+            help="Maneuver detection sensitivity in robust sigmas of the "
+            "TLE-to-TLE mean motion deltas (lower = more sensitive)",
+        ),
+    ] = 10.0,
+    title: Annotated[
+        Optional[str],
+        typer.Option("--title", help="Figure title (default: satnum and intl)"),
+    ] = None,
+) -> None:
+    """Plot TLE-derived orbital elements over time as stacked subplots.
+
+    Requires the plot extra: pip install 'thistle[plot]'. For files with
+    multiple objects, select one first: thistle filter --satnum NNN | thistle plot
+    """
+    try:
+        from thistle.cli._plot import DEFAULT_FIELDS, FIELDS, PRESETS
+    except ImportError:
+        _plot_import_error()
+
+    if preset is not None and fields is not None:
+        print(
+            "Error: --preset and --fields are mutually exclusive",
+            file=sys.stderr,
+        )
+        raise typer.Exit(code=2)
+
+    if preset is not None:
+        field_list = PRESETS[preset.value]
+    elif fields is not None:
+        field_list = [f.strip() for f in fields.split(",") if f.strip()]
+        unknown = [f for f in field_list if f not in FIELDS]
+        if unknown or not field_list:
+            print(
+                f"Error: unknown field(s): {', '.join(unknown) or '(none given)'} "
+                f"(valid: {', '.join(FIELDS)})",
+                file=sys.stderr,
+            )
+            raise typer.Exit(code=2)
+    else:
+        field_list = DEFAULT_FIELDS
+
+    sats = _load_single_object(file, "plot")
+
+    try:
+        if output is not None:
+            import matplotlib
+
+            matplotlib.use("Agg")
+
+        from thistle.cli._plot import make_figure
+
+        events: list[datetime] = []
+        if maneuvers:
+            events = maneuver_epochs(sats, threshold)
+            print(
+                f"Detected {len(events)} maneuver event(s)",
+                file=sys.stderr,
+            )
+            if len(events) > 100:
+                print(
+                    "Hint: markers may be dense; raise --threshold or narrow "
+                    "the time range (thistle filter --after/--before | thistle plot)",
+                    file=sys.stderr,
+                )
+
+        fig = make_figure(sats, field_list, events, title)
+
+        if output is not None:
+            fig.savefig(output)
+        else:
+            import matplotlib.pyplot as plt
+
+            plt.show()
+    except ImportError:
+        _plot_import_error()
+
+
+def _plot_import_error() -> NoReturn:
+    print(
+        "thistle plot requires additional packages.\n"
+        "Install with: pip install 'thistle[plot]'",
+        file=sys.stderr,
+    )
+    raise typer.Exit(code=1)
+
+
+def _load_single_object(
+    file: Optional[pathlib.Path], name: str
+) -> list[Satrec]:
+    """Load an epoch-sorted single-object TLE list from a file or stdin.
+
+    Exits with code 2 on missing file, no TLEs, or multiple objects.
+    """
+    if file is not None:
+        file = _resolve_tle_path(file)
+        try:
+            source = open(file)
+        except FileNotFoundError:
+            print(f"Error: TLE file not found: {file}", file=sys.stderr)
+            raise typer.Exit(code=2)
+        with source:
+            parsed = parse_tle_epochs(source)
+    else:
+        warn_if_tty(sys.stdin, name)
+        parsed = parse_tle_epochs(sys.stdin)
+
+    if not parsed:
+        print("Error: no TLEs found", file=sys.stderr)
+        raise typer.Exit(code=2)
+
+    satnums = {sat.satnum for _, _, sat in parsed}
+    if len(satnums) > 1:
+        print(
+            f"Error: file contains {len(satnums)} objects; "
+            "use 'thistle filter --satnum NNN' to select one object",
+            file=sys.stderr,
+        )
+        raise typer.Exit(code=2)
+
+    return sorted(
+        (sat for _, _, sat in parsed),
+        key=lambda s: epoch_to_datetime(s.epochyr, s.epochdays),
+    )
+
+
+# ---------------------------------------------------------------------------
+# groundtrack
+# ---------------------------------------------------------------------------
+
+
+@app.command("groundtrack")
+def groundtrack_cmd(
+    tle: Annotated[
+        Optional[pathlib.Path],
+        typer.Argument(
+            help="Default TLE file or catalog ID (spec lines may override "
+            "with sat=...)"
+        ),
+    ] = None,
+    spec: Annotated[
+        Optional[pathlib.Path],
+        typer.Option("--spec", help="Trace spec file (default: stdin)"),
+    ] = None,
+    output: Annotated[
+        Optional[pathlib.Path],
+        typer.Option(
+            "-o",
+            "--output",
+            help="Save figure to file (format from extension). "
+            "Without -o, opens an interactive window.",
+        ),
+    ] = None,
+    step: Annotated[
+        float,
+        typer.Option("--step", help="Trace sampling step in seconds"),
+    ] = 60.0,
+    site: Annotated[
+        Optional[list[str]],
+        typer.Option("--site", help="Ground site: NAME:LAT:LON[:ALT] (repeatable)"),
+    ] = None,
+    min_el: Annotated[
+        float,
+        typer.Option("--min-el", help="Visibility ring elevation angle (deg)"),
+    ] = 0.0,
+    sat_alt: Annotated[
+        Optional[float],
+        typer.Option(
+            "--sat-alt",
+            help="Visibility ring satellite altitude in meters "
+            "(default: mean altitude of plotted traces)",
+        ),
+    ] = None,
+    title: Annotated[
+        Optional[str],
+        typer.Option("--title", help="Figure title"),
+    ] = None,
+) -> None:
+    """Plot ground traces on a world map from spec lines.
+
+    Each spec line is 'START STOP [key=val ...]' (ISO 8601 times). Options:
+    color, style, width, alpha, marker, label, and sat=<id-or-path> to plot
+    a different object on that line. '#' comments and blank lines are
+    skipped. Ground sites get a marker and, when a satellite altitude is
+    known, a dashed visibility-horizon ring. Requires the plot extra.
+    """
+    from thistle.cli._map import parse_spec_line
+
+    sites_dict: dict[str, tuple] = {}
+    if site:
+        for s in site:
+            try:
+                name, coords = parse_site(s)
+                sites_dict[name] = coords
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                raise typer.Exit(code=2)
+
+    if spec is not None:
+        try:
+            f = open(spec)
+        except FileNotFoundError:
+            print(f"Error: spec file not found: {spec}", file=sys.stderr)
+            raise typer.Exit(code=2)
+        with f:
+            spec_lines = f.readlines()
+    else:
+        warn_if_tty(sys.stdin, "groundtrack")
+        spec_lines = sys.stdin.readlines()
+
+    specs = [s for s in map(parse_spec_line, spec_lines) if s is not None]
+
+    from thistle import Propagator, read_tle as read_tle_file
+
+    propagators: dict[pathlib.Path, "Propagator"] = {}
+
+    def get_propagator(source: pathlib.Path) -> Optional["Propagator"]:
+        try:
+            resolved = _resolve_tle_path(source)
+        except typer.Exit:
+            # resolver already printed the paths it tried; skip this line
+            return None
+        if resolved not in propagators:
+            try:
+                tles = read_tle_file(resolved)
+            except FileNotFoundError:
+                print(f"Warning: TLE file not found: {resolved}", file=sys.stderr)
+                return None
+            if not tles:
+                print(f"Warning: no TLEs found in {resolved}", file=sys.stderr)
+                return None
+            propagators[resolved] = Propagator(tles, method="midpoint")
+        return propagators[resolved]
+
+    from thistle.cli._map import trace_lla
+
+    traces: list[tuple[np.ndarray, np.ndarray, dict]] = []
+    all_alts: list[np.ndarray] = []
+    for sp in specs:
+        if sp.sat is not None:
+            source = pathlib.Path(sp.sat)
+        elif tle is not None:
+            source = tle
+        else:
+            print(
+                f"Warning: skipping spec line (no sat= and no TLE argument): "
+                f"{sp.start.isoformat()}",
+                file=sys.stderr,
+            )
+            continue
+        propagator = get_propagator(source)
+        if propagator is None:
+            continue
+        lons, lats, alts = trace_lla(propagator, sp.start, sp.stop, step)
+        traces.append((lons, lats, sp.plot_kwargs))
+        all_alts.append(alts)
+
+    if not traces:
+        print("Error: no valid traces to plot", file=sys.stderr)
+        raise typer.Exit(code=2)
+
+    ring_alt = sat_alt
+    if ring_alt is None and all_alts:
+        ring_alt = float(np.mean(np.concatenate(all_alts)))
+
+    try:
+        if output is not None:
+            import matplotlib
+
+            matplotlib.use("Agg")
+
+        from thistle.cli._map import make_map
+
+        fig = make_map(traces, sites_dict, ring_alt, min_el, title)
+
+        if output is not None:
+            fig.savefig(output)
+        else:
+            import matplotlib.pyplot as plt
+
+            plt.show()
+    except ImportError:
+        _plot_import_error()
+
+
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+
+
+@app.command("config")
+def config_cmd(
+    json_out: Annotated[
+        bool,
+        typer.Option("--json", help="Output as JSON"),
+    ] = False,
+) -> None:
+    """Show the effective CLI configuration and where each setting came from."""
+    import os
+
+    cfg = load_config()
+    dir_source = TLE_DIR_ENV if os.environ.get(TLE_DIR_ENV) else None
+    ext_source = TLE_EXT_ENV if os.environ.get(TLE_EXT_ENV) else None
+
+    if json_out:
+        print(
+            json.dumps(
+                {
+                    "tle_dir": str(cfg.tle_dir) if cfg.tle_dir else None,
+                    "tle_dir_source": dir_source,
+                    "tle_ext": cfg.tle_ext,
+                    "tle_ext_source": ext_source or "default",
+                },
+                indent=2,
+            )
+        )
+    else:
+        if cfg.tle_dir is not None:
+            print(f"tle_dir: {cfg.tle_dir}  (from {dir_source})")
+        else:
+            print(f"tle_dir: (not set)  (set {TLE_DIR_ENV} to enable ID lookup)")
+        print(f"tle_ext: {cfg.tle_ext}  (from {ext_source or 'default'})")
+
+    if cfg.tle_dir is not None and not cfg.tle_dir.is_dir():
+        print(
+            f"Warning: {TLE_DIR_ENV} points to a non-existent directory: "
+            f"{cfg.tle_dir}",
+            file=sys.stderr,
+        )
+
+
+# ---------------------------------------------------------------------------
+# maneuvers
+# ---------------------------------------------------------------------------
+
+
+@app.command("maneuvers")
+def maneuvers_cmd(
+    file: Annotated[
+        Optional[pathlib.Path],
+        typer.Argument(help="TLE file path, single object (default: stdin)"),
+    ] = None,
+    threshold: Annotated[
+        float,
+        typer.Option(
+            "--threshold",
+            help="Detection sensitivity in robust sigmas of the TLE-to-TLE "
+            "mean motion deltas (lower = more sensitive)",
+        ),
+    ] = 10.0,
+) -> None:
+    """Print detected maneuver epochs, one ISO 8601 timestamp per line.
+
+    Detects impulsive jumps in mean motion between consecutive TLEs (same
+    detector as 'thistle plot --maneuvers'). Continuous low-thrust (e.g.
+    electric orbit raising) appears as a smooth trend and is largely
+    invisible to it. No output means no maneuvers detected.
+    """
+    sats = _load_single_object(file, "maneuvers")
+    for event in maneuver_epochs(sats, threshold):
+        print(event.isoformat())
+
+
+# ---------------------------------------------------------------------------
 # summary
 # ---------------------------------------------------------------------------
 
@@ -407,6 +867,7 @@ def summary(
     ] = 2.0,
 ) -> None:
     """Summarize TLE data quality for a single object."""
+    file = _resolve_tle_path(file)
     try:
         f = open(file)
     except FileNotFoundError:
@@ -477,128 +938,6 @@ def summary(
         print(f"Span:       {result['span_days']} days")
         if count >= 2:
             print(f"Avg/day:    {result['avg_per_day']}")
-            iv = result["interval"]
-            print()
-            print("Epoch interval (days):")
-            print(f"  min:    {iv['min']}")
-            print(f"  max:    {iv['max']}")
-            print(f"  mean:   {iv['mean']}")
-            print(f"  median: {iv['median']}")
-            if result["gaps"]:
-                print()
-                print(f"Gaps (>{result['gap_threshold_days']} days): {len(result['gaps'])}")
-                for g in result["gaps"]:
-                    print(f"  {g['from'][:10]} to {g['to'][:10]}  ({g['days']} days)")
-            else:
-                print()
-                print("No gaps detected.")
-
-
-# ---------------------------------------------------------------------------
-# catalog
-# ---------------------------------------------------------------------------
-
-
-@app.command()
-def catalog(
-    path: Annotated[pathlib.Path, typer.Argument(help="Directory path")],
-    json_out: Annotated[
-        bool,
-        typer.Option("--json", help="Output as JSON"),
-    ] = False,
-    pattern: Annotated[
-        str,
-        typer.Option("--pattern", help="Glob patterns for TLE files, comma-separated"),
-    ] = "*.tle,*.txt,*.tce",
-    gap: Annotated[
-        float,
-        typer.Option("--gap", help="Gap threshold in days"),
-    ] = 2.0,
-) -> None:
-    """Summarize TLE data across a directory of files."""
-    if not path.is_dir():
-        print(f"Error: not a directory: {path}", file=sys.stderr)
-        raise typer.Exit(code=2)
-
-    from thistle import read_tle as read_tle_file
-
-    patterns = [p.strip() for p in pattern.split(",")]
-    files: list[pathlib.Path] = []
-    for pat in patterns:
-        files.extend(path.rglob(pat))
-    files = sorted(set(files))
-
-    if not files:
-        print(f"Error: no files matching {pattern} in {path}", file=sys.stderr)
-        raise typer.Exit(code=2)
-
-    all_satrecs: list[Satrec] = []
-    for fp in files:
-        tles = read_tle_file(fp)
-        for line1, line2 in tles:
-            try:
-                all_satrecs.append(Satrec.twoline2rv(line1, line2))
-            except Exception:
-                pass
-
-    if not all_satrecs:
-        print(f"Error: no valid TLEs found in {path}", file=sys.stderr)
-        raise typer.Exit(code=2)
-
-    epochs = sorted(epoch_to_datetime(s.epochyr, s.epochdays) for s in all_satrecs)
-    satnums = {str(s.satnum) for s in all_satrecs}
-    first = epochs[0]
-    last = epochs[-1]
-    span_days = round((last - first).total_seconds() / 86400.0, 2)
-    count = len(epochs)
-
-    result: dict = {
-        "directory": str(path),
-        "files": len(files),
-        "objects": len(satnums),
-        "tle_count": count,
-        "first_epoch": first.strftime("%Y-%m-%dT%H:%M:%S"),
-        "last_epoch": last.strftime("%Y-%m-%dT%H:%M:%S"),
-        "span_days": span_days,
-    }
-
-    if count >= 2:
-        intervals = [
-            (epochs[i + 1] - epochs[i]).total_seconds() / 86400.0
-            for i in range(count - 1)
-        ]
-        arr = np.array(intervals)
-
-        gaps = []
-        for i, iv in enumerate(intervals):
-            if iv > gap:
-                gaps.append({
-                    "from": epochs[i].strftime("%Y-%m-%dT%H:%M:%S"),
-                    "to": epochs[i + 1].strftime("%Y-%m-%dT%H:%M:%S"),
-                    "days": round(iv, 2),
-                })
-        gaps.sort(key=lambda g: g["from"], reverse=True)
-
-        result["interval"] = {
-            "min": round(float(arr.min()), 2),
-            "max": round(float(arr.max()), 2),
-            "mean": round(float(arr.mean()), 2),
-            "median": round(float(np.median(arr)), 2),
-        }
-        result["gap_threshold_days"] = gap
-        result["gaps"] = gaps
-
-    if json_out:
-        print(json.dumps(result, indent=2))
-    else:
-        print(f"Directory:  {path}")
-        print(f"Files:      {len(files)}")
-        print(f"Objects:    {len(satnums)}")
-        print(f"TLE count:  {count}")
-        print(f"First TLE:  {result['first_epoch']}")
-        print(f"Last TLE:   {result['last_epoch']}")
-        print(f"Span:       {span_days} days")
-        if count >= 2:
             iv = result["interval"]
             print()
             print("Epoch interval (days):")
@@ -733,6 +1072,7 @@ def filter_(
         return True
 
     if file is not None:
+        file = _resolve_tle_path(file)
         try:
             source = open(file)
         except FileNotFoundError:
@@ -839,6 +1179,7 @@ def propagate(
 
     from thistle import Propagator, generate, read_tle as read_tle_file
 
+    file = _resolve_tle_path(file)
     try:
         tles = read_tle_file(file)
     except FileNotFoundError:

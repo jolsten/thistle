@@ -7,6 +7,7 @@ import sys
 from datetime import datetime, timedelta
 from typing import TextIO
 
+import numpy as np
 from sgp4.api import Satrec
 
 MU = 398600.4418  # Earth gravitational parameter (km^3/s^2)
@@ -187,6 +188,64 @@ def rev_bounds(sat: Satrec, revnum: int) -> tuple[datetime, datetime]:
 
     drev_start = (revnum - sat.revnum) - _rev_phase(sat)
     return invert(drev_start), invert(drev_start + 1.0)
+
+
+_MIN_TLES_FOR_DETECTION = 8
+
+
+def detect_maneuvers(
+    times: list[datetime], values: list[float], threshold: float
+) -> list[datetime]:
+    """Epochs immediately after discrete jumps in a per-TLE series.
+
+    A jump is a consecutive delta exceeding ``threshold`` robust sigmas
+    (1.4826 x MAD of the signed deltas, which ignores the jumps themselves).
+    Flagged deltas closer together than max(2 days, 5x the median TLE
+    cadence) are merged into one event at the largest delta, since a single
+    burn perturbs several successive TLE fits. Detection is skipped for
+    short or constant series where the scale is meaningless.
+
+    Note this detects impulsive changes only: continuous low-thrust (e.g.
+    electric orbit raising) appears as a smooth trend with mutually
+    consistent deltas and is largely invisible to a jump detector.
+    """
+    if len(values) < _MIN_TLES_FOR_DETECTION:
+        return []
+    deltas = np.diff(np.asarray(values, dtype=float))
+    sigma = 1.4826 * float(np.median(np.abs(deltas - np.median(deltas))))
+    if sigma < 1e-12:
+        return []
+    flagged = np.nonzero(np.abs(deltas) > threshold * sigma)[0]
+    if len(flagged) == 0:
+        return []
+
+    spacings = [
+        (times[i + 1] - times[i]).total_seconds() for i in range(len(times) - 1)
+    ]
+    merge_gap = max(2.0 * 86400.0, 5.0 * float(np.median(spacings)))
+
+    events: list[datetime] = []
+    cluster = [flagged[0]]
+    for i in flagged[1:]:
+        if (times[i + 1] - times[cluster[-1] + 1]).total_seconds() <= merge_gap:
+            cluster.append(i)
+        else:
+            best = max(cluster, key=lambda j: abs(deltas[j]))
+            events.append(times[best + 1])
+            cluster = [i]
+    best = max(cluster, key=lambda j: abs(deltas[j]))
+    events.append(times[best + 1])
+    return events
+
+
+def maneuver_epochs(sats: list[Satrec], threshold: float) -> list[datetime]:
+    """Detected maneuver epochs for an epoch-sorted single-object TLE list.
+
+    Runs :func:`detect_maneuvers` on the mean-motion series.
+    """
+    times = [epoch_to_datetime(s.epochyr, s.epochdays) for s in sats]
+    mm_series = [s.no_kozai * 1440.0 / (2.0 * math.pi) for s in sats]
+    return detect_maneuvers(times, mm_series, threshold)
 
 
 def parse_site(
