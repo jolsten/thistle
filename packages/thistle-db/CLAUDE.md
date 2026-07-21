@@ -1,0 +1,148 @@
+# CLAUDE.md
+
+This file is the **target design spec** for thistle-db. Where the code and this
+document disagree, this document wins — update the code to match, not the other
+way around. Sections marked **[NOT YET IMPLEMENTED]** are known gaps.
+
+## What thistle-db is
+
+thistle-db is a database manager for orbital element sets. It ingests TLE
+(Two-Line Element) and OMM (Orbit Mean-Elements Message) files from configured
+directories into a SQL database with uniqueness guarantees, and generates
+organized output files (by date and by satellite) from that database.
+
+## Core workflow
+
+1. TLE/OMM files are delivered into directories defined in `config.toml`
+   (`[[ingest.sources]]` entries: a `path` plus a glob `pattern`).
+2. `thistle-db ingest` scans those directories, auto-detects each file's format,
+   parses the element sets, and inserts them into the database. Duplicates are
+   silently skipped — ingest is **idempotent**: running it twice over the same
+   files must never create duplicate rows or fail.
+3. `thistle-db generate` writes output files from the database.
+
+### File formats
+
+Format is auto-detected per file (`reader.detect_format`):
+
+| Format | Extensions | Reader |
+|---|---|---|
+| TLE (2-line or 3-line) | `.tle`, `.txt`, `.3le` | `read_tle` |
+| OMM JSON (Space-Track) | `.json` | `read_omm_json` |
+| OMM CSV | `.csv` | `read_omm_csv` |
+| OMM XML | `.xml` | `read_omm_xml` |
+
+### Delivery patterns to handle
+
+- **New file per delivery** (e.g. daily `YYYYMMDD.txt`): straightforward scan-and-ingest.
+- **In-place updates**: a provider may append to or rewrite an existing file
+  rather than delivering a delta. This must be handled elegantly:
+  - Correctness comes from DB-level dedup — re-reading a whole updated file and
+    inserting only the new element sets is always safe.
+  - Efficiency comes from **file-state tracking**: each successfully ingested
+    file's path, size, mtime, and content hash is recorded in the
+    `ingest_files` table (`IngestFile` model). On scan
+    (`ingest.ingest_source_file`), unchanged files (size + mtime match) are
+    skipped without being opened; a changed file whose content hash still
+    matches just refreshes its state; otherwise the file is re-ingested (dedup
+    absorbs the already-seen records). A file that fails to parse gets no
+    state recorded, so it is retried next scan. `--force` bypasses skipping.
+
+## Data model (`model.py`)
+
+Single canonical element-set table plus an OMM metadata sidecar. Do **not**
+split OMM into a fully separate element-set table.
+
+- **`tle`** — one row per unique element set. Stores the raw `line1`/`line2`
+  text plus parsed fields (norad_cat_id, epoch, Keplerian elements, drag terms)
+  and derived values (semimajor axis, period, apoapsis/periapsis altitude).
+  Parsing goes through `sgp4.Satrec`.
+- **`omm_metadata`** — OMM-only fields (object name/type, country code, RCS
+  size, launch/decay date, site, originator, GP_ID), one-to-one with a `tle`
+  row via `tle_id`.
+- **`ingest_files`** — per-file ingest state (path, size, mtime_ns, sha256)
+  used to skip unchanged source files on scan; keyed by a sha256 of the
+  resolved path (bounded length for cross-dialect unique indexes).
+
+### Uniqueness
+
+The dedup key is **exact text of `(line1, line2)`** (a `UniqueConstraint`).
+This is deliberate: it is lossless and simple; textual near-duplicates from
+different providers coexist as separate rows. Do not change the key to
+`(norad_cat_id, epoch)` or similar without an explicit decision.
+
+If a TLE is delivered first and the OMM version of the same element set arrives
+later (with identical lines), the TLE row is **not** duplicated — the OMM
+delivery attaches an `omm_metadata` row to the existing `tle` row. Both
+representations are thereby preserved: the TLE lines in `tle`, the OMM extras
+in `omm_metadata`.
+
+Dedup is enforced at the database with dialect-aware upserts
+(`ingest._bulk_insert_tles`): `ON CONFLICT DO NOTHING` for SQLite/PostgreSQL,
+`INSERT IGNORE` for MySQL/MariaDB. Inserts are chunked (`CHUNK_SIZE = 5000`).
+Any new bulk-write path must follow this pattern and work on all three dialects.
+
+## Configuration (`config.py`)
+
+- `config.toml` (path via `-c`, default `./config.toml`), parsed into
+  pydantic-settings models: `[database]`, `[[ingest.sources]]`, `[output]`,
+  `[logging]`.
+- Database credentials are **never** stored in `config.toml`. Resolution order
+  (highest priority first):
+  1. Env vars `THISTLE_DB_DATABASE__USERNAME` / `THISTLE_DB_DATABASE__PASSWORD`
+  2. User secrets file `~/.config/thistle-db.toml`
+  3. System secrets file (`database.secrets_file` in config)
+- Supported databases: SQLite (default/dev), MariaDB/MySQL (operational,
+  `thistle-db[mysql]` extra), PostgreSQL (tested in CI).
+
+## CLI (`cli.py`)
+
+`thistle-db [-c CONFIG] <command>` — the config path defaults to the
+`THISTLE_DB_CONFIG` env var when set (shared with thistle's db fallback),
+else `./config.toml`:
+
+- `init` — scaffold `config.toml` and `~/.config/thistle-db.toml`.
+- `ingest [FILES...] [--force]` — ingest specific files (always parsed, even
+  if recorded as unchanged), or scan all configured sources when no files are
+  given; `--force` re-ingests scanned files regardless of recorded state.
+- `get-tle TARGET [--days N]` — print TLEs to stdout. `TARGET` is either an
+  8-digit date `YYYYMMDD` (→ the nearest TLE per object to 12:00 UTC on that
+  date, within ±N days, default 7) or an alpha-5-compatible NORAD ID
+  (e.g. `25544`, `00022`, `E5693` → every TLE for that object, epoch order).
+  Exits 1 if nothing matches.
+- `generate` — write output files per `[output]` config:
+  - `date_files`: `YYYYMMDD.{tle,omm}` — latest element set per satellite for
+    that date.
+  - `object_files`: `NORAD_ID.{tle,omm}` — all element sets for a satellite,
+    ordered by epoch.
+  - Formats toggleable via `[output.formats]` (tle = two-line text, omm = CSV).
+
+## Module map
+
+| Module | Responsibility |
+|---|---|
+| `cli.py` | typer CLI, subcommand dispatch, logging setup |
+| `config.py` | pydantic-settings config + layered secrets resolution |
+| `model.py` | SQLAlchemy ORM models (`TLE`, `OmmMetadata`), TLE parsing via sgp4 |
+| `reader.py` | format detection + file readers (TLE, OMM JSON/CSV/XML) |
+| `ingest.py` | bulk insert with dedup, source-directory scanning |
+| `generator.py` | output file generation from the database |
+
+## Error handling philosophy
+
+Ingest is tolerant: a malformed TLE or OMM record is logged (loguru, WARNING)
+and skipped — one bad record must never abort a file, and one bad file must
+never abort a scan. A missing source directory is a warning, not an error.
+
+## Development
+
+- Python ≥ 3.11. Package manager: `uv`. Build: hatchling + hatch-vcs
+  (version comes from git tags — never hardcode it).
+- Run tests: `uv run pytest tests/thistle_db` from the workspace root. Lint:
+  `uv run ruff check`. Types: `uv run pyright`.
+- Tests cover SQLite by default; set `THISTLE_DB_TEST_MARIADB=1` /
+  `THISTLE_DB_TEST_POSTGRES=1` (requires Docker) to run the MariaDB and
+  PostgreSQL backends via testcontainers — CI runs all three. Dialect-specific
+  behavior (upserts) must be tested against all three.
+- Test fixtures live in `tests/thistle_db/data/` (real TLE text files and
+  Space-Track OMM JSON).

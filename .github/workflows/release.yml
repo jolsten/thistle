@@ -15,6 +15,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # hatch-vcs needs tag history for git describe
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -22,8 +24,20 @@ jobs:
       - name: Install Python 3.13
         run: uv python install 3.13
 
+      - name: Resolve package from tag
+        run: |
+          case "${{ github.event.release.tag_name }}" in
+            thistle-db-v*) echo "PKG=thistle-db" >> "$GITHUB_ENV" ;;
+            thistle-v*)    echo "PKG=thistle"    >> "$GITHUB_ENV" ;;
+            *)
+              echo "Unrecognized release tag: ${{ github.event.release.tag_name }}" >&2
+              echo "Expected thistle-vX.Y.Z or thistle-db-vX.Y.Z" >&2
+              exit 1
+              ;;
+          esac
+
       - name: Build
-        run: uv build
+        run: uv build --package "$PKG"
 
       - name: Publish
         run: uv publish

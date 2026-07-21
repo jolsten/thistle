@@ -1,0 +1,33 @@
+[database]
+# Operational: MariaDB. Testing: SQLite.
+# drivername = "mysql+pymysql"
+# host = "localhost"
+# port = 3306
+# name = "thistle-db"
+# Credentials resolved via (in priority order):
+#   1. Env vars: THISTLE_DB_DATABASE__USERNAME / THISTLE_DB_DATABASE__PASSWORD
+#   2. User secrets file: ~/.config/thistle-db.toml (username/password keys)
+#   3. System secrets file below
+# secrets_file = "/etc/thistle-db/secrets.toml"
+
+# SQLite (for testing/development)
+drivername = "sqlite"
+name = "tle.db"
+
+[[ingest.sources]]
+path = "/data/incoming"
+pattern = "*.tle"
+
+[output]
+dir = "./output"
+
+[output.formats]
+tle = true
+omm = true
+
+[output.types]
+date_files = true
+object_files = true
+
+[logging]
+level = "INFO"
