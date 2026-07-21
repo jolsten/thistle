@@ -27,8 +27,13 @@ ISS_TLE = """\
 @pytest.fixture(autouse=True)
 def _clean_thistle_env(monkeypatch):
     """Keep the developer's real THISTLE_* environment out of the suite."""
+    import os
+
     monkeypatch.delenv("THISTLE_TLE_DIR", raising=False)
     monkeypatch.delenv("THISTLE_TLE_EXT", raising=False)
+    monkeypatch.delenv("THISTLE_DB_CONFIG", raising=False)
+    for key in [k for k in os.environ if k.startswith("THISTLE_DB_DATABASE__")]:
+        monkeypatch.delenv(key, raising=False)
 
 
 @pytest.fixture
@@ -168,7 +173,7 @@ def test_find_tle_unique(runner, tle_file):
 
 # ---- revnum ---------------------------------------------------------------
 
-# Vanguard 1, epoch 2025-01-31, revnum 47569 (from tests/data/leo.tle)
+# Vanguard 1, epoch 2025-01-31, revnum 47569 (from tests/thistle/data/leo.tle)
 VANGUARD_TLE = """\
 1 00011U 59001A   25031.53522517  .00001638  00000-0  87319-3 0  9997
 2 00011  32.8626 182.3246 1451254  84.1345 292.2261 11.89131272475694
@@ -406,7 +411,7 @@ def test_plot_empty_file(runner, tmp_path):
 # ---- plot presets and derived fields --------------------------------------
 
 # Two consecutive stationkept TLEs of a GEO object at ~145 deg E
-# (from tests/data/obj/50001.txt)
+# (from tests/thistle/data/obj/50001.txt)
 GEO_TLE = """\
 1 50001U 21123A   25059.54220164 -.00000245  00000-0  00000-0 0  9992
 2 50001   0.0208 235.3877 0000111  15.3569 248.0225  1.00271703 11797
@@ -486,7 +491,7 @@ def test_ltan_series_at_equinox():
 
 # ---- maneuvers ------------------------------------------------------------
 
-GEO_HISTORY = "tests/data/obj/50001.txt"
+GEO_HISTORY = "tests/thistle/data/obj/50001.txt"
 
 
 def test_maneuvers_real_data(runner):
@@ -791,6 +796,32 @@ def test_resolve_alpha5(runner, tmp_path, monkeypatch):
     assert runner.invoke(app, ["summary", "A0001"]).exit_code == 0
     # lowercase input resolves via the uppercase retry
     assert runner.invoke(app, ["summary", "a0001"]).exit_code == 0
+
+
+def test_resolve_normalized_names(runner, tmp_path, monkeypatch):
+    """A typed ID finds files named by any convention: plain int,
+    zero-padded, or Alpha-5."""
+    d = tmp_path / "tledir"
+    d.mkdir()
+    monkeypatch.setenv("THISTLE_TLE_DIR", str(d))
+
+    # File named with the plain integer, ID typed zero-padded
+    (d / "22.tle").write_text(ISS_TLE)
+    assert runner.invoke(app, ["summary", "00022"]).exit_code == 0
+
+    # File named zero-padded, ID typed plain
+    (d / "22.tle").unlink()
+    (d / "00022.tle").write_text(ISS_TLE)
+    assert runner.invoke(app, ["summary", "22"]).exit_code == 0
+
+    # File named Alpha-5, ID typed as the decoded integer
+    (d / "E5693.tle").write_text(ISS_TLE)
+    assert runner.invoke(app, ["summary", "145693"]).exit_code == 0
+
+    # File named with the integer, ID typed Alpha-5 (lowercase)
+    (d / "E5693.tle").unlink()
+    (d / "145693.tle").write_text(ISS_TLE)
+    assert runner.invoke(app, ["summary", "e5693"]).exit_code == 0
 
 
 def test_resolve_alpha5_excluded_letters(runner, tmp_path, monkeypatch):

@@ -25,7 +25,7 @@ ts = load.timescale()
 @pytest.fixture(scope="module")
 def iss_satellite():
     """Get ISS satellite for testing."""
-    _tles = read_tle("tests/data/25544.tle")
+    _tles = read_tle("tests/thistle/data/25544.tle")
     return EarthSatellite(_tles[0][0], _tles[0][1], ts=ts)
 
 

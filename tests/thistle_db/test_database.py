@@ -4,7 +4,7 @@ import pytest
 from sqlalchemy import exc
 from sqlalchemy.orm import Session
 
-from tests.conftest import TLE_FILES, TLES
+from .conftest import TLE_FILES, TLES
 from thistle_db.model import TLE
 from thistle_db.reader import TLETuple, read_tle, unique
 

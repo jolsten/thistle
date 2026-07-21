@@ -110,7 +110,7 @@ class TestVisibilityCircle:
 # ---------- shared test fixtures ----------
 
 ts = load.timescale()
-_tles = read_tle("tests/data/25544.tle")
+_tles = read_tle("tests/thistle/data/25544.tle")
 SAT = EarthSatellite(_tles[0][0], _tles[0][1], ts=ts)
 
 T0 = np.datetime64("1998-11-20T06:50:00")

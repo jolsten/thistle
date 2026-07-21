@@ -441,7 +441,7 @@ class TestPropagatorTCA(PropagatorBaseClass):
 
 class TestSegmentTimes:
     def setup_class(self):
-        tles = read_tle("tests/data/25544.tle")
+        tles = read_tle("tests/thistle/data/25544.tle")
         self.propagator = Propagator(tles, method="epoch")
         # Time range spanning multiple TLEs
         self.times = trange(

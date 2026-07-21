@@ -5,7 +5,7 @@ import pytest
 
 from thistle.orbit_data import generate_sunlight
 
-from .conftest import get_iss_satellite, load_eclipse_times, load_truth_csv
+from .conftest import get_iss_satellite, load_eclipse_times
 
 
 @pytest.fixture(scope="module")

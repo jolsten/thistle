@@ -47,13 +47,58 @@ def is_catalog_id(name: str) -> bool:
     return _CATALOG_ID_RE.match(name) is not None
 
 
-def candidate_names(name: str) -> list[str]:
-    """Filenames (sans extension) to try for a catalog ID.
+def to_satnum(name: str) -> Optional[int]:
+    """Convert a catalog ID (digits or Alpha-5) to its integer satnum."""
+    if name.isdigit():
+        return int(name)
+    try:
+        from sgp4.alpha5 import from_alpha5
 
-    Alpha-5 is defined uppercase, so a lowercase-typed ID also tries the
-    uppercased form (matters on case-sensitive filesystems).
+        return from_alpha5(name.upper())
+    except ValueError:
+        return None
+
+
+def candidate_names(name: str) -> list[str]:
+    """Filenames (sans extension) to try for a catalog ID, in order.
+
+    Tries the ID as typed (plus uppercased — Alpha-5 is defined uppercase,
+    which matters on case-sensitive filesystems), then the canonical integer
+    form (leading zeros stripped, Alpha-5 decoded) and the canonical
+    5-character catalog form (zero-padded below 100000, Alpha-5 above). This
+    finds the file whatever naming convention the directory uses, however
+    the ID was typed.
     """
     names = [name]
     if name.upper() != name:
         names.append(name.upper())
-    return names
+    satnum = to_satnum(name)
+    if satnum is not None:
+        names.append(str(satnum))
+        try:
+            from sgp4.alpha5 import to_alpha5
+
+            names.append(to_alpha5(satnum))
+        except ValueError:
+            pass  # satnum too large for the Alpha-5 range
+    return list(dict.fromkeys(names))
+
+
+def find_candidate_file(
+    name: str, cfg: CliConfig
+) -> "tuple[Optional[pathlib.Path], list[str]]":
+    """Look up a catalog ID in the configured TLE directory.
+
+    Returns ``(path, tried)``: the first existing candidate file (or None),
+    and every path tried without success. Both are empty-handed when no
+    ``tle_dir`` is configured.
+    """
+    tried: list[str] = []
+    if cfg.tle_dir is None:
+        return None, tried
+    for cand in candidate_names(name):
+        candidate = cfg.tle_dir / f"{cand}{cfg.tle_ext}"
+        if candidate.exists():
+            return candidate, tried
+        tried.append(str(candidate))
+    return None, tried

@@ -2,7 +2,7 @@ import pathlib
 
 import pytest
 
-from tests.conftest import TLE_FILES
+from .conftest import TLE_FILES
 from thistle_db.model import TLE
 from thistle_db.reader import read_tle
 

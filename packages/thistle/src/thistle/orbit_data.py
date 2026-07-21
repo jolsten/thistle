@@ -20,13 +20,11 @@ from thistle._core import (
     GenerateResult,
     R_EARTH_KM,
     R_SUN_KM,
-    Site,
     Sites,
     eph,
     extract_range,
     normalize_site,
     propagate_sat,
-    ts,
 )
 
 from typing import TYPE_CHECKING

@@ -23,11 +23,12 @@ from thistle.propagator import (
     SwitchingStrategy,
     TCASwitchStrategy,
 )
-from thistle.utils import read_tle
+from thistle.utils import load_tle, read_tle
 
 __all__ = [
     "Propagator",
     "read_tle",
+    "load_tle",
     "SwitchingStrategy",
     "EpochSwitchStrategy",
     "MidpointSwitchStrategy",

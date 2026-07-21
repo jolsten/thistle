@@ -6,13 +6,11 @@ from typing import Annotated, Optional
 import typer
 from loguru import logger
 from sgp4.alpha5 import from_alpha5
-from sqlalchemy import select
-from sqlalchemy.orm import sessionmaker
 
+from thistle_db.api import nearest_tles_for_date, open_session, tles_for_object
 from thistle_db.config import load_config
 from thistle_db.generator import generate as generate_outputs
 from thistle_db.ingest import FileStatus, ingest_source_file, ingest_sources
-from thistle_db.model import TLE, Base
 
 app = typer.Typer(
     name="thistle-db",
@@ -24,13 +22,6 @@ app = typer.Typer(
 def _setup_logging(level: str) -> None:
     logger.remove()
     logger.add(sys.stderr, level=level.upper())
-
-
-def _get_session(config):
-    engine = config.database.engine
-    Base.metadata.create_all(engine)
-    Session = sessionmaker(bind=engine)
-    return Session(), engine
 
 
 CONFIG_TEMPLATE = """\
@@ -128,7 +119,8 @@ def main_callback(
         typer.Option(
             "-c",
             "--config",
-            help="Path to config.toml (default: ./config.toml)",
+            envvar="THISTLE_DB_CONFIG",
+            help="Path to config.toml (default: $THISTLE_DB_CONFIG or ./config.toml)",
         ),
     ] = Path("config.toml"),
 ) -> None:
@@ -187,7 +179,7 @@ def ingest(
     config = load_config(ctx.obj)
     _setup_logging(config.logging.level)
 
-    session, engine = _get_session(config)
+    session, engine = open_session(config)
     try:
         if files:
             total = 0
@@ -216,7 +208,7 @@ def generate(ctx: typer.Context) -> None:
     config = load_config(ctx.obj)
     _setup_logging(config.logging.level)
 
-    session, engine = _get_session(config)
+    session, engine = open_session(config)
     try:
         generate_outputs(session, config.output)
     finally:
@@ -239,33 +231,6 @@ def _parse_target(value: str) -> int | datetime.date:
         raise typer.BadParameter(
             f"{value!r} is neither an alpha-5 NORAD ID nor a YYYYMMDD date"
         ) from None
-
-
-def tles_for_object(session, satnum: int) -> list[TLE]:
-    """All TLEs for one satellite, ordered by epoch."""
-    stmt = select(TLE).where(TLE.norad_cat_id == satnum).order_by(TLE.epoch)
-    return list(session.execute(stmt).scalars().all())
-
-
-def nearest_tles_for_date(
-    session, date: datetime.date, days: float
-) -> list[TLE]:
-    """Nearest TLE per satellite to 12:00 UTC on `date`, within +/- `days`."""
-    center = datetime.datetime.combine(date, datetime.time(12))
-    window = datetime.timedelta(days=days)
-    stmt = select(TLE).where(
-        TLE.epoch >= center - window,
-        TLE.epoch <= center + window,
-    )
-
-    nearest: dict[int, TLE] = {}
-    for tle in session.execute(stmt).scalars():
-        if tle.norad_cat_id is None:
-            continue
-        best = nearest.get(tle.norad_cat_id)
-        if best is None or abs(tle.epoch - center) < abs(best.epoch - center):
-            nearest[tle.norad_cat_id] = tle
-    return [nearest[satnum] for satnum in sorted(nearest)]
 
 
 @app.command(name="get-tle")
@@ -298,7 +263,7 @@ def get_tle(
     config = load_config(ctx.obj)
     _setup_logging(config.logging.level)
 
-    session, engine = _get_session(config)
+    session, engine = open_session(config)
     try:
         if isinstance(parsed, int):
             tles = tles_for_object(session, parsed)

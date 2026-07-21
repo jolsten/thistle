@@ -24,6 +24,7 @@ from thistle.utils import (
     from_alpha5,
     group_by,
     jday_datetime64,
+    load_tle,
     read_tle,
     tle_date,
     tle_epoch,
@@ -410,3 +411,56 @@ class TestAlpha5:
         """Numbers < 100,000 are zero-padded to 5 digits."""
         assert to_alpha5(42) == "00042"
         assert len(to_alpha5(0)) == 5
+
+# ---------------------------------------------------------------------------
+# load_tle
+# ---------------------------------------------------------------------------
+
+
+ISS_TLE = (
+    "1 25544U 98067A   24001.50000000  .00016717  00000-0  10270-3 0  9005\n"
+    "2 25544  51.6400 208.9163 0006703  30.5502 329.5947 15.49560532  1001\n"
+)
+
+
+class TestLoadTLE:
+    """Tests for load_tle (CLI-style resolution in the library)."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        monkeypatch.delenv("THISTLE_TLE_DIR", raising=False)
+        monkeypatch.delenv("THISTLE_TLE_EXT", raising=False)
+        monkeypatch.delenv("THISTLE_DB_CONFIG", raising=False)
+        import os
+
+        for key in [k for k in os.environ if k.startswith("THISTLE_DB_DATABASE__")]:
+            monkeypatch.delenv(key, raising=False)
+
+    def test_existing_path_reads_directly(self, tmp_path):
+        f = tmp_path / "iss.tle"
+        f.write_text(ISS_TLE)
+        assert load_tle(f) == read_tle(f)
+
+    def test_catalog_id_via_tle_dir(self, tmp_path, monkeypatch):
+        (tmp_path / "25544.tle").write_text(ISS_TLE)
+        monkeypatch.setenv("THISTLE_TLE_DIR", str(tmp_path))
+        assert load_tle("25544") == read_tle(tmp_path / "25544.tle")
+
+    def test_catalog_id_normalized_name(self, tmp_path, monkeypatch):
+        """A zero-padded ID finds the plain-integer file name."""
+        (tmp_path / "25544.tle").write_text(ISS_TLE)
+        monkeypatch.setenv("THISTLE_TLE_DIR", str(tmp_path))
+        assert load_tle("0025544") == read_tle(tmp_path / "25544.tle")
+
+    def test_catalog_id_miss_raises(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("THISTLE_TLE_DIR", str(tmp_path))
+        with pytest.raises(FileNotFoundError, match="99999"):
+            load_tle("99999")
+
+    def test_unconfigured_catalog_id_raises(self):
+        with pytest.raises(FileNotFoundError):
+            load_tle("25544")
+
+    def test_missing_non_id_path_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            load_tle(tmp_path / "nope.tle")

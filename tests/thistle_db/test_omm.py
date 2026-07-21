@@ -5,7 +5,7 @@ import pytest
 from thistle_db.reader import detect_format, read_omm_json
 
 
-JSON_FILES = list(pathlib.Path("tests/data/").glob("*.json"))
+JSON_FILES = list(pathlib.Path("tests/thistle_db/data/").glob("*.json"))
 
 
 def test_detect_format_tle():
@@ -36,7 +36,7 @@ def test_read_omm_json(file: pathlib.Path):
 
 def test_read_omm_json_has_tle_lines():
     """Verify Space-Track JSON includes TLE_LINE1/TLE_LINE2."""
-    records = read_omm_json("tests/data/one.json")
+    records = read_omm_json("tests/thistle_db/data/one.json")
     assert len(records) >= 1
     record = records[0]
     assert "TLE_LINE1" in record

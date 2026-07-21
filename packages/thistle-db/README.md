@@ -154,7 +154,8 @@ Commands:
   get-tle    Print TLEs from the database to stdout
 
 Options:
-  -c, --config PATH   Path to config.toml (default: ./config.toml)
+  -c, --config PATH   Path to config.toml
+                      (default: $THISTLE_DB_CONFIG if set, else ./config.toml)
 ```
 
 ### `get-tle`
@@ -228,43 +229,24 @@ Exits with status 1 if no TLEs match.
 
 ### Running tests
 
-Tests are parametrized to run against SQLite, MariaDB, and PostgreSQL. SQLite runs unconditionally; MariaDB and PostgreSQL tests are skipped unless `THISTLE_DB_TEST_MARIADB_URL` / `THISTLE_DB_TEST_POSTGRES_URL` are set.
+Tests live at the workspace root under `tests/thistle_db/` and are
+parametrized to run against SQLite, MariaDB, and PostgreSQL. SQLite runs
+unconditionally; the MariaDB and PostgreSQL backends are opt-in and managed
+automatically by [testcontainers](https://testcontainers-python.readthedocs.io/)
+— one container per test session, one throwaway database per test. No manual
+`docker run` needed, just a running Docker daemon.
 
 SQLite only:
 
 ```bash
-uv run pytest tests/
+uv run pytest tests/thistle_db
 ```
 
-MariaDB (requires Docker):
+All backends (requires Docker):
 
 ```bash
-docker run -d --name thistle-db-mariadb \
-  -e MARIADB_ROOT_PASSWORD=rootpass \
-  -e MARIADB_DATABASE=thistle-db_test \
-  -e MARIADB_USER=thistle-db \
-  -e MARIADB_PASSWORD=thistle-db \
-  -p 3306:3306 \
-  mariadb:11
-
-export THISTLE_DB_TEST_MARIADB_URL="mysql+pymysql://thistle-db:thistle-db@127.0.0.1:3306/thistle-db_test"
-uv run pytest tests/
-
-docker rm -f thistle-db-mariadb
+THISTLE_DB_TEST_MARIADB=1 THISTLE_DB_TEST_POSTGRES=1 uv run pytest tests/thistle_db
 ```
 
-PostgreSQL (requires Docker):
-
-```bash
-docker run -d --name thistle-db-postgres \
-  -e POSTGRES_DB=thistle-db_test \
-  -e POSTGRES_USER=thistle-db \
-  -e POSTGRES_PASSWORD=thistle-db \
-  -p 5432:5432 \
-  postgres:16
-
-export THISTLE_DB_TEST_POSTGRES_URL="postgresql+psycopg://thistle-db:thistle-db@127.0.0.1:5432/thistle-db_test"
-uv run pytest tests/
-
-docker rm -f thistle-db-postgres
-```
+The images default to `mariadb:11` and `postgres:16`; override with
+`THISTLE_DB_MARIADB_IMAGE` / `THISTLE_DB_POSTGRES_IMAGE`.

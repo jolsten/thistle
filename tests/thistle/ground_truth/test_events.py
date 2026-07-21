@@ -15,7 +15,7 @@ from thistle.events import (
     find_sunlit_periods,
 )
 from thistle.ground_sites import visibility_circle
-from thistle.orbit_data import ts
+from thistle._core import ts
 from thistle.propagator import Propagator
 from thistle.utils import dt64_to_time
 

@@ -1,7 +1,5 @@
 """Ground truth tests for slant range against STK AER data."""
 
-import csv
-import pathlib
 
 import numpy as np
 import pytest

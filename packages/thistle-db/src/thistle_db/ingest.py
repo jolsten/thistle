@@ -43,7 +43,7 @@ def _bulk_insert_tles(session: Session, records: list[dict]) -> int:
                 index_elements=["line1", "line2"]
             )
             result = session.execute(stmt, chunk)
-            total_inserted += result.rowcount
+            total_inserted += result.rowcount  # type: ignore[attr-defined]
         elif dialect == "postgresql":
             from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -59,7 +59,7 @@ def _bulk_insert_tles(session: Session, records: list[dict]) -> int:
 
             stmt = insert(table).prefix_with("IGNORE")  # type: ignore[arg-type]
             result = session.execute(stmt, chunk)
-            total_inserted += result.rowcount
+            total_inserted += result.rowcount  # type: ignore[attr-defined]
         session.commit()
 
     return total_inserted

@@ -33,10 +33,11 @@ from thistle.cli._helpers import (
     warn_if_tty,
 )
 
+from thistle.cli import _db
 from thistle.cli._config import (
     TLE_DIR_ENV,
     TLE_EXT_ENV,
-    candidate_names,
+    find_candidate_file,
     is_catalog_id,
     load_config,
 )
@@ -46,7 +47,9 @@ app = typer.Typer(
     help="Satellite orbit propagation and TLE analysis tools.\n\n"
     f"Environment: set {TLE_DIR_ENV} to a directory of per-object TLE files "
     "to pass NORAD catalog IDs (e.g. 25544 or A0001) instead of file paths; "
-    f"{TLE_EXT_ENV} sets their extension (default .tle). See 'thistle config'.",
+    f"{TLE_EXT_ENV} sets their extension (default .tle). With 'thistle[db]' "
+    "installed and THISTLE_DB_* configured, IDs not found there fall back to "
+    "the thistle-db database. See 'thistle config'.",
     no_args_is_help=True,
     add_completion=False,
     context_settings={"help_option_names": ["-h", "--help"]},
@@ -57,27 +60,33 @@ def _resolve_tle_path(file: pathlib.Path) -> pathlib.Path:
     """Resolve a FILE argument, treating catalog IDs via THISTLE_TLE_DIR.
 
     A path that exists is always used verbatim. A non-existent all-digit or
-    Alpha-5 argument is looked up as {tle_dir}/{id}{ext}; a miss there is a
-    hard error naming every path tried. Anything else passes through for the
-    caller's normal file-not-found handling.
+    Alpha-5 argument is looked up as {tle_dir}/{id}{ext}, then in the
+    thistle-db database when that fallback is active ('thistle[db]' installed
+    and THISTLE_DB_* configured); a miss is a hard error naming everything
+    tried. Anything else passes through for the caller's normal
+    file-not-found handling.
     """
     if file.exists():
         return file
     cfg = load_config()
     name = str(file)
-    if cfg.tle_dir is not None and is_catalog_id(name):
-        tried = []
-        for cand in candidate_names(name):
-            candidate = cfg.tle_dir / f"{cand}{cfg.tle_ext}"
-            if candidate.exists():
-                return candidate
-            tried.append(str(candidate))
-        print(
-            f"Error: TLE file not found: {file} (also tried {', '.join(tried)})",
-            file=sys.stderr,
-        )
-        raise typer.Exit(code=2)
-    return file
+    if not is_catalog_id(name):
+        return file
+    found, tried = find_candidate_file(name, cfg)
+    if found is not None:
+        return found
+    tles = _db.lookup_tles(name)
+    if tles:
+        return _db.tles_to_tempfile(tles, cfg.tle_ext)
+    if tles is not None:
+        tried.append("the thistle-db database")
+    if not tried:
+        return file
+    print(
+        f"Error: TLE file not found: {file} (also tried {', '.join(tried)})",
+        file=sys.stderr,
+    )
+    raise typer.Exit(code=2)
 
 
 class SwitchStrategy(str, Enum):
@@ -789,6 +798,7 @@ def config_cmd(
     cfg = load_config()
     dir_source = TLE_DIR_ENV if os.environ.get(TLE_DIR_ENV) else None
     ext_source = TLE_EXT_ENV if os.environ.get(TLE_EXT_ENV) else None
+    db = _db.db_status()
 
     if json_out:
         print(
@@ -798,6 +808,7 @@ def config_cmd(
                     "tle_dir_source": dir_source,
                     "tle_ext": cfg.tle_ext,
                     "tle_ext_source": ext_source or "default",
+                    **db,
                 },
                 indent=2,
             )
@@ -808,6 +819,17 @@ def config_cmd(
         else:
             print(f"tle_dir: (not set)  (set {TLE_DIR_ENV} to enable ID lookup)")
         print(f"tle_ext: {cfg.tle_ext}  (from {ext_source or 'default'})")
+        if not db["db_installed"]:
+            print("db_fallback: thistle-db not installed  (pip install 'thistle[db]')")
+        elif not db["db_configured"]:
+            print(
+                "db_fallback: installed but not configured  "
+                f"(set THISTLE_DB_DATABASE__* or {_db.DB_CONFIG_ENV})"
+            )
+        else:
+            print(
+                f"db_fallback: active  (thistle-db {db['db_version']}, {db['db_url']})"
+            )
 
     if cfg.tle_dir is not None and not cfg.tle_dir.is_dir():
         print(

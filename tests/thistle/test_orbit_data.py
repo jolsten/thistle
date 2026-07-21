@@ -24,7 +24,7 @@ from thistle.orbit_data import (
 from thistle.propagator import Propagator
 
 ts = load.timescale()
-_tles = read_tle("tests/data/25544.tle")
+_tles = read_tle("tests/thistle/data/25544.tle")
 SAT = EarthSatellite(_tles[0][0], _tles[0][1], ts=ts)
 
 # Near the TLE epoch to keep propagation error small.
@@ -434,7 +434,7 @@ class TestGenerate:
     def test_generate_with_propagator(self):
         """Test generate() with a Propagator object."""
         # Load multiple TLEs
-        tles = read_tle("tests/data/25544.tle")[:3]  # Use first 3 TLEs
+        tles = read_tle("tests/thistle/data/25544.tle")[:3]  # Use first 3 TLEs
 
         # Create a propagator
         propagator = Propagator(tles, method="epoch")
@@ -463,7 +463,7 @@ class TestGenerate:
     def test_generate_with_propagator_matches_single_satellite(self):
         """Test that Propagator with single TLE matches EarthSatellite result."""
         # Create a propagator with a single TLE
-        tles = read_tle("tests/data/25544.tle")[:1]
+        tles = read_tle("tests/thistle/data/25544.tle")[:1]
         propagator = Propagator(tles, method="epoch")
 
         # Generate with both methods

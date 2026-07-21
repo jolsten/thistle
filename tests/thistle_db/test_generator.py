@@ -4,7 +4,7 @@ import tempfile
 import pytest
 from sqlalchemy.orm import Session
 
-from tests.conftest import TLES
+from .conftest import TLES
 from thistle_db.config import OutputConfig, OutputFormats, OutputTypes
 from thistle_db.generator import generate
 from thistle_db.ingest import ingest_tles

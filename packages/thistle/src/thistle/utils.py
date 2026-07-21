@@ -40,6 +40,54 @@ def read_tle(
     return results
 
 
+def load_tle(target: PathLike) -> list[TLETuple]:
+    """Read TLEs from a file path or NORAD catalog ID, resolving like the CLI.
+
+    A path that exists is read directly. Otherwise a catalog ID (digits or
+    Alpha-5, e.g. ``"25544"`` or ``"E5693"``) is resolved as the CLI would:
+    candidate files in the ``THISTLE_TLE_DIR`` directory (trying the ID as
+    typed plus its plain-integer, zero-padded, and Alpha-5 spellings, with
+    the ``THISTLE_TLE_EXT`` extension), then the thistle-db database when
+    ``thistle[db]`` is installed and ``THISTLE_DB_*`` is configured.
+
+    Args:
+        target: Path to a TLE file, or a NORAD catalog ID.
+
+    Returns:
+        A list of (line1, line2) tuples.
+
+    Raises:
+        FileNotFoundError: If the target is neither an existing file nor a
+            resolvable catalog ID.
+    """
+    import pathlib
+
+    path = pathlib.Path(target)
+    if path.exists():
+        return read_tle(path)
+
+    # Typer-free helpers; imported lazily to keep core imports cheap.
+    from thistle.cli import _config, _db
+
+    name = str(target)
+    if not _config.is_catalog_id(name):
+        return read_tle(path)  # raises FileNotFoundError with the real path
+
+    cfg = _config.load_config()
+    found, tried = _config.find_candidate_file(name, cfg)
+    if found is not None:
+        return read_tle(found)
+
+    tles = _db.lookup_tles(name)
+    if tles:
+        return list(tles)
+    if tles is not None:
+        tried.append("the thistle-db database")
+
+    detail = f" (tried {', '.join(tried)})" if tried else ""
+    raise FileNotFoundError(f"No TLE source found for {name!r}{detail}")
+
+
 def pairwise(iterable: Iterable) -> Iterable[tuple[Any, Any]]:
     """Iterate over consecutive pairs in an iterable.
 

@@ -97,7 +97,9 @@ Any new bulk-write path must follow this pattern and work on all three dialects.
 
 ## CLI (`cli.py`)
 
-`thistle-db [-c CONFIG] <command>`:
+`thistle-db [-c CONFIG] <command>` — the config path defaults to the
+`THISTLE_DB_CONFIG` env var when set (shared with thistle's db fallback),
+else `./config.toml`:
 
 - `init` — scaffold `config.toml` and `~/.config/thistle-db.toml`.
 - `ingest [FILES...] [--force]` — ingest specific files (always parsed, even
@@ -136,9 +138,11 @@ never abort a scan. A missing source directory is a warning, not an error.
 
 - Python ≥ 3.11. Package manager: `uv`. Build: hatchling + hatch-vcs
   (version comes from git tags — never hardcode it).
-- Run tests: `uv run pytest`. Lint: `uv run ruff check`. Types: `uv run pyright`.
-- Tests cover SQLite by default; MariaDB and PostgreSQL integration tests run
-  in CI (see `.github/`). Dialect-specific behavior (upserts) must be tested
-  against all three.
-- Test fixtures live in `tests/data/` (real TLE text files and Space-Track OMM
-  JSON).
+- Run tests: `uv run pytest tests/thistle_db` from the workspace root. Lint:
+  `uv run ruff check`. Types: `uv run pyright`.
+- Tests cover SQLite by default; set `THISTLE_DB_TEST_MARIADB=1` /
+  `THISTLE_DB_TEST_POSTGRES=1` (requires Docker) to run the MariaDB and
+  PostgreSQL backends via testcontainers — CI runs all three. Dialect-specific
+  behavior (upserts) must be tested against all three.
+- Test fixtures live in `tests/thistle_db/data/` (real TLE text files and
+  Space-Track OMM JSON).

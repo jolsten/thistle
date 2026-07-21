@@ -1,6 +1,6 @@
 from sqlalchemy.orm import Session
 
-from tests.conftest import TLES
+from .conftest import TLES
 from thistle_db.ingest import ingest_tles
 from thistle_db.model import TLE
 

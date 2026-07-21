@@ -116,3 +116,25 @@ class TestGetTleCommand:
     def test_invalid_target_errors(self, cli_env):
         result = runner.invoke(app, ["-c", str(cli_env), "get-tle", "not-a-date"])
         assert result.exit_code != 0
+
+
+class TestConfigEnvVar:
+    def test_env_var_replaces_flag(self, cli_env, monkeypatch):
+        monkeypatch.setenv("THISTLE_DB_CONFIG", str(cli_env))
+        result = runner.invoke(app, ["get-tle", "00022"])
+        assert result.exit_code == 0
+        expected = "".join(f"{l1}\n{l2}\n" for l1, l2 in TLES[:2])
+        assert result.stdout == expected
+
+    def test_flag_wins_over_env_var(self, cli_env, tmp_path, monkeypatch):
+        # Env var points at an empty database; the explicit -c must win.
+        empty = tmp_path / "empty.toml"
+        empty.write_text(
+            f'[database]\ndrivername = "sqlite"\n'
+            f'name = "{(tmp_path / "empty.db").as_posix()}"\n'
+        )
+        monkeypatch.setenv("THISTLE_DB_CONFIG", str(empty))
+        result = runner.invoke(app, ["-c", str(cli_env), "get-tle", "00022"])
+        assert result.exit_code == 0
+        expected = "".join(f"{l1}\n{l2}\n" for l1, l2 in TLES[:2])
+        assert result.stdout == expected

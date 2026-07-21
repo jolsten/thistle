@@ -2,7 +2,7 @@ import pathlib
 
 import pytest
 
-from tests.conftest import TLE_FILES
+from .conftest import TLE_FILES
 from thistle_db.reader import group_by, read_tle, read_tles, tle_satnum
 
 
@@ -26,7 +26,7 @@ def test_read_tles():
 @pytest.mark.parametrize(
     "file",
     [
-        "tests/data/25544.txt",
+        "tests/thistle_db/data/25544.txt",
     ],
 )
 def test_group_satnum(file: pathlib.Path):

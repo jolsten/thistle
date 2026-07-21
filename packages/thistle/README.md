@@ -10,6 +10,20 @@ pip install thistle
 
 Requires Python >= 3.9.
 
+Optional extras:
+
+```
+pip install 'thistle[cli]'   # the thistle command-line tool (Python >= 3.10)
+pip install 'thistle[plot]'  # CLI plus plot/groundtrack commands
+pip install 'thistle[db]'    # CLI plus thistle-db database fallback (Python >= 3.11)
+```
+
+With `thistle[db]` installed and a [thistle-db](https://pypi.org/project/thistle-db/)
+database configured (`THISTLE_DB_*` environment variables or a config.toml
+named by `THISTLE_DB_CONFIG`), CLI commands resolve NORAD catalog IDs from the
+database whenever no matching file is found via `THISTLE_TLE_DIR`. See
+`thistle config` for the effective settings.
+
 ## Quick start
 
 ```python

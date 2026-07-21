@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 from skyfield.api import EarthSatellite, load
 
+from thistle.propagator import Propagator
 from thistle.utils import read_tle
 from thistle.events import (
     find_ascending_periods,
@@ -15,7 +16,7 @@ from thistle.events import (
 )
 
 ts = load.timescale()
-_tles = read_tle("tests/data/25544.tle")
+_tles = read_tle("tests/thistle/data/25544.tle")
 SAT = EarthSatellite(_tles[0][0], _tles[0][1], ts=ts)
 
 # 24-hour window near the TLE epoch
@@ -318,8 +319,6 @@ class TestFindDescendingPeriods:
 
 
 # ---------- Propagator support tests ----------
-
-from thistle.propagator import Propagator
 
 # Single-TLE Propagator: no transitions in the test window, so results
 # should match using the same EarthSatellite directly.

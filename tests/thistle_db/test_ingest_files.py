@@ -5,12 +5,12 @@ import shutil
 
 from sqlalchemy.orm import Session
 
-from tests.conftest import TLES
+from .conftest import TLES
 from thistle_db.config import IngestSource
 from thistle_db.ingest import FileStatus, ingest_source_file, ingest_sources
 from thistle_db.model import IngestFile, TLE
 
-DATA = pathlib.Path("tests/data")
+DATA = pathlib.Path("tests/thistle_db/data")
 
 
 def _copy(tmp_path: pathlib.Path, name: str = "25544.txt") -> pathlib.Path:

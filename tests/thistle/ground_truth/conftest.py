@@ -24,9 +24,9 @@ def iss_tles():
     """Load ISS TLEs once for all ground truth tests.
 
     Returns:
-        List of TLE tuples (line1, line2) for ISS from tests/data/25544.tle
+        List of TLE tuples (line1, line2) for ISS from tests/thistle/data/25544.tle
     """
-    return read_tle("tests/data/25544.tle")
+    return read_tle("tests/thistle/data/25544.tle")
 
 
 @pytest.fixture(scope="session")
@@ -48,7 +48,7 @@ def get_iss_satellite() -> EarthSatellite:
     We use TLE index 40395 which has epoch 2020-04-01 02:54:32 UTC
     (closest to the ground truth data period).
     """
-    tles = read_tle("tests/data/25544.tle")
+    tles = read_tle("tests/thistle/data/25544.tle")
 
     # Use TLE index 40395 (epoch 2020-04-01 02:54:32 UTC)
     # This is the closest TLE to April 1, 2020 00:00 UTC

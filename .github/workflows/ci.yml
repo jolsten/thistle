@@ -7,68 +7,137 @@ on:
     branches: [ "main" ]
 
 jobs:
-  build:
-    name: continuous-integration
+  # Full workspace: thistle + thistle-db + integration tests, one pytest run.
+  # The MariaDB/PostgreSQL backends run via testcontainers on the runner's
+  # Docker — the same fixtures used locally, activated by the env flags.
+  test:
+    name: workspace-tests
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.11"
+          - "3.12"
+          - "3.13"
+
+    env:
+      THISTLE_DB_TEST_MARIADB: "1"
+      THISTLE_DB_TEST_POSTGRES: "1"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv and set the python version
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the workspace
+        run: uv sync --locked --all-packages --all-extras --dev
+
+      - name: Run tests
+        run: uv run pytest
+
+  # thistle still publishes for 3.9/3.10, below the workspace lock's floor,
+  # so these interpreters get an unlocked per-package install.
+  thistle-legacy:
+    name: thistle-legacy-python
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
       matrix:
         python-version:
           - "3.9"
           - "3.10"
-          - "3.11"
-          - "3.12"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install uv and set the python version
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install the project
-        run: uv sync --all-extras --dev
+      - name: Install thistle without the workspace lock
+        run: |
+          uv venv
+          uv pip install './packages/thistle[cli,plot]' pytest hypothesis matplotlib cartopy
 
-      - name: Run tests
-        run: uv run pytest tests
+      - name: Run thistle tests
+        run: .venv/bin/pytest tests/thistle
 
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Install the workspace
+        run: uv sync --locked --all-packages --all-extras --dev
+
+      - name: Ruff check
+        run: uv run ruff check .
+
+      - name: Pyright (thistle-db)
+        working-directory: packages/thistle-db
+        run: uv run pyright
+
+      - name: Pyright (thistle, advisory)
+        working-directory: packages/thistle
+        continue-on-error: true
+        run: uv run pyright
+
+  # Honest install-surface tests: fresh venv + pip-style installs, no
+  # workspace sync (a sync would drag in thistle-db and its typer dependency,
+  # invalidating the cli-missing assertion).
   cli-install:
     name: cli-extra-install
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install uv and set the python version
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
 
-      - name: Install thistle with cli extra, no dev
-        run: uv sync --extra cli --no-dev
+      - name: Install thistle with cli extra
+        run: |
+          uv venv
+          uv pip install './packages/thistle[cli]'
 
       - name: Verify CLI runs
         run: |
-          uv run thistle --help
-          uv run thistle inspect --columns
+          .venv/bin/thistle --help
+          .venv/bin/thistle inspect --columns
 
   cli-missing:
     name: cli-missing-graceful
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install uv and set the python version
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
 
       - name: Install thistle without cli extra
-        run: uv sync --no-dev
+        run: |
+          uv venv
+          uv pip install ./packages/thistle
 
       - name: Verify graceful failure
         run: |
           set +e
-          output=$(uv run thistle --help 2>&1)
+          output=$(.venv/bin/thistle --help 2>&1)
           exit_code=$?
           set -e
           echo "Exit code: $exit_code"
@@ -83,30 +152,61 @@ jobs:
             exit 1
           fi
 
+  # End-to-end: thistle-db ingest populates a SQLite database, then the
+  # thistle CLI resolves a NORAD ID from it via THISTLE_DB_* env config.
+  # (Installs the local thistle-db by path: the thistle[db] extra pins the
+  # released thistle-db>=0.5.0, which an unreleased checkout can't satisfy.)
+  db-fallback:
+    name: db-fallback-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv and set the python version
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install thistle[cli] and thistle-db
+        run: |
+          uv venv
+          uv pip install './packages/thistle[cli]' ./packages/thistle-db
+
+      - name: Ingest and resolve through the database
+        env:
+          THISTLE_DB_DATABASE__DRIVERNAME: sqlite
+          THISTLE_DB_DATABASE__NAME: /tmp/smoke.db
+        run: |
+          printf '[database]\ndrivername = "sqlite"\nname = "/tmp/smoke.db"\n' > /tmp/config.toml
+          .venv/bin/thistle-db -c /tmp/config.toml ingest tests/thistle_db/data/25544.txt
+          .venv/bin/thistle summary 25544
+          .venv/bin/thistle config | grep -F 'db_fallback: active'
+
   numpy:
     name: numpy-versions
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         numpy-version:
-        - "1.26"
-        - "2.0"
-        - "2.1"
-        - "2.2"
+          - "1.26"
+          - "2.0"
+          - "2.1"
+          - "2.2"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install uv and set the python version
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.12"
 
       - name: Set numpy version
-        run: uv add "numpy<=${{ matrix.numpy-version }}.999"
+        run: uv add --package thistle "numpy<=${{ matrix.numpy-version }}.999"
 
-      - name: Install the project
-        run: uv sync --all-extras --dev
+      - name: Install the workspace
+        run: uv sync --all-packages --all-extras --dev
 
-      - name: Run tests
-        run: uv run pytest tests
+      - name: Run thistle tests
+        run: uv run pytest tests/thistle

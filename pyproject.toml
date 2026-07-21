@@ -17,6 +17,7 @@ dev = [
     "pymysql>=1.1",
     "requests>=2.32",
     "spacetrack>=1.4",
+    "testcontainers[mysql,postgres]>=4.8,<5",
 ]
 
 [tool.pytest.ini_options]
