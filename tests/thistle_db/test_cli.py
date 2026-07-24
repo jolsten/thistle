@@ -1,15 +1,18 @@
 import datetime
+import pathlib
 
 import pytest
 import typer
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 from typer.testing import CliRunner
 
 from thistle_db.cli import _parse_target, app, nearest_tles_for_date, tles_for_object
-from thistle_db.model import TLE, Base
+from thistle_db.model import TLE, Base, OmmMetadata
 
 from .conftest import TLES
+
+DATA = pathlib.Path(__file__).parent / "data"
 
 runner = CliRunner()
 
@@ -116,6 +119,171 @@ class TestGetTleCommand:
     def test_invalid_target_errors(self, cli_env):
         result = runner.invoke(app, ["-c", str(cli_env), "get-tle", "not-a-date"])
         assert result.exit_code != 0
+
+
+class TestInitDbCommand:
+    def test_creates_schema(self, tmp_path):
+        db_path = tmp_path / "new.db"
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            f'[database]\ndrivername = "sqlite"\nname = "{db_path.as_posix()}"\n'
+        )
+        result = runner.invoke(app, ["-c", str(config_path), "init-db"])
+        assert result.exit_code == 0
+        assert "Created:" in result.stdout
+        assert "tle" in result.stdout
+
+    def test_rerun_reports_existing(self, cli_env):
+        result = runner.invoke(app, ["-c", str(cli_env), "init-db"])
+        assert result.exit_code == 0
+        assert "Existing:" in result.stdout
+        assert "Created:" not in result.stdout
+
+    def test_drop_without_yes_refuses_non_interactive(self, cli_env):
+        # CliRunner's stdin is not a TTY, so --drop must fail closed.
+        result = runner.invoke(app, ["-c", str(cli_env), "init-db", "--drop"])
+        assert result.exit_code == 2
+        assert "--yes" in result.stderr
+        # And the data must be untouched.
+        result = runner.invoke(app, ["-c", str(cli_env), "get-tle", "00022"])
+        assert result.exit_code == 0
+
+    def test_drop_with_yes_wipes_data(self, cli_env):
+        result = runner.invoke(
+            app, ["-c", str(cli_env), "init-db", "--drop", "--yes"]
+        )
+        assert result.exit_code == 0
+        assert "Dropped:" in result.stdout
+        result = runner.invoke(app, ["-c", str(cli_env), "get-tle", "00022"])
+        assert result.exit_code == 1  # no TLEs left
+
+
+class TestUninitializedDatabase:
+    @pytest.fixture()
+    def uninit_config(self, tmp_path):
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            f'[database]\ndrivername = "sqlite"\n'
+            f'name = "{(tmp_path / "nope.db").as_posix()}"\n'
+        )
+        return config_path
+
+    @pytest.mark.parametrize("command", [["get-tle", "25544"], ["ingest"], ["generate"]])
+    def test_commands_fail_closed(self, uninit_config, tmp_path, command):
+        result = runner.invoke(app, ["-c", str(uninit_config), *command])
+        assert result.exit_code == 3
+        assert "init-db" in result.stderr
+        assert not (tmp_path / "nope.db").exists()
+
+    def test_dump_fails_closed(self, uninit_config, tmp_path):
+        result = runner.invoke(
+            app, ["-c", str(uninit_config), "dump", str(tmp_path / "backup")]
+        )
+        assert result.exit_code == 3
+        assert "init-db" in result.stderr
+        assert not (tmp_path / "backup.tle").exists()
+
+
+def _write_sqlite_config(tmp_path, name):
+    db_path = tmp_path / f"{name}.db"
+    config_path = tmp_path / f"{name}.toml"
+    config_path.write_text(
+        f'[database]\ndrivername = "sqlite"\nname = "{db_path.as_posix()}"\n'
+    )
+    return config_path, db_path
+
+
+def _table_counts(db_path):
+    engine = create_engine(f"sqlite:///{db_path.as_posix()}")
+    try:
+        with engine.connect() as conn:
+            tles = conn.execute(select(func.count()).select_from(TLE.__table__)).scalar()
+            omms = conn.execute(
+                select(func.count()).select_from(OmmMetadata.__table__)
+            ).scalar()
+        return tles, omms
+    finally:
+        engine.dispose()
+
+
+class TestDumpCommand:
+    @pytest.fixture()
+    def populated(self, tmp_path):
+        """A SQLite db loaded with plain TLEs and one OMM record."""
+        config_path, db_path = _write_sqlite_config(tmp_path, "src")
+        assert runner.invoke(app, ["-c", str(config_path), "init-db"]).exit_code == 0
+        result = runner.invoke(
+            app,
+            [
+                "-c",
+                str(config_path),
+                "ingest",
+                str(DATA / "25544.txt"),
+                str(DATA / "one.json"),
+            ],
+        )
+        assert result.exit_code == 0
+        return config_path, db_path
+
+    def test_round_trip(self, populated, tmp_path):
+        config_path, db_path = populated
+        base = tmp_path / "backup"
+
+        result = runner.invoke(app, ["-c", str(config_path), "dump", str(base)])
+        assert result.exit_code == 0
+        assert base.with_suffix(".tle").exists()
+        assert base.with_suffix(".json").exists()
+
+        # Restore into a fresh database and compare row counts.
+        config2, db2 = _write_sqlite_config(tmp_path, "restored")
+        assert runner.invoke(app, ["-c", str(config2), "init-db"]).exit_code == 0
+        result = runner.invoke(
+            app,
+            [
+                "-c",
+                str(config2),
+                "ingest",
+                str(base.with_suffix(".tle")),
+                str(base.with_suffix(".json")),
+            ],
+        )
+        assert result.exit_code == 0
+        assert _table_counts(db2) == _table_counts(db_path)
+
+    def test_dump_is_idempotent_backup(self, populated, tmp_path):
+        """Re-ingesting a dump into its own source database changes nothing."""
+        config_path, db_path = populated
+        before = _table_counts(db_path)
+        base = tmp_path / "self"
+        assert runner.invoke(app, ["-c", str(config_path), "dump", str(base)]).exit_code == 0
+        result = runner.invoke(
+            app, ["-c", str(config_path), "ingest", str(base.with_suffix(".tle"))]
+        )
+        assert result.exit_code == 0
+        assert _table_counts(db_path) == before
+
+    def test_refuses_overwrite_without_force(self, populated, tmp_path):
+        config_path, _ = populated
+        base = tmp_path / "backup"
+        base.with_suffix(".tle").write_text("precious\n")
+        result = runner.invoke(app, ["-c", str(config_path), "dump", str(base)])
+        assert result.exit_code == 1
+        assert "--force" in result.stderr
+        assert base.with_suffix(".tle").read_text() == "precious\n"
+
+        result = runner.invoke(
+            app, ["-c", str(config_path), "dump", str(base), "--force"]
+        )
+        assert result.exit_code == 0
+
+    def test_no_omm_metadata_skips_json(self, cli_env, tmp_path):
+        # cli_env holds TLE rows only (no OMM metadata).
+        base = tmp_path / "backup"
+        result = runner.invoke(app, ["-c", str(cli_env), "dump", str(base)])
+        assert result.exit_code == 0
+        assert base.with_suffix(".tle").exists()
+        assert not base.with_suffix(".json").exists()
+        assert "not written" in result.stdout
 
 
 class TestConfigEnvVar:

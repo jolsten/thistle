@@ -66,7 +66,19 @@ username = "myuser"
 password = "mypassword"
 ```
 
-### 3. Ingest TLE/OMM files
+### 3. Create the database schema
+
+```bash
+thistle-db init-db
+```
+
+Run once per database (idempotent — safe to re-run). Commands never create
+schema implicitly, so on MariaDB/PostgreSQL you can run `init-db` with an
+admin account and give the day-to-day account only read/write privileges.
+`init-db --drop` destroys and recreates everything (asks for confirmation
+unless `--yes`).
+
+### 4. Ingest TLE/OMM files
 
 Scan configured source directories:
 
@@ -91,7 +103,7 @@ File format is auto-detected by extension:
 
 Ingestion is idempotent -- duplicate records are silently skipped.
 
-### 4. Generate output files
+### 5. Generate output files
 
 ```bash
 thistle-db generate
@@ -149,9 +161,12 @@ thistle-db [-c CONFIG] COMMAND
 
 Commands:
   init       Scaffold config.toml and ~/.config/thistle-db.toml
+  init-db    Create the database schema (idempotent; --drop recreates from
+             scratch, destroying all data — asks unless --yes)
   ingest     Ingest TLE/OMM files into the database
   generate   Generate output TLE/OMM files from the database
   get-tle    Print TLEs from the database to stdout
+  dump       Export the entire database as re-ingestable TLE/OMM files
 
 Options:
   -c, --config PATH   Path to config.toml
@@ -177,6 +192,34 @@ thistle-db get-tle 20260717 --days 3
 ```
 
 Exits with status 1 if no TLEs match.
+
+### `dump` — backups and migration
+
+Export the whole database as re-ingestable files (a *logical* backup):
+
+```bash
+thistle-db dump /backups/tles-20260722
+# -> writes /backups/tles-20260722.tle
+#    and    /backups/tles-20260722.json  (only if OMM metadata exists)
+```
+
+Restore into any empty database — including a different dialect (SQLite →
+MariaDB, etc.):
+
+```bash
+thistle-db -c new-config.toml init-db
+thistle-db -c new-config.toml ingest /backups/tles-20260722.tle /backups/tles-20260722.json
+```
+
+The export is lossless for element sets (rows store the TLE line text
+verbatim, and dedup is by that exact text), and the JSON carries the OMM
+metadata in Space-Track form so `ingest` reattaches it to the same rows.
+The `ingest_files` change-detection state is deliberately not exported —
+it is a cache; the next scan rebuilds it.
+
+For *physical* backups of a live server, prefer the native tools: a file
+copy or `VACUUM INTO` for SQLite, `mariadb-dump` / `pg_dump` for the
+server dialects.
 
 ## Configuration Reference
 

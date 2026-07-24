@@ -89,6 +89,19 @@ def test_tle_dir_wins_over_db(db_env, tmp_path, monkeypatch):
     assert "59001A" in result.stdout
 
 
+def test_uninitialized_db_leaves_no_trace(tmp_path, monkeypatch):
+    """A typo'd DB path warns and falls through — and creates no stray file."""
+    monkeypatch.delenv("THISTLE_TLE_DIR", raising=False)
+    monkeypatch.delenv(_db.DB_CONFIG_ENV, raising=False)
+    ghost = tmp_path / "ghost.db"
+    monkeypatch.setenv("THISTLE_DB_DATABASE__DRIVERNAME", "sqlite")
+    monkeypatch.setenv("THISTLE_DB_DATABASE__NAME", ghost.as_posix())
+    result = runner.invoke(app, ["summary", "25544"])
+    assert result.exit_code == 2
+    assert "thistle-db lookup failed" in result.stderr
+    assert not ghost.exists()
+
+
 def test_not_configured_is_not_attempted(monkeypatch):
     monkeypatch.delenv("THISTLE_TLE_DIR", raising=False)
     monkeypatch.delenv(_db.DB_CONFIG_ENV, raising=False)

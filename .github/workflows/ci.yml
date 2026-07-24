@@ -178,6 +178,7 @@ jobs:
           THISTLE_DB_DATABASE__NAME: /tmp/smoke.db
         run: |
           printf '[database]\ndrivername = "sqlite"\nname = "/tmp/smoke.db"\n' > /tmp/config.toml
+          .venv/bin/thistle-db -c /tmp/config.toml init-db
           .venv/bin/thistle-db -c /tmp/config.toml ingest tests/thistle_db/data/25544.txt
           .venv/bin/thistle summary 25544
           .venv/bin/thistle config | grep -F 'db_fallback: active'

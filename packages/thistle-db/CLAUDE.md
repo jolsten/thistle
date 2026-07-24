@@ -15,6 +15,10 @@ organized output files (by date and by satellite) from that database.
 
 1. TLE/OMM files are delivered into directories defined in `config.toml`
    (`[[ingest.sources]]` entries: a `path` plus a glob `pattern`).
+   The schema is created once with `thistle-db init-db` — the **only** DDL
+   path; other commands never create tables and fail with a clear
+   "run `thistle-db init-db`" error (exit 3) against an uninitialized
+   database.
 2. `thistle-db ingest` scans those directories, auto-detects each file's format,
    parses the element sets, and inserts them into the database. Duplicates are
    silently skipped — ingest is **idempotent**: running it twice over the same
@@ -102,6 +106,11 @@ Any new bulk-write path must follow this pattern and work on all three dialects.
 else `./config.toml`:
 
 - `init` — scaffold `config.toml` and `~/.config/thistle-db.toml`.
+- `init-db [--drop] [--yes]` — create the database schema; the intended DDL
+  entry point (run once with an admin account when using MariaDB/PostgreSQL).
+  Idempotent without `--drop`. `--drop` destroys and recreates all tables:
+  it prompts for confirmation, and in non-interactive use fails closed
+  unless `--yes` is passed.
 - `ingest [FILES...] [--force]` — ingest specific files (always parsed, even
   if recorded as unchanged), or scan all configured sources when no files are
   given; `--force` re-ingests scanned files regardless of recorded state.
@@ -110,6 +119,13 @@ else `./config.toml`:
   date, within ±N days, default 7) or an alpha-5-compatible NORAD ID
   (e.g. `25544`, `00022`, `E5693` → every TLE for that object, epoch order).
   Exits 1 if nothing matches.
+- `dump OUTPUT [--force]` — logical backup: write every element set to
+  `OUTPUT.tle` (lossless, verbatim line text) and rows with OMM metadata to
+  `OUTPUT.json` (Space-Track form, only created when metadata exists).
+  Restore = `init-db` + `ingest` both files; works across dialects. Refuses
+  to overwrite existing outputs without `--force`. Physical backups of live
+  servers belong to native tools (`mariadb-dump`, `pg_dump`, SQLite file
+  copy), not this command.
 - `generate` — write output files per `[output]` config:
   - `date_files`: `YYYYMMDD.{tle,omm}` — latest element set per satellite for
     that date.

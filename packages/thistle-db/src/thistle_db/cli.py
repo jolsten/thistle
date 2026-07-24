@@ -7,7 +7,14 @@ import typer
 from loguru import logger
 from sgp4.alpha5 import from_alpha5
 
-from thistle_db.api import nearest_tles_for_date, open_session, tles_for_object
+from thistle_db.api import (
+    DatabaseNotInitializedError,
+    dump_db,
+    init_db,
+    nearest_tles_for_date,
+    open_session,
+    tles_for_object,
+)
 from thistle_db.config import load_config
 from thistle_db.generator import generate as generate_outputs
 from thistle_db.ingest import FileStatus, ingest_source_file, ingest_sources
@@ -22,6 +29,14 @@ app = typer.Typer(
 def _setup_logging(level: str) -> None:
     logger.remove()
     logger.add(sys.stderr, level=level.upper())
+
+
+def _open_session_or_exit(config):
+    try:
+        return open_session(config)
+    except DatabaseNotInitializedError as err:
+        print(f"Error: {err}", file=sys.stderr)
+        raise typer.Exit(code=3) from None
 
 
 CONFIG_TEMPLATE = """\
@@ -158,6 +173,56 @@ def init(ctx: typer.Context) -> None:
         print("Nothing to do - all files already exist.")
 
 
+@app.command(name="init-db")
+def init_db_cmd(
+    ctx: typer.Context,
+    drop: Annotated[
+        bool,
+        typer.Option(
+            "--drop",
+            help="Drop all tables first, destroying all data (DESTRUCTIVE)",
+        ),
+    ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            "-y",
+            help="Skip the --drop confirmation prompt (for scripts)",
+        ),
+    ] = False,
+) -> None:
+    """Create the database schema in the configured database.
+
+    Idempotent: existing tables are left untouched. With --drop, all tables
+    are dropped and recreated (asks for confirmation unless --yes).
+    """
+    config = load_config(ctx.obj)
+    _setup_logging(config.logging.level)
+    url = config.database.url.render_as_string(hide_password=True)
+
+    if drop and not yes:
+        if not sys.stdin.isatty():
+            print(
+                "Error: --drop requires confirmation; pass --yes to skip the "
+                "prompt in non-interactive use.",
+                file=sys.stderr,
+            )
+            raise typer.Exit(code=2)
+        if not typer.confirm(f"Drop ALL tables in {url}?"):
+            raise typer.Exit(code=1)
+
+    result = init_db(config, drop=drop)
+
+    print(f"Database: {url}")
+    if result["dropped"]:
+        print(f"Dropped:  {', '.join(result['dropped'])}")
+    if result["created"]:
+        print(f"Created:  {', '.join(result['created'])}")
+    if result["existing"]:
+        print(f"Existing: {', '.join(result['existing'])} (left untouched)")
+
+
 @app.command()
 def ingest(
     ctx: typer.Context,
@@ -179,7 +244,7 @@ def ingest(
     config = load_config(ctx.obj)
     _setup_logging(config.logging.level)
 
-    session, engine = open_session(config)
+    session, engine = _open_session_or_exit(config)
     try:
         if files:
             total = 0
@@ -208,12 +273,63 @@ def generate(ctx: typer.Context) -> None:
     config = load_config(ctx.obj)
     _setup_logging(config.logging.level)
 
-    session, engine = open_session(config)
+    session, engine = _open_session_or_exit(config)
     try:
         generate_outputs(session, config.output)
     finally:
         session.close()
         engine.dispose()
+
+
+@app.command()
+def dump(
+    ctx: typer.Context,
+    output: Annotated[
+        Path,
+        typer.Argument(
+            help="Base path for the export; writes OUTPUT.tle and (when OMM "
+            "metadata exists) OUTPUT.json",
+            show_default=False,
+        ),
+    ],
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Overwrite existing output files"),
+    ] = False,
+) -> None:
+    """Export the entire database as re-ingestable TLE/OMM files.
+
+    A logical backup: restore into any (empty, init-db'd) database with
+    `thistle-db ingest OUTPUT.tle OUTPUT.json` — also works across dialects
+    (e.g. SQLite to MariaDB). For physical backups of a live server, prefer
+    the native tools (sqlite file copy / mariadb-dump / pg_dump).
+    """
+    config = load_config(ctx.obj)
+    _setup_logging(config.logging.level)
+
+    tle_path = Path(f"{output}.tle")
+    omm_path = Path(f"{output}.json")
+    existing = [p for p in (tle_path, omm_path) if p.exists()]
+    if existing and not force:
+        print(
+            f"Error: output file(s) already exist: "
+            f"{', '.join(str(p) for p in existing)} (use --force to overwrite)",
+            file=sys.stderr,
+        )
+        raise typer.Exit(code=1)
+
+    session, engine = _open_session_or_exit(config)
+    try:
+        tle_count, omm_count = dump_db(session, tle_path, omm_path)
+    finally:
+        session.close()
+        engine.dispose()
+
+    print(f"Wrote {tle_path} ({tle_count} TLEs)")
+    if omm_count:
+        print(f"Wrote {omm_path} ({omm_count} OMM records)")
+    else:
+        print(f"No OMM metadata in the database; {omm_path} not written")
 
 
 def _parse_target(value: str) -> int | datetime.date:
@@ -263,7 +379,7 @@ def get_tle(
     config = load_config(ctx.obj)
     _setup_logging(config.logging.level)
 
-    session, engine = open_session(config)
+    session, engine = _open_session_or_exit(config)
     try:
         if isinstance(parsed, int):
             tles = tles_for_object(session, parsed)
