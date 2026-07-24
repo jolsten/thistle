@@ -3,7 +3,7 @@
 import datetime
 import pathlib
 
-from sqlalchemy import inspect, select
+from sqlalchemy import event, inspect, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -45,13 +45,41 @@ class DatabaseNotInitializedError(RuntimeError):
     """The configured database is missing the thistle-db schema."""
 
 
-def open_session(config: Settings) -> tuple[Session, Engine]:
+_READONLY_STMTS = {
+    "sqlite": "PRAGMA query_only=ON",
+    "postgresql": "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
+    "mysql": "SET SESSION TRANSACTION READ ONLY",
+    "mariadb": "SET SESSION TRANSACTION READ ONLY",
+}
+
+
+def _make_readonly(engine: Engine) -> None:
+    """Reject writes at the connection level (defense in depth for the read
+    tier — grants are the real enforcement, this catches bugs)."""
+    stmt = _READONLY_STMTS.get(engine.dialect.name)
+    if stmt is None:
+        return  # unknown dialect: rely on grants
+
+    @event.listens_for(engine, "connect")
+    def _set_read_only(dbapi_conn, _record):
+        cursor = dbapi_conn.cursor()
+        try:
+            cursor.execute(stmt)
+        finally:
+            cursor.close()
+        dbapi_conn.commit()
+
+
+def open_session(config: Settings, *, readonly: bool = False) -> tuple[Session, Engine]:
     """Open a session on the configured database.
 
     Never issues DDL — schema creation is `init_db`'s job. Raises
     DatabaseNotInitializedError if any model table is missing, so a typo'd
     database path/name fails loudly instead of quietly querying (or, for
     SQLite, creating) an empty database.
+
+    With ``readonly=True`` the connection itself rejects writes (read-tier
+    callers: queries, exports, thistle's fallback).
     """
     db = config.database
     # Check SQLite file existence before connecting: connecting alone would
@@ -63,6 +91,8 @@ def open_session(config: Settings) -> tuple[Session, Engine]:
                 "exist — run `thistle-db init-db`"
             )
     engine = config.database.engine
+    if readonly:
+        _make_readonly(engine)
     try:
         missing = set(Base.metadata.tables) - set(inspect(engine).get_table_names())
     except Exception:
@@ -179,7 +209,7 @@ def get_tles(satnum: int, config: Settings | None = None) -> list[tuple[str, str
     """
     if config is None:
         config = load_config(None)
-    session, engine = open_session(config)
+    session, engine = open_session(config, readonly=True)
     try:
         return [(tle.line1, tle.line2) for tle in tles_for_object(session, satnum)]
     finally:

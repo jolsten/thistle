@@ -8,12 +8,11 @@ import pathlib
 import sys
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import NoReturn, Optional
+from typing import Annotated, NoReturn, Optional
 
 import numpy as np
 import typer
 from sgp4.api import Satrec
-from typing_extensions import Annotated
 
 from thistle.cli._helpers import (
     ALL_COLUMNS,

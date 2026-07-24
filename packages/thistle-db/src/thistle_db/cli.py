@@ -31,9 +31,9 @@ def _setup_logging(level: str) -> None:
     logger.add(sys.stderr, level=level.upper())
 
 
-def _open_session_or_exit(config):
+def _open_session_or_exit(config, *, readonly: bool = False):
     try:
-        return open_session(config)
+        return open_session(config, readonly=readonly)
     except DatabaseNotInitializedError as err:
         print(f"Error: {err}", file=sys.stderr)
         raise typer.Exit(code=3) from None
@@ -273,7 +273,7 @@ def generate(ctx: typer.Context) -> None:
     config = load_config(ctx.obj)
     _setup_logging(config.logging.level)
 
-    session, engine = _open_session_or_exit(config)
+    session, engine = _open_session_or_exit(config, readonly=True)
     try:
         generate_outputs(session, config.output)
     finally:
@@ -318,7 +318,7 @@ def dump(
         )
         raise typer.Exit(code=1)
 
-    session, engine = _open_session_or_exit(config)
+    session, engine = _open_session_or_exit(config, readonly=True)
     try:
         tle_count, omm_count = dump_db(session, tle_path, omm_path)
     finally:
@@ -379,7 +379,7 @@ def get_tle(
     config = load_config(ctx.obj)
     _setup_logging(config.logging.level)
 
-    session, engine = _open_session_or_exit(config)
+    session, engine = _open_session_or_exit(config, readonly=True)
     try:
         if isinstance(parsed, int):
             tles = tles_for_object(session, parsed)

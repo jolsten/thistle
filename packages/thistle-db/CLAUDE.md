@@ -103,7 +103,15 @@ Any new bulk-write path must follow this pattern and work on all three dialects.
 
 `thistle-db [-c CONFIG] <command>` — the config path defaults to the
 `THISTLE_DB_CONFIG` env var when set (shared with thistle's db fallback),
-else `./config.toml`:
+else `./config.toml`.
+
+Commands are privilege-tiered: `init-db` is the only DDL path, `ingest` the
+only DML path, and the read commands (`get-tle`, `generate`, `dump`, plus
+thistle's `get_tles` fallback) open **read-only connections** — writes are
+rejected at the connection level (`PRAGMA query_only` / `SET SESSION
+TRANSACTION READ ONLY` / read-only transaction characteristics) as defense
+in depth on top of DB grants. Deployments can therefore give the cron
+account DML-only rights and readers SELECT-only rights:
 
 - `init` — scaffold `config.toml` and `~/.config/thistle-db.toml`.
 - `init-db [--drop] [--yes]` — create the database schema; the intended DDL

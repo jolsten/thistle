@@ -1,5 +1,7 @@
 import pytest
 from sqlalchemy import create_engine, inspect
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import sessionmaker
 
 from thistle_db.api import (
@@ -80,6 +82,62 @@ def test_get_tles_config_from_env(db_path, monkeypatch):
 
 
 MODEL_TABLES = {"tle", "omm_metadata", "ingest_files"}
+
+
+def _settings_from_url(url_str: str) -> Settings:
+    url = make_url(url_str)
+    return Settings(
+        database=Database(
+            drivername=url.drivername,
+            username=url.username,
+            password=url.password,
+            host=url.host,
+            port=url.port,
+            name=url.database,
+        )
+    )
+
+
+class TestReadOnlySession:
+    @pytest.fixture(params=["sqlite", "mariadb", "postgres"])
+    def ro_settings(self, request, tmp_path):
+        """An initialized database seeded with one TLE, per backend."""
+        if request.param == "sqlite":
+            settings = _settings(tmp_path / "ro.db")
+        else:
+            settings = _settings_from_url(
+                request.getfixturevalue(f"{request.param}_url")
+            )
+        init_db(settings)
+        session, engine = open_session(settings)
+        try:
+            session.add(TLE.from_twoline(*TLES[0]))
+            session.commit()
+        finally:
+            session.close()
+            engine.dispose()
+        return settings
+
+    def test_reads_work(self, ro_settings):
+        session, engine = open_session(ro_settings, readonly=True)
+        try:
+            assert len(tles_for_object(session, 22)) == 1
+        finally:
+            session.close()
+            engine.dispose()
+
+    def test_writes_rejected(self, ro_settings):
+        session, engine = open_session(ro_settings, readonly=True)
+        try:
+            session.add(TLE.from_twoline(*TLES[1]))
+            with pytest.raises(DBAPIError):
+                session.commit()
+            session.rollback()
+        finally:
+            session.close()
+            engine.dispose()
+        # Nothing was written despite the attempt.
+        assert get_tles(22, ro_settings) == [TLES[0]]
 
 
 def test_init_db_creates_all_tables(tmp_path):
