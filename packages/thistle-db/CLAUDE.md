@@ -58,9 +58,10 @@ Single canonical element-set table plus an OMM metadata sidecar. Do **not**
 split OMM into a fully separate element-set table.
 
 - **`tle`** — one row per unique element set. Stores the raw `line1`/`line2`
-  text plus parsed fields (norad_cat_id, epoch, Keplerian elements, drag terms)
-  and derived values (semimajor axis, period, apoapsis/periapsis altitude).
-  Parsing goes through `sgp4.Satrec`.
+  text, a `line_hash` (sha256 hex of the exact text — the dedup key), parsed
+  fields (norad_cat_id, epoch, Keplerian elements, drag terms) and derived
+  values (semimajor axis, period, apoapsis/periapsis altitude). Parsing goes
+  through `sgp4.Satrec`.
 - **`omm_metadata`** — OMM-only fields (object name/type, country code, RCS
   size, launch/decay date, site, originator, GP_ID), one-to-one with a `tle`
   row via `tle_id`.
@@ -68,21 +69,48 @@ split OMM into a fully separate element-set table.
   used to skip unchanged source files on scan; keyed by a sha256 of the
   resolved path (bounded length for cross-dialect unique indexes).
 
+Schema conventions (deliberate, sized for hundreds of millions of rows on
+MariaDB — do not regress them casually):
+
+- Surrogate keys are **BIGINT** (`INTEGER` on SQLite for rowid autoincrement):
+  `INSERT IGNORE` burns auto-increment values on every duplicate it skips, so
+  id consumption tracks rows *attempted*, not stored.
+- All stored datetimes are **naive UTC with microseconds** (`DATETIME(6)` on
+  MariaDB); `epoch` must round-trip exactly for the generator's tail guard.
+- Element/derived float columns are **single precision** (`Float32` =
+  FLOAT(24)): the TLE text carries at most 7 significant digits everywhere
+  except `mean_motion` (10 digits — kept DOUBLE), and `line1`/`line2` are
+  the lossless source of truth, so these columns are a re-derivable
+  convenience view. Never compare them for equality; recompute from the
+  lines when full precision matters.
+- Rows are immutable once inserted — there is no `modified` column.
+- The `tle` **index budget is intentionally minimal** (PK,
+  `UNIQUE(epoch, line_hash)`, `(norad_cat_id, epoch)`, `(created)`). Every
+  additional secondary index taxes every insert; add one only with a query
+  that needs it.
+
 ### Uniqueness
 
-The dedup key is **exact text of `(line1, line2)`** (a `UniqueConstraint`).
-This is deliberate: it is lossless and simple; textual near-duplicates from
-different providers coexist as separate rows. Do not change the key to
+The dedup key is the **exact text of `(line1, line2)`**, enforced as
+`UNIQUE(epoch, line_hash)` where `line_hash` is the raw 32-byte sha256 of
+`line1 + "\n" + line2` (`BINARY(32)` on MariaDB — a plain BLOB could not
+back the unique index; use `HEX(line_hash)` in ad-hoc SQL). This is
+semantically identical to a unique constraint on the raw text (the epoch is
+encoded in line1, so identical lines always share an epoch) but keeps the
+index 32 bytes wide instead of 560. Epoch-first ordering means
+normal "recent elsets" ingest probes only the hot right edge of the index
+regardless of table size. Textual near-duplicates from different providers
+coexist as separate rows — this is deliberate. Do not change the key to
 `(norad_cat_id, epoch)` or similar without an explicit decision.
 
 If a TLE is delivered first and the OMM version of the same element set arrives
 later (with identical lines), the TLE row is **not** duplicated — the OMM
-delivery attaches an `omm_metadata` row to the existing `tle` row. Both
-representations are thereby preserved: the TLE lines in `tle`, the OMM extras
-in `omm_metadata`.
+delivery attaches an `omm_metadata` row to the existing `tle` row (resolved by
+`line_hash`). Both representations are thereby preserved: the TLE lines in
+`tle`, the OMM extras in `omm_metadata`.
 
 Dedup is enforced at the database with dialect-aware upserts
-(`ingest._bulk_insert_tles`): `ON CONFLICT DO NOTHING` for SQLite/PostgreSQL,
+(`ingest._bulk_insert_ignore`): `ON CONFLICT DO NOTHING` for SQLite/PostgreSQL,
 `INSERT IGNORE` for MySQL/MariaDB. Inserts are chunked (`CHUNK_SIZE = 5000`).
 Any new bulk-write path must follow this pattern and work on all three dialects.
 
@@ -134,12 +162,39 @@ account DML-only rights and readers SELECT-only rights:
   to overwrite existing outputs without `--force`. Physical backups of live
   servers belong to native tools (`mariadb-dump`, `pg_dump`, SQLite file
   copy), not this command.
-- `generate` — write output files per `[output]` config:
+- `generate [--all] [--window-days N] [--lookback-days N] [--verify]` —
+  write output files per `[output]` config:
   - `date_files`: `YYYYMMDD.{tle,omm}` — latest element set per satellite for
     that date.
   - `object_files`: `NORAD_ID.{tle,omm}` — all element sets for a satellite,
     ordered by epoch.
   - Formats toggleable via `[output.formats]` (tle = two-line text, omm = CSV).
+  - **Incremental by default** — steady-state cost must stay O(new rows),
+    independent of catalog size, with no persistent generator state:
+    - Date files: rewritten for a trailing epoch window
+      (`output.window_days`, default 60) plus any date that received new rows
+      within the lookback — so arbitrarily late deliveries land in the right
+      old date file.
+    - Object files: rows created within `output.lookback_days` (default 7)
+      are streamed in keyset batches ordered by `(norad_cat_id, epoch, id)`
+      and **appended** to each object's files behind a tail guard (only rows
+      strictly newer than the file's last epoch are appended; the file mtime
+      distinguishes overlapping-lookback re-runs from genuinely late rows).
+      Any anomaly — late delivery, epoch tie, torn last line, missing or
+      inconsistent file — falls back to a full rewrite of that one object
+      from the database, which is always authoritative. The `.tle` file is
+      the tail authority; the `.omm` file may legitimately hold only a
+      subset (sgp4 cannot export every elset).
+    - `--all` rebuilds everything (first run, disaster recovery, or after a
+      generation gap longer than the lookback). `lookback_days` must exceed
+      the ingest cron cadence.
+    - `--verify` follows the normal run with a count-reconciliation sweep:
+      per-object database row counts (one aggregated index query) against
+      each `.tle` file's line count, rewriting mismatches — catches damage
+      the tail guard can't see (mid-file truncation/edits, files deleted for
+      quiet objects). Reads all output files, so it belongs on a periodic
+      (e.g. weekly) cron entry, not every run. Requires tle output; the
+      `.tle` file is the verification authority.
 
 ## Module map
 
@@ -170,3 +225,16 @@ never abort a scan. A missing source directory is a warning, not an error.
   behavior (upserts) must be tested against all three.
 - Test fixtures live in `tests/thistle_db/data/` (real TLE text files and
   Space-Track OMM JSON).
+
+### Schema changes (no migration framework — deliberate)
+
+There is intentionally **no Alembic or other migration tooling**. The
+database is a derived store: every row reconstitutes losslessly from a
+`dump`, so schema changes ship as breaking releases migrated by
+`dump` → `init-db --drop` → `ingest` (plus one `generate --all`, since a
+restore resets `created` timestamps and the incremental generator's state
+derives from them). Do not add a migration framework without an explicit
+decision — the trigger to revisit is when restore downtime becomes
+unacceptable (roughly 100M+ rows). Purely additive changes (a new index, a
+nullable column) may instead ship with hand-written `ALTER` statements for
+all three dialects in the release notes.

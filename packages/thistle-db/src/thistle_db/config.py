@@ -1,11 +1,36 @@
 import tomllib
+from functools import cached_property
 from pathlib import Path
 from typing import Optional
 
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.engine import URL
+
+_READONLY_STMTS = {
+    "sqlite": "PRAGMA query_only=ON",
+    "postgresql": "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
+    "mysql": "SET SESSION TRANSACTION READ ONLY",
+    "mariadb": "SET SESSION TRANSACTION READ ONLY",
+}
+
+
+def _install_readonly_guard(engine: Engine) -> None:
+    """Reject writes at the connection level (defense in depth for the read
+    tier — grants are the real enforcement, this catches bugs)."""
+    stmt = _READONLY_STMTS.get(engine.dialect.name)
+    if stmt is None:
+        return  # unknown dialect: rely on grants
+
+    @event.listens_for(engine, "connect")
+    def _set_read_only(dbapi_conn, _record):
+        cursor = dbapi_conn.cursor()
+        try:
+            cursor.execute(stmt)
+        finally:
+            cursor.close()
+        dbapi_conn.commit()
 
 
 class Database(BaseModel):
@@ -28,9 +53,21 @@ class Database(BaseModel):
             database=self.name,
         )
 
-    @property
+    @cached_property
     def engine(self) -> Engine:
-        return create_engine(self.url)
+        # Cached: repeated access must not build a new pool each time.
+        # pool_pre_ping revalidates connections that a long generate run
+        # (or MariaDB's wait_timeout) may have silently dropped.
+        return create_engine(self.url, pool_pre_ping=True)
+
+    @cached_property
+    def readonly_engine(self) -> Engine:
+        # A separate engine: the readonly guard is a connect-event listener,
+        # and attaching it to the shared write engine would poison later
+        # write use (both engines are cached for the process lifetime).
+        engine = create_engine(self.url, pool_pre_ping=True)
+        _install_readonly_guard(engine)
+        return engine
 
 
 class IngestSource(BaseModel):
@@ -56,6 +93,13 @@ class OutputConfig(BaseModel):
     dir: str = "./output"
     formats: OutputFormats = OutputFormats()
     types: OutputTypes = OutputTypes()
+    window_days: int = 60
+    """Date files: trailing epoch window (days) rewritten every run."""
+    lookback_days: int = 7
+    """Object files: rows created within this many days are (re)considered.
+
+    Must comfortably exceed the ingest/generate cron cadence; after an outage
+    longer than this, run `generate --all`."""
 
 
 class LoggingConfig(BaseModel):

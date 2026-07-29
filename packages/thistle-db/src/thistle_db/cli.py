@@ -93,6 +93,14 @@ pattern = "*.tle"    # glob pattern for matching files
 [output]
 dir = "./output"     # directory where generated files are written
 
+# Generation is incremental: each run rewrites date files for a trailing
+# epoch window and appends new rows to object files. Late deliveries are
+# handled automatically; run `thistle-db generate --all` after an outage
+# longer than lookback_days.
+window_days = 60     # date files: trailing window rewritten every run
+lookback_days = 7    # object files: newly created rows considered per run
+                     # (must exceed the ingest cron cadence)
+
 # Which output formats to produce
 [output.formats]
 tle = true           # two-line element format (.tle files)
@@ -268,14 +276,61 @@ def ingest(
 
 
 @app.command()
-def generate(ctx: typer.Context) -> None:
-    """Generate output TLE/OMM files from the database."""
+def generate(
+    ctx: typer.Context,
+    rebuild_all: Annotated[
+        bool,
+        typer.Option(
+            "--all",
+            help="Rebuild every output file from scratch (first run, disaster "
+            "recovery, or after a generation gap longer than the lookback)",
+        ),
+    ] = False,
+    window_days: Annotated[
+        Optional[int],
+        typer.Option(
+            "--window-days",
+            help="Override output.window_days: trailing epoch window (days) of "
+            "date files rewritten each run",
+        ),
+    ] = None,
+    lookback_days: Annotated[
+        Optional[int],
+        typer.Option(
+            "--lookback-days",
+            help="Override output.lookback_days: how many days of newly created "
+            "rows to (re)consider for object files",
+        ),
+    ] = None,
+    verify: Annotated[
+        bool,
+        typer.Option(
+            "--verify",
+            help="After generating, reconcile every object file's line count "
+            "against the database and rewrite mismatches (reads all output "
+            "files — intended for a periodic, e.g. weekly, cron run)",
+        ),
+    ] = False,
+) -> None:
+    """Generate output TLE/OMM files from the database.
+
+    Incremental by default: date files are rewritten for a trailing epoch
+    window plus any date that received new data; object files are appended
+    to. Cost scales with new data, not database size.
+    """
     config = load_config(ctx.obj)
     _setup_logging(config.logging.level)
 
     session, engine = _open_session_or_exit(config, readonly=True)
     try:
-        generate_outputs(session, config.output)
+        generate_outputs(
+            session,
+            config.output,
+            rebuild_all=rebuild_all,
+            window_days=window_days,
+            lookback_days=lookback_days,
+            verify=verify,
+        )
     finally:
         session.close()
         engine.dispose()

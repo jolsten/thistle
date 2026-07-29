@@ -128,9 +128,7 @@ def test_explicit_ingest_bypasses_skip_and_records_state(
     assert db_session.query(IngestFile).count() == 1
 
 
-def test_missing_explicit_file_is_isolated(
-    db_session: Session, tmp_path: pathlib.Path
-):
+def test_missing_explicit_file_is_isolated(db_session: Session, tmp_path: pathlib.Path):
     missing = tmp_path / "nope.txt"
     assert ingest_source_file(db_session, missing, force=True) == (FileStatus.FAILED, 0)
     assert db_session.query(IngestFile).count() == 0

@@ -3,7 +3,7 @@
 import datetime
 import pathlib
 
-from sqlalchemy import event, inspect, select
+from sqlalchemy import func, inspect, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -45,31 +45,6 @@ class DatabaseNotInitializedError(RuntimeError):
     """The configured database is missing the thistle-db schema."""
 
 
-_READONLY_STMTS = {
-    "sqlite": "PRAGMA query_only=ON",
-    "postgresql": "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
-    "mysql": "SET SESSION TRANSACTION READ ONLY",
-    "mariadb": "SET SESSION TRANSACTION READ ONLY",
-}
-
-
-def _make_readonly(engine: Engine) -> None:
-    """Reject writes at the connection level (defense in depth for the read
-    tier — grants are the real enforcement, this catches bugs)."""
-    stmt = _READONLY_STMTS.get(engine.dialect.name)
-    if stmt is None:
-        return  # unknown dialect: rely on grants
-
-    @event.listens_for(engine, "connect")
-    def _set_read_only(dbapi_conn, _record):
-        cursor = dbapi_conn.cursor()
-        try:
-            cursor.execute(stmt)
-        finally:
-            cursor.close()
-        dbapi_conn.commit()
-
-
 def open_session(config: Settings, *, readonly: bool = False) -> tuple[Session, Engine]:
     """Open a session on the configured database.
 
@@ -90,9 +65,7 @@ def open_session(config: Settings, *, readonly: bool = False) -> tuple[Session, 
                 f"database not initialized: SQLite file {db.name} does not "
                 "exist — run `thistle-db init-db`"
             )
-    engine = config.database.engine
-    if readonly:
-        _make_readonly(engine)
+    engine = config.database.readonly_engine if readonly else config.database.engine
     try:
         missing = set(Base.metadata.tables) - set(inspect(engine).get_table_names())
     except Exception:
@@ -115,21 +88,51 @@ def tles_for_object(session: Session, satnum: int) -> list[TLE]:
     return list(session.execute(stmt).scalars().all())
 
 
+def _boundary_tles(
+    session: Session,
+    start: datetime.datetime,
+    end: datetime.datetime,
+    latest: bool,
+) -> list[TLE]:
+    """Per object, the latest (or earliest) TLE with epoch in [start, end]."""
+    order = (TLE.epoch.desc(), TLE.id.desc()) if latest else (TLE.epoch, TLE.id)
+    rn = (
+        func.row_number()
+        .over(partition_by=TLE.norad_cat_id, order_by=order)
+        .label("rn")
+    )
+    subq = (
+        select(TLE.id.label("tle_id"), rn)
+        .where(TLE.epoch >= start, TLE.epoch <= end, TLE.norad_cat_id.is_not(None))
+        .subquery()
+    )
+    stmt = select(TLE).join(subq, TLE.id == subq.c.tle_id).where(subq.c.rn == 1)
+    return list(session.execute(stmt).scalars().all())
+
+
 def nearest_tles_for_date(
     session: Session, date: datetime.date, days: float
 ) -> list[TLE]:
-    """Nearest TLE per satellite to 12:00 UTC on `date`, within +/- `days`."""
+    """Nearest TLE per satellite to 12:00 UTC on `date`, within +/- `days`.
+
+    The per-object reduction happens in SQL (one candidate on each side of
+    the center per object), so memory is O(objects), not O(rows in window).
+    """
     center = datetime.datetime.combine(date, datetime.time(12))
     window = datetime.timedelta(days=days)
-    stmt = select(TLE).where(
-        TLE.epoch >= center - window,
-        TLE.epoch <= center + window,
+
+    # Latest at/before center, earliest after: the nearest is one of the two.
+    before = _boundary_tles(session, center - window, center, latest=True)
+    after = _boundary_tles(
+        session,
+        center + datetime.timedelta(microseconds=1),
+        center + window,
+        latest=False,
     )
 
     nearest: dict[int, TLE] = {}
-    for tle in session.execute(stmt).scalars():
-        if tle.norad_cat_id is None:
-            continue
+    for tle in before + after:
+        assert tle.norad_cat_id is not None
         best = nearest.get(tle.norad_cat_id)
         if best is None or abs(tle.epoch - center) < abs(best.epoch - center):
             nearest[tle.norad_cat_id] = tle

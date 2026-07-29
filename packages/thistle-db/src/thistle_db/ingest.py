@@ -1,10 +1,10 @@
 import enum
 import hashlib
 import pathlib
-from typing import Sequence
+from typing import Iterable, cast
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import Table, select
 from sqlalchemy.orm import Session
 
 from thistle_db.config import IngestSource
@@ -20,17 +20,30 @@ from thistle_db.reader import (
 
 CHUNK_SIZE = 5000
 
+# Dedup index columns for ON CONFLICT dialects (SQLite/PostgreSQL); MariaDB
+# uses INSERT IGNORE, which keys off the same unique constraints.
+_TLE_CONFLICT = ["epoch", "line_hash"]
+_OMM_CONFLICT = ["tle_id"]
 
-def _bulk_insert_tles(session: Session, records: list[dict]) -> int:
-    """Bulk insert TLE records with dialect-aware dedup.
+_TLE_TABLE = cast(Table, TLE.__table__)
+_OMM_TABLE = cast(Table, OmmMetadata.__table__)
 
-    Returns count of newly inserted rows.
+
+def _bulk_insert_ignore(
+    session: Session,
+    table: Table,
+    records: list[dict],
+    index_elements: list[str],
+) -> int:
+    """Insert records, silently skipping unique-key duplicates.
+
+    Dialect-aware: ON CONFLICT DO NOTHING (SQLite/PostgreSQL), INSERT IGNORE
+    (MariaDB/MySQL). Returns count of newly inserted rows.
     """
     if not records:
         return 0
 
     dialect = session.bind.dialect.name  # type: ignore[union-attr]
-    table = TLE.__table__
     total_inserted = 0
 
     for i in range(0, len(records), CHUNK_SIZE):
@@ -39,16 +52,16 @@ def _bulk_insert_tles(session: Session, records: list[dict]) -> int:
         if dialect == "sqlite":
             from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-            stmt = sqlite_insert(table).on_conflict_do_nothing(  # type: ignore[arg-type]
-                index_elements=["line1", "line2"]
+            stmt = sqlite_insert(table).on_conflict_do_nothing(
+                index_elements=index_elements
             )
             result = session.execute(stmt, chunk)
             total_inserted += result.rowcount  # type: ignore[attr-defined]
         elif dialect == "postgresql":
             from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-            stmt = pg_insert(table).on_conflict_do_nothing(  # type: ignore[arg-type]
-                index_elements=["line1", "line2"]
+            stmt = pg_insert(table).on_conflict_do_nothing(
+                index_elements=index_elements
             )
             # psycopg3 doesn't populate rowcount for bulk inserts; use RETURNING.
             result = session.execute(stmt.returning(table.c.id), chunk)
@@ -57,7 +70,7 @@ def _bulk_insert_tles(session: Session, records: list[dict]) -> int:
             # mysql / mariadb (and any other INSERT IGNORE dialect)
             from sqlalchemy import insert
 
-            stmt = insert(table).prefix_with("IGNORE")  # type: ignore[arg-type]
+            stmt = insert(table).prefix_with("IGNORE")
             result = session.execute(stmt, chunk)
             total_inserted += result.rowcount  # type: ignore[attr-defined]
         session.commit()
@@ -65,22 +78,28 @@ def _bulk_insert_tles(session: Session, records: list[dict]) -> int:
     return total_inserted
 
 
-def ingest_tles(session: Session, tles: Sequence[TLETuple]) -> int:
+def ingest_tles(session: Session, tles: Iterable[TLETuple]) -> int:
     """Ingest TLE tuples into the database.
 
-    Skips malformed records and duplicates. Returns count of newly inserted rows.
+    Consumes the iterable lazily in CHUNK_SIZE batches, so arbitrarily large
+    inputs (full-catalog restores) never materialize in memory. Skips
+    malformed records and duplicates. Returns count of newly inserted rows.
     """
-    records = []
+    table = _TLE_TABLE
+    total = 0
+    records: list[dict] = []
     for line1, line2 in tles:
         try:
             tle = TLE.from_twoline(line1, line2)
-            now = utcnow()
-            record = _tle_to_record(tle, now)
-            records.append(record)
+            records.append(_tle_to_record(tle))
         except Exception:
             logger.warning(f"Skipping malformed TLE: {line1[:20]}...")
+        if len(records) >= CHUNK_SIZE:
+            total += _bulk_insert_ignore(session, table, records, _TLE_CONFLICT)
+            records = []
 
-    return _bulk_insert_tles(session, records)
+    total += _bulk_insert_ignore(session, table, records, _TLE_CONFLICT)
+    return total
 
 
 def _tle_to_record(tle: TLE, now=None) -> dict:
@@ -93,7 +112,6 @@ def _tle_to_record(tle: TLE, now=None) -> dict:
         if col.name != "id"
     }
     record["created"] = now
-    record["modified"] = now
     return record
 
 
@@ -101,12 +119,12 @@ def ingest_omm(session: Session, omm_records: list[dict]) -> int:
     """Ingest OMM records into the database.
 
     Extracts TLE_LINE1/TLE_LINE2 from each record, inserts into TLE table,
-    then populates OmmMetadata for newly inserted rows.
+    then populates OmmMetadata for rows that don't have it yet.
     Returns count of newly inserted TLE rows.
     """
     # Build TLE records from OMM data
     tle_records = []
-    omm_by_lines: dict[tuple[str, str], dict] = {}
+    omm_by_hash: dict[bytes, dict] = {}
 
     for omm in omm_records:
         line1 = omm.get("TLE_LINE1", "").strip()
@@ -121,41 +139,39 @@ def ingest_omm(session: Session, omm_records: list[dict]) -> int:
             tle = TLE.from_twoline(line1, line2)
             record = _tle_to_record(tle)
             tle_records.append(record)
-            omm_by_lines[(line1, line2)] = omm
+            omm_by_hash[record["line_hash"]] = omm
         except Exception:
             logger.warning(
                 f"Skipping malformed OMM record: {omm.get('OBJECT_NAME', 'unknown')}"
             )
 
     # Bulk insert TLE rows
-    inserted = _bulk_insert_tles(session, tle_records)
+    inserted = _bulk_insert_ignore(session, _TLE_TABLE, tle_records, _TLE_CONFLICT)
 
-    if not omm_by_lines:
+    if not omm_by_hash:
         return inserted
 
-    # FK resolution: SELECT back by (line1, line2) to get IDs
-    line_pairs = list(omm_by_lines.keys())
-    for i in range(0, len(line_pairs), CHUNK_SIZE):
-        chunk = line_pairs[i : i + CHUNK_SIZE]
-        # Query TLE rows that match our line pairs and don't have metadata yet
+    # FK resolution: SELECT back by line_hash to get the TLE ids that still
+    # lack metadata. A single-column IN list — compact and index-backed.
+    hashes = list(omm_by_hash.keys())
+    for i in range(0, len(hashes), CHUNK_SIZE):
+        chunk = hashes[i : i + CHUNK_SIZE]
         stmt = (
-            select(TLE.id, TLE.line1, TLE.line2)
-            .where(
-                TLE.line1.in_([lp[0] for lp in chunk]),
-                TLE.line2.in_([lp[1] for lp in chunk]),
-            )
+            select(TLE.id, TLE.line_hash)
+            .where(TLE.line_hash.in_(chunk))
             .outerjoin(OmmMetadata, TLE.id == OmmMetadata.tle_id)
             .where(OmmMetadata.id.is_(None))
         )
         rows = session.execute(stmt).all()
 
+        now = utcnow()
         metadata_records = []
-        for tle_id, line1, line2 in rows:
-            omm = omm_by_lines.get((line1, line2))
+        for tle_id, line_hash in rows:
+            omm = omm_by_hash.get(line_hash)
             if omm is None:
                 continue
             metadata_records.append(
-                OmmMetadata(
+                dict(
                     tle_id=tle_id,
                     object_name=omm.get("OBJECT_NAME"),
                     object_type=omm.get("OBJECT_TYPE"),
@@ -166,12 +182,11 @@ def ingest_omm(session: Session, omm_records: list[dict]) -> int:
                     decay_date=omm.get("DECAY_DATE"),
                     originator=omm.get("ORIGINATOR"),
                     gp_id=int(omm["GP_ID"]) if omm.get("GP_ID") else None,
+                    created=now,
                 )
             )
 
-        if metadata_records:
-            session.add_all(metadata_records)
-            session.commit()
+        _bulk_insert_ignore(session, _OMM_TABLE, metadata_records, _OMM_CONFLICT)
 
     return inserted
 
@@ -182,17 +197,13 @@ def ingest_file(session: Session, path: pathlib.Path) -> int:
     logger.info(f"Ingesting {path} (format: {fmt})")
 
     if fmt == "tle":
-        tles = read_tle(path)
-        return ingest_tles(session, tles)
+        return ingest_tles(session, read_tle(path))
     elif fmt == "omm_json":
-        records = read_omm_json(path)
-        return ingest_omm(session, records)
+        return ingest_omm(session, read_omm_json(path))
     elif fmt == "omm_csv":
-        records = read_omm_csv(path)
-        return ingest_omm(session, records)
+        return ingest_omm(session, read_omm_csv(path))
     elif fmt == "omm_xml":
-        records = read_omm_xml(path)
-        return ingest_omm(session, records)
+        return ingest_omm(session, read_omm_xml(path))
     else:
         logger.warning(f"Unknown format for {path}, skipping")
         return 0

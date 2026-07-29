@@ -114,6 +114,13 @@ This produces files in the configured output directory:
 - **Date files** (`YYYYMMDD.tle` / `YYYYMMDD.omm`) -- one TLE per satellite for each date (latest epoch that day)
 - **Object files** (`25544.tle` / `25544.omm`) -- all TLEs for a single satellite, ordered by epoch
 
+Generation is **incremental**: each run rewrites date files for a trailing
+epoch window and appends newly ingested rows to object files, so cost
+scales with new data rather than database size. Late-arriving TLEs are
+placed correctly automatically. Run `generate --all` once after ingesting
+pre-existing/historical data (or restoring a backup); routine cron runs
+need no flags.
+
 ## Automating with Cron
 
 thistle-db is designed to run via cron rather than as a long-running service. Both `ingest` and `generate` are idempotent and safe to re-run.
@@ -136,6 +143,49 @@ thistle-db is designed to run via cron rather than as a long-running service. Bo
 ```cron
 0 */4 * * * thistle-db -c /etc/thistle-db/config.toml ingest >> /var/log/thistle-db.log 2>&1 && thistle-db -c /etc/thistle-db/config.toml generate >> /var/log/thistle-db.log 2>&1
 ```
+
+**Weekly integrity sweep** (reconciles every object file against the
+database and repairs any damage the incremental runs can't see):
+
+```cron
+0 4 * * 0 thistle-db -c /etc/thistle-db/config.toml generate --verify
+```
+
+## MariaDB Deployment Tuning
+
+The schema is designed so the hot working set (the dedup and per-object
+indexes) stays small, but server configuration still decides whether inserts
+run at memory speed or disk speed. In rough priority order:
+
+### Must-have
+
+- **`innodb_buffer_pool_size`** — the single setting that matters. The
+  default (128 MB) is far too small for a growing catalog and is the classic
+  cause of ingest performance "falling off a cliff" as the table grows.
+  Size it to comfortably hold the `tle` indexes — roughly 1–2 GB of buffer
+  pool per 10M rows — or simply give it 25–50% of the machine's RAM on a
+  dedicated host. Check the current value with:
+
+  ```sql
+  SHOW VARIABLES LIKE 'innodb_buffer_pool_size';
+  ```
+
+### Nice-to-have
+
+- **`innodb_flush_log_at_trx_commit = 2`** — one log flush per second
+  instead of one per commit. Ingest commits every 5000-row chunk, so this
+  meaningfully speeds bulk loads. The trade: a server crash (not a client
+  crash) can lose up to ~1 second of committed rows — acceptable here
+  because ingest is idempotent and re-running it restores anything lost.
+  Keep the default (`1`) if the database also serves data you cannot
+  re-derive.
+- **`innodb_log_file_size`** (redo log; `innodb_redo_log_capacity` on
+  newer MariaDB) — raise to 1–4 GB if large restores or backfills
+  checkpoint-stall (visible as periodic throughput collapses during bulk
+  ingest). Irrelevant for routine daily deliveries.
+- **`wait_timeout` / `net_write_timeout`** — the defaults are fine for the
+  normal cron cadence; only relevant if you script very long-running custom
+  reads over the same connection.
 
 ## Credential Resolution
 
@@ -173,6 +223,24 @@ Options:
                       (default: $THISTLE_DB_CONFIG if set, else ./config.toml)
 ```
 
+### `generate`
+
+Incremental by default (see *Generate output files* above). Flags:
+
+```bash
+thistle-db generate                    # routine incremental run
+thistle-db generate --all              # full rebuild of every output file
+thistle-db generate --verify           # incremental run + integrity sweep
+thistle-db generate --window-days 90   # override output.window_days
+thistle-db generate --lookback-days 14 # override output.lookback_days
+```
+
+Use `--all` for the first run over historical data, after restoring a
+backup, or after `generate` hasn't run for longer than the lookback.
+`--verify` reconciles every object file against the database and rewrites
+any that disagree (it reads all output files — schedule it weekly rather
+than every run).
+
 ### `get-tle`
 
 Query the database directly and print TLEs to stdout. The positional argument
@@ -209,6 +277,7 @@ MariaDB, etc.):
 ```bash
 thistle-db -c new-config.toml init-db
 thistle-db -c new-config.toml ingest /backups/tles-20260722.tle /backups/tles-20260722.json
+thistle-db -c new-config.toml generate --all
 ```
 
 The export is lossless for element sets (rows store the TLE line text
@@ -216,6 +285,13 @@ verbatim, and dedup is by that exact text), and the JSON carries the OMM
 metadata in Space-Track form so `ingest` reattaches it to the same rows.
 The `ingest_files` change-detection state is deliberately not exported —
 it is a cache; the next scan rebuilds it.
+
+The final `generate --all` matters: a restore resets every row's `created`
+timestamp, which is what incremental generation keys off, so output files
+must be rebuilt once from scratch. This dump/restore cycle is also the
+supported schema-migration path — thistle-db deliberately has no migration
+framework; schema-changing releases document this procedure in their
+release notes.
 
 For *physical* backups of a live server, prefer the native tools: a file
 copy or `VACUUM INTO` for SQLite, `mariadb-dump` / `pg_dump` for the
@@ -244,9 +320,11 @@ server dialects.
 
 ### `[output]`
 
-| Field   | Default      | Description                     |
-| ------- | ------------ | ------------------------------- |
-| `dir`   | `"./output"` | Output directory                |
+| Field           | Default      | Description                                      |
+| --------------- | ------------ | ------------------------------------------------ |
+| `dir`           | `"./output"` | Output directory                                 |
+| `window_days`   | `60`         | Date files: trailing epoch window rewritten each run |
+| `lookback_days` | `7`          | Object files: newly created rows considered each run (must exceed the ingest cron cadence) |
 
 ### `[output.formats]`
 

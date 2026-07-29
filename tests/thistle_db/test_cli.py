@@ -149,9 +149,7 @@ class TestInitDbCommand:
         assert result.exit_code == 0
 
     def test_drop_with_yes_wipes_data(self, cli_env):
-        result = runner.invoke(
-            app, ["-c", str(cli_env), "init-db", "--drop", "--yes"]
-        )
+        result = runner.invoke(app, ["-c", str(cli_env), "init-db", "--drop", "--yes"])
         assert result.exit_code == 0
         assert "Dropped:" in result.stdout
         result = runner.invoke(app, ["-c", str(cli_env), "get-tle", "00022"])
@@ -168,7 +166,9 @@ class TestUninitializedDatabase:
         )
         return config_path
 
-    @pytest.mark.parametrize("command", [["get-tle", "25544"], ["ingest"], ["generate"]])
+    @pytest.mark.parametrize(
+        "command", [["get-tle", "25544"], ["ingest"], ["generate"]]
+    )
     def test_commands_fail_closed(self, uninit_config, tmp_path, command):
         result = runner.invoke(app, ["-c", str(uninit_config), *command])
         assert result.exit_code == 3
@@ -197,7 +197,9 @@ def _table_counts(db_path):
     engine = create_engine(f"sqlite:///{db_path.as_posix()}")
     try:
         with engine.connect() as conn:
-            tles = conn.execute(select(func.count()).select_from(TLE.__table__)).scalar()
+            tles = conn.execute(
+                select(func.count()).select_from(TLE.__table__)
+            ).scalar()
             omms = conn.execute(
                 select(func.count()).select_from(OmmMetadata.__table__)
             ).scalar()
@@ -255,7 +257,10 @@ class TestDumpCommand:
         config_path, db_path = populated
         before = _table_counts(db_path)
         base = tmp_path / "self"
-        assert runner.invoke(app, ["-c", str(config_path), "dump", str(base)]).exit_code == 0
+        assert (
+            runner.invoke(app, ["-c", str(config_path), "dump", str(base)]).exit_code
+            == 0
+        )
         result = runner.invoke(
             app, ["-c", str(config_path), "ingest", str(base.with_suffix(".tle"))]
         )

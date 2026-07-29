@@ -20,6 +20,10 @@ pattern = "*.tle"
 
 [output]
 dir = "./output"
+# Incremental generation tuning (see README):
+# window_days = 60     # date files: trailing epoch window rewritten each run
+# lookback_days = 7    # object files: newly created rows considered each run
+#                      # (must exceed the ingest cron cadence)
 
 [output.formats]
 tle = true

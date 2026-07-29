@@ -4,7 +4,7 @@ import datetime
 import json
 import os
 import pathlib
-from typing import Callable, Iterable, TypeVar, Union
+from typing import Callable, Iterable, Iterator, TypeVar, Union
 
 from sgp4 import omm as sgp4_omm
 
@@ -17,7 +17,7 @@ GroupByKey = TypeVar("GroupByKey")
 
 
 def group_by(
-    tles: list[TLETuple], key: Callable[[TLETuple], GroupByKey]
+    tles: Iterable[TLETuple], key: Callable[[TLETuple], GroupByKey]
 ) -> dict[GroupByKey, list[TLETuple]]:
     """Groups input TLEs by values from a callable key."""
     results: dict[GroupByKey, list[TLETuple]] = {}
@@ -29,7 +29,7 @@ def group_by(
     return results
 
 
-def unique(tles: list[T]) -> list[T]:
+def unique(tles: Iterable[T]) -> list[T]:
     """Returns input as a list list ensuring unique entries."""
     return list(dict.fromkeys(tles).keys())
 
@@ -57,9 +57,12 @@ def tle_satnum(tle: TLETuple) -> str:
 
 def read_tle(
     file: PathLike,
-) -> list[TLETuple]:
-    """Read a single TLE file."""
-    results: list[TLETuple] = []
+) -> Iterator[TLETuple]:
+    """Read a single TLE file, yielding (line1, line2) pairs lazily.
+
+    A generator so that arbitrarily large files (full-catalog restores) can
+    be ingested without materializing every record in memory.
+    """
     with open(file, "r") as f:
         line1: str | None = None
         for raw in f:
@@ -69,15 +72,18 @@ def read_tle(
             if line[0] == "1":
                 line1 = line
             elif line[0] == "2" and line1 is not None:
-                results.append((line1, line))
+                yield (line1, line)
                 line1 = None
-    return results
+
+
+def _read_tle_list(file: PathLike) -> list[TLETuple]:
+    return list(read_tle(file))
 
 
 def read_tles(files: Iterable[PathLike]) -> list[TLETuple]:
     """Read multiple TLE files."""
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = [executor.submit(read_tle, file) for file in files]
+        futures = [executor.submit(_read_tle_list, file) for file in files]
         tles = []
         for future in futures:
             results = future.result()

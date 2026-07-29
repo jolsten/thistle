@@ -4,7 +4,9 @@ import uuid
 
 import pytest
 
-pytest.importorskip("thistle_db", reason="thistle-db not installed (requires Python >= 3.11)")
+pytest.importorskip(
+    "thistle_db", reason="thistle-db not installed (requires Python >= 3.11)"
+)
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
