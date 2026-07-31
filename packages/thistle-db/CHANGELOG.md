@@ -1,16 +1,6 @@
 # Changelog
 
-## [0.9.0] - 2026-07-31
-
-### Added
-
-- Interactive **progress bars** for `ingest` and `generate` (rich, on
-  stderr, anchored at the bottom with log lines rendering above). Enabled
-  only when stderr is a terminal; `--no-progress` (global option) forces
-  them off. Cron runs are unaffected — non-TTY stderr auto-disables.
-- **`--log FILE`** (global option): additionally write logs to a rotating
-  file (10 MB per file, last 10 rotations kept) — crons no longer need
-  shell redirection for logging.
+## [0.10.0] - 2026-07-31
 
 ### Fixed
 
@@ -21,9 +11,26 @@
   file-provided value, and the system secrets file beat the user one. A
   scaffolded-but-unfilled user secrets file (empty strings) no longer masks
   credentials from lower layers.
+
+  **Check your deployment before upgrading**: if credentials differ between
+  layers (e.g. a stale env var alongside current file credentials, or values
+  in both secrets files), the credential actually used may change with this
+  release.
 - `load_config(None)` (library callers, e.g. `thistle_db.get_tles`) now
   honors `$THISTLE_DB_CONFIG` and falls back to `./config.toml`, matching
   the CLI's config discovery.
+
+## [0.9.0] - 2026-07-30
+
+### Added
+
+- Interactive **progress bars** for `ingest` and `generate` (rich, on
+  stderr, anchored at the bottom with log lines rendering above). Enabled
+  only when stderr is a terminal; `--no-progress` (global option) forces
+  them off. Cron runs are unaffected — non-TTY stderr auto-disables.
+- **`--log FILE`** (global option): additionally write logs to a rotating
+  file (10 MB per file, last 10 rotations kept) — crons no longer need
+  shell redirection for logging.
 
 ### Changed
 
