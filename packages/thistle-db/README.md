@@ -138,18 +138,25 @@ thistle-db is designed to run via cron rather than as a long-running service. Bo
 0 3 * * * thistle-db -c /etc/thistle-db/config.toml generate
 ```
 
-**With logging to a file:**
+**With logging to a rotating file** (`--log` caps disk usage at ~10 MB × 10
+rotations — no shell redirection or logrotate needed):
 
 ```cron
-0 */4 * * * thistle-db -c /etc/thistle-db/config.toml ingest >> /var/log/thistle-db.log 2>&1 && thistle-db -c /etc/thistle-db/config.toml generate >> /var/log/thistle-db.log 2>&1
+0 */4 * * * thistle-db -c /etc/thistle-db/config.toml --log /var/log/thistle-db.log ingest && thistle-db -c /etc/thistle-db/config.toml --log /var/log/thistle-db.log generate
 ```
 
 **Weekly integrity sweep** (reconciles every object file against the
 database and repairs any damage the incremental runs can't see):
 
 ```cron
-0 4 * * 0 thistle-db -c /etc/thistle-db/config.toml generate --verify
+0 4 * * 0 thistle-db -c /etc/thistle-db/config.toml --log /var/log/thistle-db.log generate --verify
 ```
+
+The interactive progress bar disables itself automatically when stderr is
+not a terminal, so no extra flags are needed under cron (`--no-progress`
+exists to force it off in an interactive shell). Routine "skipped
+(unchanged file)" lines log at DEBUG; set `[logging] level = "DEBUG"` to
+see them.
 
 ## MariaDB Deployment Tuning
 
@@ -221,7 +228,15 @@ Commands:
 Options:
   -c, --config PATH   Path to config.toml
                       (default: $THISTLE_DB_CONFIG if set, else ./config.toml)
+  --log PATH          Also write logs to this file, rotated at 10 MB with
+                      the last 10 rotations kept (for cron use)
+  --no-progress       Disable the interactive progress bar (auto-disabled
+                      when stderr is not a terminal)
 ```
+
+`ingest` and `generate` show a progress bar on stderr when run
+interactively; command output (`get-tle`, `dump`) always goes to stdout and
+is never mixed with progress rendering.
 
 ### `generate`
 

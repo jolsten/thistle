@@ -129,9 +129,18 @@ Any new bulk-write path must follow this pattern and work on all three dialects.
 
 ## CLI (`cli.py`)
 
-`thistle-db [-c CONFIG] <command>` — the config path defaults to the
-`THISTLE_DB_CONFIG` env var when set (shared with thistle's db fallback),
-else `./config.toml`.
+`thistle-db [-c CONFIG] [--log FILE] [--no-progress] <command>` — the
+config path defaults to the `THISTLE_DB_CONFIG` env var when set (shared
+with thistle's db fallback), else `./config.toml`. Global options:
+
+- `--log FILE` — add a rotating loguru file sink (10 MB rotation, last 10
+  kept) alongside console logging; the cron-friendly alternative to shell
+  redirection.
+- `--no-progress` — force the progress bar off. The bar (rich, stderr,
+  `progress.py`) only appears when stderr is an interactive terminal, so
+  crons never see it; log lines render above the live bar via the shared
+  rich console. Command *output* (get-tle TLEs, dump messages) is stdout
+  and must never route through the progress console.
 
 Commands are privilege-tiered: `init-db` is the only DDL path, `ingest` the
 only DML path, and the read commands (`get-tle`, `generate`, `dump`, plus
@@ -206,12 +215,17 @@ account DML-only rights and readers SELECT-only rights:
 | `reader.py` | format detection + file readers (TLE, OMM JSON/CSV/XML) |
 | `ingest.py` | bulk insert with dedup, source-directory scanning |
 | `generator.py` | output file generation from the database |
+| `progress.py` | shared rich console (stderr) + no-op-able progress reporter |
 
 ## Error handling philosophy
 
 Ingest is tolerant: a malformed TLE or OMM record is logged (loguru, WARNING)
 and skipped — one bad record must never abort a file, and one bad file must
 never abort a scan. A missing source directory is a warning, not an error.
+
+Logging levels: routine no-ops (unchanged files skipped on scan) log at
+DEBUG; per-file actions and per-directory summaries at INFO; data problems
+at WARNING. The INFO log of a steady-state cron run should stay short.
 
 ## Development
 

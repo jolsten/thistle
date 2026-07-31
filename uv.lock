@@ -3363,6 +3363,7 @@ source = { editable = "packages/thistle-db" }
 dependencies = [
     { name = "loguru" },
     { name = "pydantic-settings" },
+    { name = "rich" },
     { name = "sgp4" },
     { name = "sqlalchemy" },
     { name = "typer" },
@@ -3378,6 +3379,7 @@ requires-dist = [
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "pydantic-settings", specifier = ">=2.9.1" },
     { name = "pymysql", marker = "extra == 'mysql'", specifier = ">=1.1" },
+    { name = "rich", specifier = ">=13" },
     { name = "sgp4", specifier = ">=2.24" },
     { name = "sqlalchemy", specifier = ">=2.0.40" },
     { name = "typer", specifier = ">=0.27.0" },

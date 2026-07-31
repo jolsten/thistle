@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from thistle_db.config import OutputConfig
 from thistle_db.model import TLE, epoch_from_lines, utcnow
+from thistle_db.progress import NO_PROGRESS, ProgressReporter
 from thistle_db.reader import OMM_CSV_FIELDS, TLETuple, write_tle
 
 BATCH_SIZE = 50_000
@@ -148,11 +149,14 @@ def generate_date_files(
     output_dir: pathlib.Path,
     config: OutputConfig,
     dates: set[datetime.date],
+    progress: ProgressReporter = NO_PROGRESS,
 ) -> None:
     """(Re)generate one file per date with the latest TLE per object."""
     logger.info(f"Generating date files for {len(dates)} dates")
 
+    task = progress.task("Date files", total=len(dates))
     for date_val in sorted(dates):
+        progress.advance(task)
         tles = _latest_per_object_for_date(session, date_val)
         if not tles:
             continue
@@ -167,6 +171,8 @@ def generate_date_files(
         if config.formats.omm:
             omm_path = output_dir / f"{filename_date}.omm"
             _write_omm_full(omm_path, _omm_records(tles))
+
+    progress.finish(task)
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +424,7 @@ def generate_object_files(
     output_dir: pathlib.Path,
     config: OutputConfig,
     cutoff: Optional[datetime.datetime],
+    progress: ProgressReporter = NO_PROGRESS,
 ) -> None:
     """Generate/refresh one file per satellite.
 
@@ -425,6 +432,9 @@ def generate_object_files(
     object, and append each object's new rows behind the tail guard.
     Full (cutoff None): stream everything and rewrite every object's files.
     """
+    # The object count isn't known until the keyset stream is exhausted, so
+    # this bar is indeterminate (running count instead of a percentage).
+    task = progress.task("Object files", total=None)
     counts = {"appended": 0, "rewritten": 0, "unchanged": 0}
     current_id: Optional[int] = None
     buffer: list[TLE] = []
@@ -437,6 +447,7 @@ def generate_object_files(
             counts["rewritten"] += 1
         else:
             counts[_emit_object(session, output_dir, config, current_id, buffer)] += 1
+        progress.advance(task)
 
     for tle in _keyset_batches(session, cutoff):
         if tle.norad_cat_id != current_id:
@@ -445,6 +456,7 @@ def generate_object_files(
             buffer = []
         buffer.append(tle)
     flush()
+    progress.finish(task)
 
     mode = "full rewrite" if cutoff is None else "incremental"
     logger.info(
@@ -475,7 +487,10 @@ def _count_lines(path: pathlib.Path) -> int:
 
 
 def verify_object_files(
-    session: Session, output_dir: pathlib.Path, config: OutputConfig
+    session: Session,
+    output_dir: pathlib.Path,
+    config: OutputConfig,
+    progress: ProgressReporter = NO_PROGRESS,
 ) -> None:
     """Reconcile every object's .tle file against the database and rewrite
     any that disagree.
@@ -506,8 +521,10 @@ def verify_object_files(
     )
     expected = {norad: count for norad, count in session.execute(stmt)}
 
+    task = progress.task("Verifying object files", total=len(expected))
     repaired = 0
     for norad_id, count in expected.items():
+        progress.advance(task)
         path = output_dir / f"{norad_id}.tle"
         ok = path.exists() and _count_lines(path) == 2 * count
         if ok:
@@ -523,6 +540,7 @@ def verify_object_files(
         if not ok:
             _rewrite_object(session, output_dir, config, norad_id)
             repaired += 1
+    progress.finish(task)
 
     orphans = [
         p.name
@@ -554,6 +572,7 @@ def generate(
     window_days: Optional[int] = None,
     lookback_days: Optional[int] = None,
     verify: bool = False,
+    progress: ProgressReporter = NO_PROGRESS,
 ) -> None:
     """Generate all configured output files.
 
@@ -579,13 +598,13 @@ def generate(
             # that received new rows — catches arbitrarily late deliveries.
             dates = _dates_in_window(session, window_start)
             dates |= _dates_with_new_rows(session, cutoff)
-        generate_date_files(session, output_dir, config, dates)
+        generate_date_files(session, output_dir, config, dates, progress)
 
     if config.types.object_files:
         generate_object_files(
-            session, output_dir, config, None if rebuild_all else cutoff
+            session, output_dir, config, None if rebuild_all else cutoff, progress
         )
         if verify and not rebuild_all:  # --all just rewrote everything
-            verify_object_files(session, output_dir, config)
+            verify_object_files(session, output_dir, config, progress)
 
     logger.info(f"Output generation complete → {output_dir}")

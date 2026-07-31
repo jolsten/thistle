@@ -1,6 +1,7 @@
 import enum
 import hashlib
 import pathlib
+from collections import Counter
 from typing import Iterable, cast
 
 from loguru import logger
@@ -9,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from thistle_db.config import IngestSource
 from thistle_db.model import IngestFile, OmmMetadata, TLE, utcnow
+from thistle_db.progress import NO_PROGRESS, ProgressReporter
 from thistle_db.reader import (
     TLETuple,
     detect_format,
@@ -295,13 +297,21 @@ def ingest_source_file(
 
 
 def ingest_sources(
-    session: Session, sources: list[IngestSource], *, force: bool = False
+    session: Session,
+    sources: list[IngestSource],
+    *,
+    force: bool = False,
+    progress: ProgressReporter = NO_PROGRESS,
 ) -> int:
     """Scan configured source directories and ingest all matching files.
 
     Unchanged files are skipped via the ingest_files state table; a bad file
     is logged and never aborts the scan. Pass force=True to re-ingest
     regardless of recorded state.
+
+    Per-file outcomes log at INFO, except routine skips (unchanged files),
+    which log at DEBUG — on a steady-state scan they are the overwhelming
+    majority and pure noise. Each directory gets an INFO summary line.
     """
     total = 0
     for source in sources:
@@ -315,9 +325,25 @@ def ingest_sources(
             f"Found {len(files)} files in {source_path} matching {source.pattern}"
         )
 
+        task = progress.task(f"Ingesting {source_path.name}", total=len(files))
+        outcomes = Counter()
+        source_total = 0
         for file in files:
             status, count = ingest_source_file(session, file, force=force)
-            logger.info(f"  {file.name}: {status}, {count} new records")
-            total += count
+            level = "DEBUG" if status == FileStatus.SKIPPED else "INFO"
+            logger.log(level, f"  {file.name}: {status}, {count} new records")
+            outcomes[status] += 1
+            source_total += count
+            progress.advance(task)
+        progress.finish(task)
+
+        logger.info(
+            f"{source_path}: {source_total} new records "
+            f"({outcomes[FileStatus.INGESTED]} ingested, "
+            f"{outcomes[FileStatus.SKIPPED]} skipped, "
+            f"{outcomes[FileStatus.REFRESHED]} refreshed, "
+            f"{outcomes[FileStatus.FAILED]} failed)"
+        )
+        total += source_total
 
     return total

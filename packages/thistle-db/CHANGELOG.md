@@ -1,6 +1,24 @@
 # Changelog
 
-## 0.8.0 (unreleased)
+## 0.9.0 (unreleased)
+
+### Added
+
+- Interactive **progress bars** for `ingest` and `generate` (rich, on
+  stderr, anchored at the bottom with log lines rendering above). Enabled
+  only when stderr is a terminal; `--no-progress` (global option) forces
+  them off. Cron runs are unaffected — non-TTY stderr auto-disables.
+- **`--log FILE`** (global option): additionally write logs to a rotating
+  file (10 MB per file, last 10 rotations kept) — crons no longer need
+  shell redirection for logging.
+
+### Changed
+
+- Per-file "skipped (unchanged)" ingest lines moved from INFO to **DEBUG**;
+  steady-state scans no longer flood the log. Each source directory now
+  gets an INFO summary line (`N new records (X ingested, Y skipped, ...)`).
+
+## 0.8.0 (2026-07-29)
 
 Complete storage-layer redesign for scale. At 10M+ rows on MariaDB, ingest
 no longer degrades with table size and `generate` cost scales with new data

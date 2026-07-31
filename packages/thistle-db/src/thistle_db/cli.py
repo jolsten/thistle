@@ -1,3 +1,4 @@
+import dataclasses
 import datetime
 import sys
 from pathlib import Path
@@ -18,6 +19,7 @@ from thistle_db.api import (
 from thistle_db.config import load_config
 from thistle_db.generator import generate as generate_outputs
 from thistle_db.ingest import FileStatus, ingest_source_file, ingest_sources
+from thistle_db.progress import ProgressReporter, console
 
 app = typer.Typer(
     name="thistle-db",
@@ -25,10 +27,45 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 
+LOG_ROTATION = "10 MB"
+LOG_RETENTION = 10
 
-def _setup_logging(level: str) -> None:
+
+@dataclasses.dataclass
+class CliContext:
+    config_path: Path
+    log_file: Optional[Path]
+    no_progress: bool
+
+
+def _setup_logging(level: str, log_file: Optional[Path] = None) -> None:
     logger.remove()
-    logger.add(sys.stderr, level=level.upper())
+    # Console lines go through the shared rich console so they render above
+    # a live progress bar instead of tearing it. Still stderr underneath.
+    logger.add(
+        # soft_wrap: never hard-wrap log lines at the console width (matters
+        # for piped/redirected stderr, where rich assumes 80 columns).
+        lambda message: console.print(
+            message, end="", markup=False, highlight=False, soft_wrap=True
+        ),
+        level=level.upper(),
+        colorize=False,
+    )
+    if log_file is not None:
+        # Rotating file sink for cron use: caps disk usage without external
+        # logrotate. Rotated files are kept (retention) then deleted.
+        logger.add(
+            str(log_file),
+            level=level.upper(),
+            rotation=LOG_ROTATION,
+            retention=LOG_RETENTION,
+        )
+
+
+def _progress(ctx_obj: CliContext) -> ProgressReporter:
+    """Progress bar only when interactive: an explicit --no-progress wins,
+    and non-TTY stderr (cron, redirects) auto-disables it."""
+    return ProgressReporter(enabled=not ctx_obj.no_progress and console.is_terminal)
 
 
 def _open_session_or_exit(config, *, readonly: bool = False):
@@ -146,14 +183,30 @@ def main_callback(
             help="Path to config.toml (default: $THISTLE_DB_CONFIG or ./config.toml)",
         ),
     ] = Path("config.toml"),
+    log: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--log",
+            help="Also write logs to this file, rotated at 10 MB with the "
+            "last 10 rotations kept (for cron use)",
+        ),
+    ] = None,
+    no_progress: Annotated[
+        bool,
+        typer.Option(
+            "--no-progress",
+            help="Disable the interactive progress bar (it is also disabled "
+            "automatically when stderr is not a terminal)",
+        ),
+    ] = False,
 ) -> None:
-    ctx.obj = config
+    ctx.obj = CliContext(config_path=config, log_file=log, no_progress=no_progress)
 
 
 @app.command()
 def init(ctx: typer.Context) -> None:
     """Scaffold config.toml and ~/.config/thistle-db.toml."""
-    config_path: Path = ctx.obj
+    config_path: Path = ctx.obj.config_path
     secrets_path = Path.home() / ".config" / "thistle-db.toml"
 
     created = []
@@ -205,8 +258,8 @@ def init_db_cmd(
     Idempotent: existing tables are left untouched. With --drop, all tables
     are dropped and recreated (asks for confirmation unless --yes).
     """
-    config = load_config(ctx.obj)
-    _setup_logging(config.logging.level)
+    config = load_config(ctx.obj.config_path)
+    _setup_logging(config.logging.level, ctx.obj.log_file)
     url = config.database.url.render_as_string(hide_password=True)
 
     if drop and not yes:
@@ -249,27 +302,32 @@ def ingest(
     ] = False,
 ) -> None:
     """Ingest TLE/OMM files into the database."""
-    config = load_config(ctx.obj)
-    _setup_logging(config.logging.level)
+    config = load_config(ctx.obj.config_path)
+    _setup_logging(config.logging.level, ctx.obj.log_file)
 
     session, engine = _open_session_or_exit(config)
     try:
-        if files:
-            total = 0
-            failed = 0
-            for file in files:
-                # Explicitly named files always parse; state is still recorded.
-                status, count = ingest_source_file(session, file, force=True)
-                if status == FileStatus.FAILED:
-                    failed += 1
-                total += count
-            logger.info(
-                f"Ingested {total} new records from {len(files)} files"
-                + (f" ({failed} failed)" if failed else "")
-            )
-        else:
-            total = ingest_sources(session, config.ingest.sources, force=force)
-            logger.info(f"Ingested {total} new records from configured sources")
+        with _progress(ctx.obj) as progress:
+            if files:
+                task = progress.task("Ingesting files", total=len(files))
+                total = 0
+                failed = 0
+                for file in files:
+                    # Explicitly named files always parse; state is still recorded.
+                    status, count = ingest_source_file(session, file, force=True)
+                    if status == FileStatus.FAILED:
+                        failed += 1
+                    total += count
+                    progress.advance(task)
+                logger.info(
+                    f"Ingested {total} new records from {len(files)} files"
+                    + (f" ({failed} failed)" if failed else "")
+                )
+            else:
+                total = ingest_sources(
+                    session, config.ingest.sources, force=force, progress=progress
+                )
+                logger.info(f"Ingested {total} new records from configured sources")
     finally:
         session.close()
         engine.dispose()
@@ -318,19 +376,21 @@ def generate(
     window plus any date that received new data; object files are appended
     to. Cost scales with new data, not database size.
     """
-    config = load_config(ctx.obj)
-    _setup_logging(config.logging.level)
+    config = load_config(ctx.obj.config_path)
+    _setup_logging(config.logging.level, ctx.obj.log_file)
 
     session, engine = _open_session_or_exit(config, readonly=True)
     try:
-        generate_outputs(
-            session,
-            config.output,
-            rebuild_all=rebuild_all,
-            window_days=window_days,
-            lookback_days=lookback_days,
-            verify=verify,
-        )
+        with _progress(ctx.obj) as progress:
+            generate_outputs(
+                session,
+                config.output,
+                rebuild_all=rebuild_all,
+                window_days=window_days,
+                lookback_days=lookback_days,
+                verify=verify,
+                progress=progress,
+            )
     finally:
         session.close()
         engine.dispose()
@@ -359,8 +419,8 @@ def dump(
     (e.g. SQLite to MariaDB). For physical backups of a live server, prefer
     the native tools (sqlite file copy / mariadb-dump / pg_dump).
     """
-    config = load_config(ctx.obj)
-    _setup_logging(config.logging.level)
+    config = load_config(ctx.obj.config_path)
+    _setup_logging(config.logging.level, ctx.obj.log_file)
 
     tle_path = Path(f"{output}.tle")
     omm_path = Path(f"{output}.json")
@@ -431,8 +491,8 @@ def get_tle(
     """
     parsed = _parse_target(target)
 
-    config = load_config(ctx.obj)
-    _setup_logging(config.logging.level)
+    config = load_config(ctx.obj.config_path)
+    _setup_logging(config.logging.level, ctx.obj.log_file)
 
     session, engine = _open_session_or_exit(config, readonly=True)
     try:
