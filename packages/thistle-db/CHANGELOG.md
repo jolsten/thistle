@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.9.0 (unreleased)
+## [0.9.0] - 2026-07-31
 
 ### Added
 
@@ -12,13 +12,26 @@
   file (10 MB per file, last 10 rotations kept) — crons no longer need
   shell redirection for logging.
 
+### Fixed
+
+- **Credential resolution order now matches the documentation**: env vars >
+  user secrets (`~/.config/thistle-db.toml`) > system secrets file >
+  config.toml values. Previously the order was effectively reversed —
+  `THISTLE_DB_DATABASE__USERNAME`/`__PASSWORD` env vars lost to any
+  file-provided value, and the system secrets file beat the user one. A
+  scaffolded-but-unfilled user secrets file (empty strings) no longer masks
+  credentials from lower layers.
+- `load_config(None)` (library callers, e.g. `thistle_db.get_tles`) now
+  honors `$THISTLE_DB_CONFIG` and falls back to `./config.toml`, matching
+  the CLI's config discovery.
+
 ### Changed
 
 - Per-file "skipped (unchanged)" ingest lines moved from INFO to **DEBUG**;
   steady-state scans no longer flood the log. Each source directory now
   gets an INFO summary line (`N new records (X ingested, Y skipped, ...)`).
 
-## 0.8.0 (2026-07-29)
+## [0.8.0] - 2026-07-29
 
 Complete storage-layer redesign for scale. At 10M+ rows on MariaDB, ingest
 no longer degrades with table size and `generate` cost scales with new data

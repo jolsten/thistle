@@ -1,12 +1,19 @@
+import os
 import tomllib
 from functools import cached_property
 from pathlib import Path
 from typing import Optional
 
 from pydantic import BaseModel
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
 from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.engine import URL
+
+CONFIG_PATH_ENV = "THISTLE_DB_CONFIG"
 
 _READONLY_STMTS = {
     "sqlite": "PRAGMA query_only=ON",
@@ -117,6 +124,39 @@ class Settings(BaseSettings):
     output: OutputConfig = OutputConfig()
     logging: LoggingConfig = LoggingConfig()
 
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        # load_config passes the merged TOML layers as init kwargs, and
+        # pydantic-settings ranks init kwargs above env vars by default —
+        # which would let file values shadow THISTLE_DB_* env vars. Env
+        # vars are the documented highest-priority source, so rank them
+        # above init here.
+        return (env_settings, init_settings, dotenv_settings, file_secret_settings)
+
+
+def _overlay_secrets(db_data: dict, secrets_path: Path) -> None:
+    """Overlay username/password from a secrets TOML onto `db_data`.
+
+    Non-empty values overwrite whatever a lower-priority layer supplied.
+    Empty values are ignored: `thistle-db init` scaffolds the user secrets
+    file with empty strings, and an unfilled scaffold must not mask real
+    credentials from a lower layer.
+    """
+    if not secrets_path.exists():
+        return
+    with open(secrets_path, "rb") as f:
+        secrets = tomllib.load(f)
+    for key in ("username", "password"):
+        if secrets.get(key):
+            db_data[key] = secrets[key]
+
 
 def load_config(path: Path | None = None) -> Settings:
     """Load settings from TOML file with layered credential resolution.
@@ -126,37 +166,29 @@ def load_config(path: Path | None = None) -> Settings:
     2. User secrets (~/.config/thistle-db.toml)
     3. System secrets file (database.secrets_file in config)
     4. Values in config.toml
-    """
-    toml_data: dict = {}
 
-    if path is not None and path.exists():
+    With ``path=None`` the config file is ``$THISTLE_DB_CONFIG`` when set,
+    else ``./config.toml`` — the same default the CLI uses, shared with
+    thistle's db fallback.
+    """
+    if path is None:
+        env_path = os.environ.get(CONFIG_PATH_ENV)
+        path = Path(env_path) if env_path else Path("config.toml")
+
+    toml_data: dict = {}
+    if path.exists():
         with open(path, "rb") as f:
             toml_data = tomllib.load(f)
 
-    # Load system secrets file if specified
+    # Credential layers, applied lowest priority first so each overlays the
+    # one below: config.toml values, then the system secrets file, then the
+    # user secrets file. Env vars beat all of these (Settings ranks env
+    # above init kwargs).
     db_data = toml_data.get("database", {})
-    secrets_file = db_data.get("secrets_file")
-    if secrets_file:
-        secrets_path = Path(secrets_file)
-        if secrets_path.exists():
-            with open(secrets_path, "rb") as f:
-                secrets = tomllib.load(f)
-            # Merge secrets into database config (secrets_file has lower priority
-            # than values already in db_data, which have lower priority than env vars)
-            for key in ("username", "password"):
-                if key in secrets and key not in db_data:
-                    db_data[key] = secrets[key]
-            toml_data["database"] = db_data
-
-    # Load user-local secrets (~/.config/thistle-db.toml)
-    user_secrets_path = Path.home() / ".config" / "thistle-db.toml"
-    if user_secrets_path.exists():
-        with open(user_secrets_path, "rb") as f:
-            user_secrets = tomllib.load(f)
-        for key in ("username", "password"):
-            if key in user_secrets and key not in db_data:
-                db_data[key] = user_secrets[key]
+    if db_data.get("secrets_file"):
+        _overlay_secrets(db_data, Path(db_data["secrets_file"]))
+    _overlay_secrets(db_data, Path.home() / ".config" / "thistle-db.toml")
+    if db_data:
         toml_data["database"] = db_data
 
-    # pydantic-settings handles env var overrides automatically
     return Settings(**toml_data)
