@@ -1,6 +1,7 @@
 """Programmatic query API for the thistle-db database."""
 
 import datetime
+import json
 import pathlib
 
 from sqlalchemy import func, inspect, select
@@ -178,30 +179,41 @@ def dump_db(
         .order_by(*order)
         .execution_options(yield_per=5000)
     )
-    records = []
-    for meta, tle in session.execute(omm_stmt):
-        record = {
-            "TLE_LINE1": tle.line1,
-            "TLE_LINE2": tle.line2,
-            "OBJECT_NAME": meta.object_name,
-            "OBJECT_TYPE": meta.object_type,
-            "COUNTRY_CODE": meta.country_code,
-            "RCS_SIZE": meta.rcs_size,
-            "LAUNCH_DATE": meta.launch_date,
-            "SITE": meta.site,
-            "DECAY_DATE": meta.decay_date,
-            "ORIGINATOR": meta.originator,
-            "GP_ID": meta.gp_id,
-        }
-        records.append({k: v for k, v in record.items() if v is not None})
+    # Stream the JSON array one record per line: the export must scale to
+    # full-catalog dumps, so records are never all held in memory. The file
+    # is only created once the first record arrives.
+    omm_count = 0
+    f = None
+    try:
+        for meta, tle in session.execute(omm_stmt):
+            record = {
+                "TLE_LINE1": tle.line1,
+                "TLE_LINE2": tle.line2,
+                "OBJECT_NAME": meta.object_name,
+                "OBJECT_TYPE": meta.object_type,
+                "COUNTRY_CODE": meta.country_code,
+                "RCS_SIZE": meta.rcs_size,
+                "LAUNCH_DATE": meta.launch_date,
+                "SITE": meta.site,
+                "DECAY_DATE": meta.decay_date,
+                "ORIGINATOR": meta.originator,
+                "GP_ID": meta.gp_id,
+            }
+            record = {k: v for k, v in record.items() if v is not None}
+            if f is None:
+                f = open(omm_path, "w")
+                f.write("[\n")
+            else:
+                f.write(",\n")
+            f.write(json.dumps(record))
+            omm_count += 1
+        if f is not None:
+            f.write("\n]\n")
+    finally:
+        if f is not None:
+            f.close()
 
-    if records:
-        import json
-
-        with open(omm_path, "w") as f:
-            json.dump(records, f, indent=1)
-
-    return tle_count, len(records)
+    return tle_count, omm_count
 
 
 def get_tles(satnum: int, config: Settings | None = None) -> list[tuple[str, str]]:

@@ -291,6 +291,33 @@ class TestDumpCommand:
         assert "not written" in result.stdout
 
 
+class TestIngestCommand:
+    def test_named_file_success_exits_zero(self, cli_env):
+        result = runner.invoke(
+            app, ["-c", str(cli_env), "ingest", str(DATA / "one.json")]
+        )
+        assert result.exit_code == 0
+
+    def test_named_file_failure_exits_nonzero(self, cli_env, tmp_path):
+        # A named file that cannot be ingested must be detectable by the
+        # caller (cron) via the exit code.
+        missing = tmp_path / "missing.tle"
+        result = runner.invoke(app, ["-c", str(cli_env), "ingest", str(missing)])
+        assert result.exit_code == 1
+
+    def test_named_file_failure_does_not_abort_others(self, cli_env, tmp_path):
+        # The good file is still ingested even when another one fails.
+        missing = tmp_path / "missing.tle"
+        result = runner.invoke(
+            app,
+            ["-c", str(cli_env), "ingest", str(missing), str(DATA / "one.json")],
+        )
+        assert result.exit_code == 1
+        # one.json holds VANGUARD 2 (NORAD 11) — it must be queryable now.
+        result = runner.invoke(app, ["-c", str(cli_env), "get-tle", "00011"])
+        assert result.exit_code == 0
+
+
 class TestConfigEnvVar:
     def test_env_var_replaces_flag(self, cli_env, monkeypatch):
         monkeypatch.setenv("THISTLE_DB_CONFIG", str(cli_env))

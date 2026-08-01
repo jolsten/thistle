@@ -159,6 +159,9 @@ account DML-only rights and readers SELECT-only rights:
 - `ingest [FILES...] [--force]` — ingest specific files (always parsed, even
   if recorded as unchanged), or scan all configured sources when no files are
   given; `--force` re-ingests scanned files regardless of recorded state.
+  With named files, any failure yields exit code 1 (after all files are
+  attempted) so cron wrappers can detect it; scans stay tolerant (exit 0,
+  failed files retried next scan).
 - `get-tle TARGET [--days N]` — print TLEs to stdout. `TARGET` is either an
   8-digit date `YYYYMMDD` (→ the nearest TLE per object to 12:00 UTC on that
   date, within ±N days, default 7) or an alpha-5-compatible NORAD ID
@@ -189,6 +192,11 @@ account DML-only rights and readers SELECT-only rights:
       and **appended** to each object's files behind a tail guard (only rows
       strictly newer than the file's last epoch are appended; the file mtime
       distinguishes overlapping-lookback re-runs from genuinely late rows).
+      The mtime watermark assumes ingest and generate never run
+      concurrently — deployments must serialize them (cron chaining with
+      `&&`, or a shared `flock`); a row committed mid-generate could
+      otherwise be misclassified as already on disk until the next
+      `--verify` sweep.
       Any anomaly — late delivery, epoch tie, torn last line, missing or
       inconsistent file — falls back to a full rewrite of that one object
       from the database, which is always authoritative. The `.tle` file is

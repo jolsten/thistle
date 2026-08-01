@@ -153,14 +153,21 @@ def ingest_omm(session: Session, omm_records: list[dict]) -> int:
     if not omm_by_hash:
         return inserted
 
-    # FK resolution: SELECT back by line_hash to get the TLE ids that still
-    # lack metadata. A single-column IN list — compact and index-backed.
-    hashes = list(omm_by_hash.keys())
-    for i in range(0, len(hashes), CHUNK_SIZE):
-        chunk = hashes[i : i + CHUNK_SIZE]
+    # FK resolution: SELECT back the TLE ids that still lack metadata.
+    # The lookup must constrain on epoch AND line_hash: the only index
+    # containing line_hash is UNIQUE(epoch, line_hash), and epoch is its
+    # leading column — line_hash alone would be a full-table scan. The
+    # epoch IN-list can only exclude rows, never wrongly include: a
+    # matching hash implies the row's epoch equals its own record's epoch
+    # (the epoch is encoded in line1).
+    pairs = [(rec["epoch"], rec["line_hash"]) for rec in tle_records]
+    for i in range(0, len(pairs), CHUNK_SIZE):
+        chunk = pairs[i : i + CHUNK_SIZE]
+        epochs = sorted({e for e, _ in chunk})
+        hashes = [h for _, h in chunk]
         stmt = (
             select(TLE.id, TLE.line_hash)
-            .where(TLE.line_hash.in_(chunk))
+            .where(TLE.epoch.in_(epochs), TLE.line_hash.in_(hashes))
             .outerjoin(OmmMetadata, TLE.id == OmmMetadata.tle_id)
             .where(OmmMetadata.id.is_(None))
         )

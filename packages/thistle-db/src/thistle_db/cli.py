@@ -223,6 +223,9 @@ def init(ctx: typer.Context) -> None:
     else:
         secrets_path.parent.mkdir(parents=True, exist_ok=True)
         secrets_path.write_text(SECRETS_TEMPLATE)
+        # Credentials file: owner-only. No-op on Windows (chmod only
+        # toggles the read-only bit there).
+        secrets_path.chmod(0o600)
         created.append(str(secrets_path))
 
     if created:
@@ -323,6 +326,12 @@ def ingest(
                     f"Ingested {total} new records from {len(files)} files"
                     + (f" ({failed} failed)" if failed else "")
                 )
+                if failed:
+                    # Explicitly named files failing is an error the caller
+                    # (cron included) must be able to detect. Directory
+                    # scans stay tolerant: failed files there are retried
+                    # on the next scan by design.
+                    raise typer.Exit(code=1)
             else:
                 total = ingest_sources(
                     session, config.ingest.sources, force=force, progress=progress

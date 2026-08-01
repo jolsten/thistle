@@ -272,7 +272,10 @@ def _omm_tail_epoch(path: pathlib.Path) -> Optional[datetime.datetime]:
             return None
         row = next(csv.reader(io.StringIO(lines[-1])))
         epoch_idx = OMM_CSV_FIELDS.index("EPOCH")
-        return datetime.datetime.strptime(row[epoch_idx], "%Y-%m-%dT%H:%M:%S.%f")
+        # fromisoformat: tolerant of an epoch with zero microseconds
+        # (isoformat omits ".000000"), which strptime with .%f would
+        # reject and misreport as a damaged tail.
+        return datetime.datetime.fromisoformat(row[epoch_idx])
     except Exception:
         return None
 
@@ -356,7 +359,11 @@ def _emit_object(
       tail but created *after* the last write is a late delivery (or an
       epoch tie): it belongs in the middle of the file, so rewrite from the
       database. The mtime comparison assumes ingest and generate run on the
-      same host (the cron deployment model), sharing one clock.
+      same host (the cron deployment model), sharing one clock, and that
+      they never run concurrently: a row committed while generate is
+      between its query and its file write would get created < mtime and
+      be misclassified as already on disk. Serialize the two (cron
+      chaining or flock — see the README); `--verify` remains the backstop.
 
     Returns "appended", "rewritten", or "unchanged" (all rows already on disk).
     """

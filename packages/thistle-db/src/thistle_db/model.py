@@ -48,8 +48,13 @@ def object_id(sat: Satrec) -> str:
     val = sat.intldesg
     if len(val) < 2:
         return val
-    else:
-        return ("20" if int(val[0:2]) < 57 else "19") + val
+    try:
+        year = int(val[0:2])
+    except ValueError:
+        # Non-numeric designator (e.g. "TBA" placeholders): store verbatim
+        # rather than rejecting an otherwise valid TLE as malformed.
+        return val
+    return ("20" if year < 57 else "19") + val
 
 
 def period(sat: Satrec) -> float:

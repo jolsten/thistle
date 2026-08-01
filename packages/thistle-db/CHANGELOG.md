@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.10.0] - 2026-07-31
+## [0.11.0] - 2026-07-31
 
 ### Fixed
 
@@ -19,6 +19,39 @@
 - `load_config(None)` (library callers, e.g. `thistle_db.get_tles`) now
   honors `$THISTLE_DB_CONFIG` and falls back to `./config.toml`, matching
   the CLI's config discovery.
+- A TLE with a non-numeric international designator (e.g. a `TBA`
+  placeholder) is now ingested with the designator stored verbatim instead
+  of being skipped as malformed.
+- An `.omm` output file whose last epoch has zero microseconds is no longer
+  misread as damaged (which caused a harmless but pointless rewrite).
+- TLE parsing in `ingest` now requires the standard `"1 "`/`"2 "` line
+  prefixes (matching the generator's tail guard), so 3LE name lines
+  beginning with a digit can no longer be misread as element lines.
+
+### Changed
+
+- `ingest FILE...` (explicitly named files) now exits non-zero when any
+  named file fails to ingest, so cron wrappers can detect the failure.
+  Directory scans (`ingest` with no arguments) remain tolerant: failed
+  files are logged and retried on the next scan, exit code 0.
+- `dump` streams the OMM JSON export instead of building it in memory —
+  full-catalog dumps now run in constant memory (the `.tle` side already
+  did). The JSON is written one record per line (still a valid array;
+  `ingest` reads it unchanged).
+- OMM ingest resolves TLE foreign keys with an index-backed
+  `(epoch, line_hash)` lookup; previously the lookup was by `line_hash`
+  alone, which required a full-table scan per chunk on large MariaDB
+  catalogs.
+- `init` now creates `~/.config/thistle-db.toml` with owner-only
+  permissions (`0600`) on POSIX systems.
+
+### Documentation
+
+- **Ingest and generate must not run concurrently** — the incremental
+  generator's mtime watermark assumes it. This constraint is now explicit,
+  and the README cron examples with separate entries serialize them with a
+  shared `flock`. (Chained `ingest && generate` entries were always safe;
+  the weekly `--verify` sweep remains the backstop.)
 
 ## [0.9.0] - 2026-07-30
 

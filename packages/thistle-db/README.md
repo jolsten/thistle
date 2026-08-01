@@ -125,17 +125,24 @@ need no flags.
 
 thistle-db is designed to run via cron rather than as a long-running service. Both `ingest` and `generate` are idempotent and safe to re-run.
 
+One rule: **ingest and generate must not run concurrently.** The incremental
+generator uses output-file mtimes to decide what is already on disk, and a
+row committed mid-generate can be misclassified until the next `--verify`
+sweep. Chaining with `&&` (one cron entry) serializes them naturally;
+separate cron entries should share a `flock`.
+
 **Ingest and generate every 4 hours:**
 
 ```cron
 0 */4 * * * thistle-db -c /etc/thistle-db/config.toml ingest && thistle-db -c /etc/thistle-db/config.toml generate
 ```
 
-**Ingest hourly, generate once daily at 03:00 UTC:**
+**Ingest hourly, generate once daily at 03:00 UTC** (the shared lock keeps
+the 03:00 ingest and generate from overlapping):
 
 ```cron
-0 * * * * thistle-db -c /etc/thistle-db/config.toml ingest
-0 3 * * * thistle-db -c /etc/thistle-db/config.toml generate
+0 * * * * flock /run/lock/thistle-db.lock thistle-db -c /etc/thistle-db/config.toml ingest
+0 3 * * * flock /run/lock/thistle-db.lock thistle-db -c /etc/thistle-db/config.toml generate
 ```
 
 **With logging to a rotating file** (`--log` caps disk usage at ~10 MB × 10
@@ -146,10 +153,13 @@ rotations — no shell redirection or logrotate needed):
 ```
 
 **Weekly integrity sweep** (reconciles every object file against the
-database and repairs any damage the incremental runs can't see):
+database and repairs any damage the incremental runs can't see). It runs
+alongside the 4-hourly chain above, so both entries take the shared lock
+to keep the 04:00 Sunday firings from overlapping:
 
 ```cron
-0 4 * * 0 thistle-db -c /etc/thistle-db/config.toml --log /var/log/thistle-db.log generate --verify
+0 */4 * * * flock /run/lock/thistle-db.lock sh -c 'thistle-db -c /etc/thistle-db/config.toml --log /var/log/thistle-db.log ingest && thistle-db -c /etc/thistle-db/config.toml --log /var/log/thistle-db.log generate'
+0 4 * * 0 flock /run/lock/thistle-db.lock thistle-db -c /etc/thistle-db/config.toml --log /var/log/thistle-db.log generate --verify
 ```
 
 The interactive progress bar disables itself automatically when stderr is

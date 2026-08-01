@@ -69,9 +69,12 @@ def read_tle(
             line = raw.rstrip()
             if not line:
                 continue
-            if line[0] == "1":
+            # "1 "/"2 " prefixes (line number + mandatory blank), matching
+            # the generator's tail guard — a bare "1" would also accept
+            # 3LE name lines of satellites whose names start with a digit.
+            if line.startswith("1 "):
                 line1 = line
-            elif line[0] == "2" and line1 is not None:
+            elif line.startswith("2 ") and line1 is not None:
                 yield (line1, line)
                 line1 = None
 

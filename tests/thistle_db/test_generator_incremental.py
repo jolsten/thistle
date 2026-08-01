@@ -206,6 +206,26 @@ def test_date_files_pick_up_late_rows(db_session: Session, outdir):
     assert date_file.read_text().splitlines() == [*TLE_C]
 
 
+def test_omm_tail_epoch_handles_whole_second_epochs(tmp_path):
+    # An epoch with zero microseconds is formatted without ".000000";
+    # the tail parser must read it rather than reporting a damaged tail.
+    import datetime
+
+    from thistle_db.generator import _omm_tail_epoch
+    from thistle_db.reader import OMM_CSV_FIELDS
+
+    row = {field: "" for field in OMM_CSV_FIELDS}
+    row["EPOCH"] = "2025-04-10T02:24:00"
+    path = tmp_path / "900.omm"
+    path.write_text(
+        ",".join(OMM_CSV_FIELDS)
+        + "\n"
+        + ",".join(row[field] for field in OMM_CSV_FIELDS)
+        + "\n"
+    )
+    assert _omm_tail_epoch(path) == datetime.datetime(2025, 4, 10, 2, 24, 0)
+
+
 def test_epoch_from_lines_matches_db(db_session: Session):
     """The tail guard's epoch computation must equal the stored column."""
     from sqlalchemy import select

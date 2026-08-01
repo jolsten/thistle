@@ -131,3 +131,6 @@ dmypy.json
 
 # hatch-vcs
 _version.py
+
+# Ad-hoc source archives shared for review (thistle-db.zip, *.zip.txt, ...)
+/*.zip*
