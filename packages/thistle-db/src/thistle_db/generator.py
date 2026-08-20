@@ -1,20 +1,24 @@
 """Output file generation.
 
-Steady-state cost is O(new rows), independent of catalog size, with no
-persistent generator state:
+Outputs are declared as ``[[output.files]]`` entries — each names a type
+(``date`` or ``object``), a format (``tle`` or ``omm``), a destination
+directory, and a filename scheme (integer vs alpha-5 object IDs, zero
+padding, date format, extension). Steady-state cost is O(new rows),
+independent of catalog size, with no persistent generator state:
 
-- **Date files** (``YYYYMMDD.{tle,omm}``, latest elset per object that day)
-  are rewritten for a trailing epoch window (``output.window_days``) plus any
-  date that actually received new rows in the ingest lookback — so a TLE
-  delivered arbitrarily late still lands in the proper old date file.
-- **Object files** (``NORAD_ID.{tle,omm}``, full epoch-ordered history) are
-  appended to: rows created within ``output.lookback_days`` are streamed in
-  keyset batches ordered by (norad_cat_id, epoch, id) and appended to each
-  object's files. A tail guard makes this idempotent — only rows strictly
-  newer than the file's last epoch are appended, so overlapping lookbacks
-  across cron runs never duplicate. Anything irregular (late delivery, epoch
-  tie at the boundary, torn last line from a crash, missing/odd file) falls
-  back to a full rewrite of that one object from the database, which is
+- **Date files** (latest elset per object that day) are rewritten for a
+  trailing epoch window (``output.window_days``) plus any date that actually
+  received new rows in the ingest lookback — so a TLE delivered arbitrarily
+  late still lands in the proper old date file.
+- **Object files** (full epoch-ordered history per object) are appended to:
+  rows created within ``output.lookback_days`` are streamed in keyset
+  batches ordered by (norad_cat_id, epoch, id) and appended to each object's
+  file in every output. A tail guard makes this idempotent — only rows
+  strictly newer than the file's last epoch are appended, so overlapping
+  lookbacks across cron runs never duplicate. Each output decides
+  independently; anything irregular (late delivery, epoch tie at the
+  boundary, torn last line from a crash, missing/odd file) falls back to a
+  full rewrite of that object's file from the database, which is
   authoritative. The lookback must comfortably exceed the ingest cadence;
   if generation hasn't run for longer than the lookback, run ``--all``.
 """
@@ -31,7 +35,7 @@ from sgp4.exporter import export_omm
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
-from thistle_db.config import OutputConfig
+from thistle_db.config import OutputConfig, OutputFile
 from thistle_db.model import TLE, epoch_from_lines, utcnow
 from thistle_db.progress import NO_PROGRESS, ProgressReporter
 from thistle_db.reader import OMM_CSV_FIELDS, TLETuple, write_tle
@@ -146,12 +150,11 @@ def _coerce_date(raw) -> datetime.date:
 
 def generate_date_files(
     session: Session,
-    output_dir: pathlib.Path,
-    config: OutputConfig,
+    outputs: Sequence[OutputFile],
     dates: set[datetime.date],
     progress: ProgressReporter = NO_PROGRESS,
 ) -> None:
-    """(Re)generate one file per date with the latest TLE per object."""
+    """(Re)generate every date output for `dates` (latest TLE per object)."""
     logger.info(f"Generating date files for {len(dates)} dates")
 
     task = progress.task("Date files", total=len(dates))
@@ -161,16 +164,16 @@ def generate_date_files(
         if not tles:
             continue
 
-        filename_date = date_val.strftime("%Y%m%d")
-
-        if config.formats.tle:
-            tle_path = output_dir / f"{filename_date}.tle"
-            tle_tuples: list[TLETuple] = [(t.line1, t.line2) for t in tles]
-            write_tle(tle_path, tle_tuples)
-
-        if config.formats.omm:
-            omm_path = output_dir / f"{filename_date}.omm"
-            _write_omm_full(omm_path, _omm_records(tles))
+        omm_records: Optional[list[dict]] = None  # shared across omm outputs
+        for out in outputs:
+            path = out.date_path(date_val)
+            if out.format == "tle":
+                tle_tuples: list[TLETuple] = [(t.line1, t.line2) for t in tles]
+                write_tle(path, tle_tuples)
+            else:
+                if omm_records is None:
+                    omm_records = _omm_records(tles)
+                _write_omm_full(path, omm_records)
 
     progress.finish(task)
 
@@ -309,45 +312,49 @@ def _append_tle(path: pathlib.Path, tles: Sequence[TLE]) -> None:
             f.write(f"{tle.line1}\n{tle.line2}\n")
 
 
-def _rewrite_object(
-    session: Session,
-    output_dir: pathlib.Path,
-    config: OutputConfig,
-    norad_id: int,
-) -> None:
-    """Full authoritative rewrite of one object's files from the database."""
+def _fetch_object(session: Session, norad_id: int) -> list[TLE]:
+    """All rows for one object in file order — the authoritative content."""
     stmt = (
         select(TLE)
         .where(TLE.norad_cat_id == norad_id)
         .order_by(TLE.epoch, TLE.id)
         .options(selectinload(TLE.omm_metadata))
     )
-    tles = list(session.execute(stmt).scalars().all())
-    _write_object(output_dir, config, norad_id, tles)
+    return list(session.execute(stmt).scalars().all())
+
+
+def _rewrite_object(
+    session: Session,
+    outputs: Sequence[OutputFile],
+    norad_id: int,
+) -> None:
+    """Full authoritative rewrite of one object's file in every output."""
+    _write_object(outputs, norad_id, _fetch_object(session, norad_id))
 
 
 def _write_object(
-    output_dir: pathlib.Path,
-    config: OutputConfig,
+    outputs: Sequence[OutputFile],
     norad_id: int,
     tles: Sequence[TLE],
 ) -> None:
-    if config.formats.tle:
-        write_tle(output_dir / f"{norad_id}.tle", [(t.line1, t.line2) for t in tles])
-    if config.formats.omm:
-        _write_omm_full(output_dir / f"{norad_id}.omm", _omm_records(tles))
+    omm_records: Optional[list[dict]] = None  # shared across omm outputs
+    for out in outputs:
+        path = out.object_path(norad_id)
+        if out.format == "tle":
+            write_tle(path, [(t.line1, t.line2) for t in tles])
+        else:
+            if omm_records is None:
+                omm_records = _omm_records(tles)
+            _write_omm_full(path, omm_records)
 
 
-def _emit_object(
-    session: Session,
-    output_dir: pathlib.Path,
-    config: OutputConfig,
-    norad_id: int,
-    new_rows: list[TLE],
-) -> str:
-    """Append `new_rows` to one object's files, or rewrite on any anomaly.
+def _output_action(
+    out: OutputFile, norad_id: int, new_rows: list[TLE]
+) -> tuple[str, list[TLE]]:
+    """Decide how `new_rows` reach one output's file for this object.
 
-    Two guards decide, both stateless:
+    Returns ("rewrite" | "append" | "unchanged", pending_rows). Two guards
+    decide, both stateless:
 
     - **Tail epoch**: rows with epoch strictly greater than the file's last
       epoch are provably not on disk — appending them keeps the file sorted.
@@ -365,75 +372,77 @@ def _emit_object(
       be misclassified as already on disk. Serialize the two (cron
       chaining or flock — see the README); `--verify` remains the backstop.
 
-    Returns "appended", "rewritten", or "unchanged" (all rows already on disk).
+    An omm file only holds rows sgp4 could export — for some objects a
+    subset — so its tail can legitimately lag the database. Re-appending a
+    previously seen but unexportable row exports nothing, so it stays
+    harmless; an object with no exportable rows at all keeps no file and
+    rewrites as a no-op whenever it receives rows.
     """
-    if not config.formats.tle and not config.formats.omm:
-        return "unchanged"
-
-    # The .tle file is the tail authority: it records every row verbatim,
-    # while the .omm file only holds rows sgp4 could export — for some
-    # objects that is a subset (or nothing at all), so its tail can
-    # legitimately lag and its absence is not damage. In omm-only configs
-    # the .omm tail is authoritative; re-appending a previously seen but
-    # unexportable row there exports nothing, so it stays harmless.
-    if config.formats.tle:
-        auth_path = output_dir / f"{norad_id}.tle"
-        tail_fn = _tle_tail_epoch
-    else:
-        auth_path = output_dir / f"{norad_id}.omm"
-        tail_fn = _omm_tail_epoch
-
-    if not auth_path.exists():
+    path = out.object_path(norad_id)
+    if not path.exists():
         # New object (or deleted file): a full write is the append.
-        _rewrite_object(session, output_dir, config, norad_id)
-        return "rewritten"
-    tail_epoch = tail_fn(auth_path)
+        return "rewrite", []
+    tail_fn = _tle_tail_epoch if out.format == "tle" else _omm_tail_epoch
+    tail_epoch = tail_fn(path)
     if tail_epoch is None:  # torn/damaged/header-only tail: self-heal
-        _rewrite_object(session, output_dir, config, norad_id)
-        return "rewritten"
-    mtimes = [auth_path.stat().st_mtime]
+        return "rewrite", []
 
-    if config.formats.tle and config.formats.omm:
-        omm_path = output_dir / f"{norad_id}.omm"
-        if omm_path.exists():
-            try:
-                _, ends_clean = _tail_record(omm_path)
-            except OSError:
-                ends_clean = False
-            if not ends_clean:  # torn append (crash between the two files)
-                _rewrite_object(session, output_dir, config, norad_id)
-                return "rewritten"
-            mtimes.append(omm_path.stat().st_mtime)
-
-    # Oldest mtime across present files: conservative — errs toward rewrite.
     watermark = datetime.datetime.fromtimestamp(
-        min(mtimes), datetime.timezone.utc
+        path.stat().st_mtime, datetime.timezone.utc
     ).replace(tzinfo=None)
-
-    late = [t for t in new_rows if t.epoch <= tail_epoch and t.created >= watermark]
-    if late:
-        _rewrite_object(session, output_dir, config, norad_id)
-        return "rewritten"
+    if any(t.epoch <= tail_epoch and t.created >= watermark for t in new_rows):
+        return "rewrite", []
 
     pending = [t for t in new_rows if t.epoch > tail_epoch]
     if not pending:
-        return "unchanged"
+        return "unchanged", []
+    return "append", pending
 
-    if config.formats.tle:
-        _append_tle(output_dir / f"{norad_id}.tle", pending)
-    if config.formats.omm:
-        _append_omm(output_dir / f"{norad_id}.omm", _omm_records(pending))
-    return "appended"
+
+def _emit_object(
+    session: Session,
+    outputs: Sequence[OutputFile],
+    norad_id: int,
+    new_rows: list[TLE],
+) -> str:
+    """Land `new_rows` in one object's file in every output.
+
+    Each output decides independently against its own tail and mtime
+    watermark (see `_output_action`); outputs needing a rewrite are rebuilt
+    together from a single authoritative database fetch.
+
+    Returns the strongest action taken across outputs: "rewritten" >
+    "appended" > "unchanged".
+    """
+    actions = [(out, _output_action(out, norad_id, new_rows)) for out in outputs]
+
+    rewrite_outs = [out for out, (action, _) in actions if action == "rewrite"]
+    if rewrite_outs:
+        _rewrite_object(session, rewrite_outs, norad_id)
+
+    appended = False
+    for out, (action, pending) in actions:
+        if action != "append":
+            continue
+        path = out.object_path(norad_id)
+        if out.format == "tle":
+            _append_tle(path, pending)
+        else:
+            _append_omm(path, _omm_records(pending))
+        appended = True
+
+    if rewrite_outs:
+        return "rewritten"
+    return "appended" if appended else "unchanged"
 
 
 def generate_object_files(
     session: Session,
-    output_dir: pathlib.Path,
-    config: OutputConfig,
+    outputs: Sequence[OutputFile],
     cutoff: Optional[datetime.datetime],
     progress: ProgressReporter = NO_PROGRESS,
 ) -> None:
-    """Generate/refresh one file per satellite.
+    """Generate/refresh one file per satellite in every object output.
 
     Incremental (cutoff set): stream rows created since cutoff, grouped by
     object, and append each object's new rows behind the tail guard.
@@ -450,10 +459,10 @@ def generate_object_files(
         if current_id is None:
             return
         if cutoff is None:
-            _write_object(output_dir, config, current_id, buffer)
+            _write_object(outputs, current_id, buffer)
             counts["rewritten"] += 1
         else:
-            counts[_emit_object(session, output_dir, config, current_id, buffer)] += 1
+            counts[_emit_object(session, outputs, current_id, buffer)] += 1
         progress.advance(task)
 
     for tle in _keyset_batches(session, cutoff):
@@ -472,18 +481,6 @@ def generate_object_files(
     )
 
 
-def _is_date_stem(stem: str) -> bool:
-    """True for YYYYMMDD stems — date files share the output directory with
-    object files and must not be mistaken for orphaned objects."""
-    if len(stem) != 8:
-        return False
-    try:
-        datetime.datetime.strptime(stem, "%Y%m%d")
-        return True
-    except ValueError:
-        return False
-
-
 def _count_lines(path: pathlib.Path) -> int:
     """Count newlines in a file without parsing it (binary chunked read)."""
     count = 0
@@ -495,12 +492,11 @@ def _count_lines(path: pathlib.Path) -> int:
 
 def verify_object_files(
     session: Session,
-    output_dir: pathlib.Path,
-    config: OutputConfig,
+    outputs: Sequence[OutputFile],
     progress: ProgressReporter = NO_PROGRESS,
 ) -> None:
-    """Reconcile every object's .tle file against the database and rewrite
-    any that disagree.
+    """Reconcile every object's tle files against the database and rewrite
+    objects that disagree.
 
     The check is deliberately cheap: one aggregated index-only query for
     per-object row counts, then a newline count per file (2 lines per elset,
@@ -509,15 +505,18 @@ def verify_object_files(
     file. Cost is O(total output size), so this is meant for a periodic
     (e.g. weekly) cron flag, not every run.
 
-    The .tle file is the verification authority (it holds every row
-    verbatim); a rewrite refreshes the object's .omm file too. In omm-only
-    configurations there is no derivable expected count (sgp4 cannot export
-    every elset), so verification is skipped with a warning.
+    The tle outputs are the verification authority (they hold every row
+    verbatim); a failed check rewrites the object's file in *every* output,
+    omm included. Without a tle object output there is no derivable expected
+    count (sgp4 cannot export every elset), so verification is skipped with
+    a warning.
     """
-    if not config.formats.tle:
+    tle_outputs = [o for o in outputs if o.format == "tle"]
+    omm_outputs = [o for o in outputs if o.format == "omm"]
+    if not tle_outputs:
         logger.warning(
-            "--verify requires tle output (the .omm row count is not "
-            "derivable); skipping verification"
+            "--verify requires a tle object output (the omm row count is "
+            "not derivable); skipping verification"
         )
         return
 
@@ -532,36 +531,45 @@ def verify_object_files(
     repaired = 0
     for norad_id, count in expected.items():
         progress.advance(task)
-        path = output_dir / f"{norad_id}.tle"
-        ok = path.exists() and _count_lines(path) == 2 * count
-        if ok:
-            # Line count alone misses a torn (newline-less) final line and
-            # an out-of-step .omm; both checks are cheap.
-            _, ends_clean = _tail_record(path)
-            ok = ends_clean
-        if ok and config.formats.omm:
-            omm_path = output_dir / f"{norad_id}.omm"
-            if omm_path.exists():
-                _, ends_clean = _tail_record(omm_path)
+        ok = True
+        for out in tle_outputs:
+            path = out.object_path(norad_id)
+            ok = path.exists() and _count_lines(path) == 2 * count
+            if ok:
+                # Line count alone misses a torn (newline-less) final line;
+                # the tail check is cheap.
+                _, ends_clean = _tail_record(path)
                 ok = ends_clean
+            if not ok:
+                break
+        if ok:
+            # An omm file may legitimately be absent or hold a subset, but a
+            # present one must at least end cleanly.
+            for out in omm_outputs:
+                omm_path = out.object_path(norad_id)
+                if omm_path.exists():
+                    _, ends_clean = _tail_record(omm_path)
+                    ok = ends_clean
+                    if not ok:
+                        break
         if not ok:
-            _rewrite_object(session, output_dir, config, norad_id)
+            _rewrite_object(session, outputs, norad_id)
             repaired += 1
     progress.finish(task)
 
-    orphans = [
-        p.name
-        for p in output_dir.glob("*.tle")
-        if p.stem.isdigit()
-        and not _is_date_stem(p.stem)
-        and int(p.stem) not in expected
-    ]
-    if orphans:
-        logger.warning(
-            f"Verify: {len(orphans)} object file(s) have no database rows "
-            f"(left untouched): {', '.join(sorted(orphans)[:10])}"
-            + ("…" if len(orphans) > 10 else "")
-        )
+    for out in tle_outputs:
+        orphans = [
+            p.name
+            for p in pathlib.Path(out.dir).glob(f"*{out.ext}")
+            if (nid := out.parse_object_stem(p.stem)) is not None
+            and nid not in expected
+        ]
+        if orphans:
+            logger.warning(
+                f"Verify: {len(orphans)} object file(s) in {out.dir} have no "
+                f"database rows (left untouched): {', '.join(sorted(orphans)[:10])}"
+                + ("…" if len(orphans) > 10 else "")
+            )
 
     logger.info(f"Verified {len(expected)} objects: {repaired} repaired")
 
@@ -581,22 +589,32 @@ def generate(
     verify: bool = False,
     progress: ProgressReporter = NO_PROGRESS,
 ) -> None:
-    """Generate all configured output files.
+    """Generate all configured output files (``config.files``).
 
     Incremental by default; ``rebuild_all=True`` regenerates everything from
     scratch (first run, disaster recovery, or after a gap in cron coverage
     longer than the lookback). ``verify=True`` follows the normal run with a
     full count-reconciliation sweep of object files (see
     ``verify_object_files``) — intended for a periodic cron flag.
+
+    Raises ValueError when no outputs are configured: generating nothing is
+    a misconfiguration, not a no-op (the CLI checks first and exits 2).
     """
-    output_dir = pathlib.Path(config.dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if not config.files:
+        raise ValueError(
+            "no outputs configured — add at least one [[output.files]] entry"
+        )
+
+    date_outputs = [f for f in config.files if f.type == "date"]
+    object_outputs = [f for f in config.files if f.type == "object"]
+    for out in config.files:
+        pathlib.Path(out.dir).mkdir(parents=True, exist_ok=True)
 
     window = window_days if window_days is not None else config.window_days
     lookback = lookback_days if lookback_days is not None else config.lookback_days
     cutoff = utcnow() - datetime.timedelta(days=lookback)
 
-    if config.types.date_files:
+    if date_outputs:
         if rebuild_all:
             dates = _all_dates(session)
         else:
@@ -605,13 +623,14 @@ def generate(
             # that received new rows — catches arbitrarily late deliveries.
             dates = _dates_in_window(session, window_start)
             dates |= _dates_with_new_rows(session, cutoff)
-        generate_date_files(session, output_dir, config, dates, progress)
+        generate_date_files(session, date_outputs, dates, progress)
 
-    if config.types.object_files:
+    if object_outputs:
         generate_object_files(
-            session, output_dir, config, None if rebuild_all else cutoff, progress
+            session, object_outputs, None if rebuild_all else cutoff, progress
         )
         if verify and not rebuild_all:  # --all just rewrote everything
-            verify_object_files(session, output_dir, config, progress)
+            verify_object_files(session, object_outputs, progress)
 
-    logger.info(f"Output generation complete → {output_dir}")
+    dirs = ", ".join(sorted({out.dir for out in config.files}))
+    logger.info(f"Output generation complete → {dirs}")

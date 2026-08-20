@@ -1,5 +1,49 @@
 # Changelog
 
+## [Unreleased]
+
+### Breaking — output config redesigned
+
+`[output]` no longer takes `dir`, `[output.formats]`, or `[output.types]`.
+Outputs are now declared as `[[output.files]]` entries — each one names a
+type, a format, a destination directory, and a filename scheme, so several
+outputs can be generated side by side (different directories per format,
+alpha-5 and integer naming conventions at once, custom extensions):
+
+```toml
+[output]
+window_days = 60
+lookback_days = 7
+
+[[output.files]]
+type = "object"          # "date" | "object"
+format = "tle"           # "tle" | "omm"
+dir = "./output/tle"
+object_id = "alpha5"     # "int" (default) | "alpha5"  -> E5693.tle
+# zero_pad = true        # with object_id = "int": 00900.tle
+# extension = ".txt"     # override the ".tle"/".omm" default
+# date_format = "%Y%m%d" # date files: strftime stem pattern
+```
+
+Old configs fail validation with a pointer at the removed key (`dir`,
+`formats`, `types`) rather than being silently reinterpreted, and there is
+no implicit default: `generate` with no `[[output.files]]` entries prints
+an error and exits 2 (the library `generate()` raises `ValueError`). To
+reproduce the previous behavior, declare the four entries the `init`
+scaffold ships (date + object × tle + omm under `./output`). No database
+change — regenerate outputs with `thistle-db generate --all` after
+switching naming schemes (old files with the previous naming are left
+behind; `--verify` reports them as orphans).
+
+### Changed
+
+- Each output now self-heals independently in the incremental object pass:
+  a missing or damaged file in one output is rewritten from the database
+  without forcing a rewrite of the sibling format (outputs needing a
+  rewrite share one fetch). A deleted `.omm` file is now restored with full
+  history on the next run that touches the object (previously it was
+  recreated with only the pending rows until a `--verify` sweep).
+
 ## [0.11.0] - 2026-07-31
 
 ### Fixed

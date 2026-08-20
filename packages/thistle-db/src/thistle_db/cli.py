@@ -128,8 +128,6 @@ pattern = "*.tle"    # glob pattern for matching files
 # Output generation
 # ----------------------------------------------
 [output]
-dir = "./output"     # directory where generated files are written
-
 # Generation is incremental: each run rewrites date files for a trailing
 # epoch window and appends new rows to object files. Late deliveries are
 # handled automatically; run `thistle-db generate --all` after an outage
@@ -138,17 +136,41 @@ window_days = 60     # date files: trailing window rewritten every run
 lookback_days = 7    # object files: newly created rows considered per run
                      # (must exceed the ingest cron cadence)
 
-# Which output formats to produce
-[output.formats]
-tle = true           # two-line element format (.tle files)
-omm = true           # OMM CSV format (.omm files)
+# Each [[output.files]] entry defines one generated output; `generate`
+# requires at least one entry:
+#   type   = "date"    -> one file per date (latest TLE per satellite)
+#          = "object"  -> one file per satellite (all TLEs, epoch order)
+#   format = "tle"     -> two-line element text
+#          = "omm"     -> OMM CSV
+#   dir    = destination directory (created if missing)
+# Filename options:
+#   object files: object_id = "int" (default) or "alpha5" (always 5 chars,
+#                 e.g. E5693); zero_pad = true pads int IDs to 5 digits
+#   date files:   date_format = strftime stem pattern (default "%Y%m%d")
+#   any:          extension = override the ".tle"/".omm" default suffix
+# Entries may share a directory or use separate ones.
 
-# Which output file types to generate
-[output.types]
-date_files = true    # one file per date: YYYYMMDD.{tle,omm}
-                     # contains the latest TLE per satellite for that date
-object_files = true  # one file per satellite: NORAD_ID.{tle,omm}
-                     # contains all TLEs for that satellite, ordered by epoch
+[[output.files]]
+type = "date"
+format = "tle"
+dir = "./output"
+
+[[output.files]]
+type = "date"
+format = "omm"
+dir = "./output"
+
+[[output.files]]
+type = "object"
+format = "tle"
+dir = "./output"
+# object_id = "alpha5"   # name files E5693.tle instead of 145693.tle
+# zero_pad = true        # 00900.tle instead of 900.tle (with object_id = "int")
+
+[[output.files]]
+type = "object"
+format = "omm"
+dir = "./output"
 
 # ----------------------------------------------
 # Logging
@@ -387,6 +409,14 @@ def generate(
     """
     config = load_config(ctx.obj.config_path)
     _setup_logging(config.logging.level, ctx.obj.log_file)
+
+    if not config.output.files:
+        print(
+            "Error: no outputs configured — add at least one "
+            "[[output.files]] entry to the config",
+            file=sys.stderr,
+        )
+        raise typer.Exit(code=2)
 
     session, engine = _open_session_or_exit(config, readonly=True)
     try:

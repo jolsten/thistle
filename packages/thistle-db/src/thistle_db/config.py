@@ -1,19 +1,26 @@
+import datetime
 import os
+import re
 import tomllib
 from functools import cached_property
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, field_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
 )
+from sgp4.alpha5 import from_alpha5, to_alpha5
 from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.engine import URL
 
 CONFIG_PATH_ENV = "THISTLE_DB_CONFIG"
+
+# Alpha-5 tops out at Z9999, so no real catalog number exceeds this. Lets
+# object-stem parsing reject 8-digit YYYYMMDD date stems numerically.
+MAX_SATNUM = 339_999
 
 _READONLY_STMTS = {
     "sqlite": "PRAGMA query_only=ON",
@@ -86,20 +93,78 @@ class IngestConfig(BaseModel):
     sources: list[IngestSource] = []
 
 
-class OutputFormats(BaseModel):
-    tle: bool = True
-    omm: bool = True
+class OutputFile(BaseModel):
+    """One generated output: a file type + format + destination + naming.
 
+    Declared as ``[[output.files]]`` entries in config.toml. Entries may
+    share a directory (extensions keep them apart) or spread across
+    directories; each is generated independently.
+    """
 
-class OutputTypes(BaseModel):
-    date_files: bool = True
-    object_files: bool = True
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["date", "object"]
+    """"date": one file per epoch date (latest elset per object that day);
+    "object": one file per satellite (full history, epoch order)."""
+    format: Literal["tle", "omm"]
+    """"tle": verbatim two-line text; "omm": OMM CSV."""
+    dir: str = "./output"
+    object_id: Literal["int", "alpha5"] = "int"
+    """Object files: render the NORAD ID as a plain integer or alpha-5
+    (always 5 characters, e.g. 00900, E5693)."""
+    zero_pad: bool = False
+    """Object files with object_id="int": left-pad the ID to 5 digits."""
+    date_format: str = "%Y%m%d"
+    """Date files: strftime pattern for the filename stem."""
+    extension: Optional[str] = None
+    """Filename extension; defaults to ".tle"/".omm" per format."""
+
+    @field_validator("extension")
+    @classmethod
+    def _dot_extension(cls, v: Optional[str]) -> Optional[str]:
+        if v and not v.startswith("."):
+            return f".{v}"
+        return v
+
+    @property
+    def ext(self) -> str:
+        return self.extension if self.extension is not None else f".{self.format}"
+
+    def object_path(self, norad_id: int) -> Path:
+        if self.object_id == "alpha5":
+            stem = to_alpha5(norad_id)
+        elif self.zero_pad:
+            stem = f"{norad_id:05d}"
+        else:
+            stem = str(norad_id)
+        return Path(self.dir) / f"{stem}{self.ext}"
+
+    def date_path(self, date_val: datetime.date) -> Path:
+        return Path(self.dir) / f"{date_val.strftime(self.date_format)}{self.ext}"
+
+    def parse_object_stem(self, stem: str) -> Optional[int]:
+        """The NORAD ID this output's naming assigns to `stem`, or None if
+        the stem cannot name an object file (used for orphan detection —
+        date files sharing the directory must not look like orphans)."""
+        if self.object_id == "alpha5":
+            # 5 chars, leading digit or alpha-5 letter (I and O are invalid).
+            if re.fullmatch(r"[0-9A-HJ-NP-Z][0-9]{4}", stem) is None:
+                return None
+            return from_alpha5(stem)
+        if not stem.isdigit():
+            return None
+        norad_id = int(stem)
+        return norad_id if norad_id <= MAX_SATNUM else None
 
 
 class OutputConfig(BaseModel):
-    dir: str = "./output"
-    formats: OutputFormats = OutputFormats()
-    types: OutputTypes = OutputTypes()
+    # extra="forbid": pre-0.12 keys (dir, formats, types) fail loudly with a
+    # pointer at the key instead of being silently ignored.
+    model_config = ConfigDict(extra="forbid")
+
+    files: list[OutputFile] = []
+    """Outputs to generate. Empty is valid config (ingest-only deployments),
+    but `generate` refuses to run with nothing to produce."""
     window_days: int = 60
     """Date files: trailing epoch window (days) rewritten every run."""
     lookback_days: int = 7

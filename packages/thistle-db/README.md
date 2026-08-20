@@ -109,10 +109,17 @@ Ingestion is idempotent -- duplicate records are silently skipped.
 thistle-db generate
 ```
 
-This produces files in the configured output directory:
+This produces the outputs declared as `[[output.files]]` entries in the
+config. Each entry is one output — a file type, a format (`tle` or `omm`
+CSV), a destination directory, and a filename scheme — so different formats
+can go to different directories, or several naming conventions can be
+generated side by side:
 
-- **Date files** (`YYYYMMDD.tle` / `YYYYMMDD.omm`) -- one TLE per satellite for each date (latest epoch that day)
-- **Object files** (`25544.tle` / `25544.omm`) -- all TLEs for a single satellite, ordered by epoch
+- **Date files** (`type = "date"`) -- one file per date with the latest TLE
+  per satellite (filename from `date_format`, default `YYYYMMDD`)
+- **Object files** (`type = "object"`) -- all TLEs for a single satellite,
+  ordered by epoch, named by NORAD ID: plain integer (`25544.tle`),
+  zero-padded (`00900.tle`), or alpha-5 (`E5693.tle`)
 
 Generation is **incremental**: each run rewrites date files for a trailing
 epoch window and appends newly ingested rows to object files, so cost
@@ -264,7 +271,9 @@ Use `--all` for the first run over historical data, after restoring a
 backup, or after `generate` hasn't run for longer than the lookback.
 `--verify` reconciles every object file against the database and rewrites
 any that disagree (it reads all output files — schedule it weekly rather
-than every run).
+than every run; requires a tle object output).
+
+Exits with status 2 if the config declares no `[[output.files]]` entries.
 
 ### `get-tle`
 
@@ -347,23 +356,24 @@ server dialects.
 
 | Field           | Default      | Description                                      |
 | --------------- | ------------ | ------------------------------------------------ |
-| `dir`           | `"./output"` | Output directory                                 |
+| `files`         | (none)       | Outputs to generate, one `[[output.files]]` entry each; `generate` errors (exit 2) when no entries are configured |
 | `window_days`   | `60`         | Date files: trailing epoch window rewritten each run |
 | `lookback_days` | `7`          | Object files: newly created rows considered each run (must exceed the ingest cron cadence) |
 
-### `[output.formats]`
+### `[[output.files]]`
 
-| Field | Default | Description                 |
-| ----- | ------- | --------------------------- |
-| `tle` | `true`  | Generate .tle output files  |
-| `omm` | `true`  | Generate .omm (CSV) output  |
+One entry per generated output. Entries may share a directory (extensions
+keep them apart) or use separate ones.
 
-### `[output.types]`
-
-| Field          | Default | Description                                        |
-| -------------- | ------- | -------------------------------------------------- |
-| `date_files`   | `true`  | YYYYMMDD files with latest TLE per satellite       |
-| `object_files` | `true`  | Per-satellite files with all TLEs ordered by epoch  |
+| Field         | Default            | Description                                        |
+| ------------- | ------------------ | -------------------------------------------------- |
+| `type`        | (required)         | `"date"` — one file per date, latest TLE per satellite; `"object"` — one file per satellite, all TLEs by epoch |
+| `format`      | (required)         | `"tle"` — two-line text; `"omm"` — OMM CSV         |
+| `dir`         | `"./output"`       | Destination directory (created if missing)          |
+| `object_id`   | `"int"`            | Object files: NORAD ID as `"int"` or `"alpha5"` (always 5 chars, e.g. `00900`, `E5693`) |
+| `zero_pad`    | `false`            | Object files with `object_id = "int"`: pad the ID to 5 digits |
+| `date_format` | `"%Y%m%d"`         | Date files: strftime pattern for the filename stem  |
+| `extension`   | `".tle"`/`".omm"`  | Filename suffix override                            |
 
 ### `[logging]`
 

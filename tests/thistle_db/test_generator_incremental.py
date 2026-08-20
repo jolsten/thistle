@@ -10,7 +10,7 @@ import pathlib
 import pytest
 from sqlalchemy.orm import Session
 
-from thistle_db.config import OutputConfig, OutputFormats, OutputTypes
+from thistle_db.config import OutputConfig, OutputFile
 from thistle_db.generator import generate
 from thistle_db.ingest import ingest_tles
 from thistle_db.model import epoch_from_lines
@@ -36,11 +36,10 @@ TLE_OTHER = (
 
 
 def _config(tmpdir, *, omm: bool = True) -> OutputConfig:
-    return OutputConfig(
-        dir=str(tmpdir),
-        formats=OutputFormats(tle=True, omm=omm),
-        types=OutputTypes(date_files=False, object_files=True),
-    )
+    files = [OutputFile(type="object", format="tle", dir=str(tmpdir))]
+    if omm:
+        files.append(OutputFile(type="object", format="omm", dir=str(tmpdir)))
+    return OutputConfig(files=files)
 
 
 def _object_lines(tmpdir) -> list[str]:
@@ -193,9 +192,7 @@ def test_date_files_pick_up_late_rows(db_session: Session, outdir):
     """Epochs far outside the trailing window still get their date files,
     because the rows were created within the lookback."""
     config = OutputConfig(
-        dir=str(outdir),
-        formats=OutputFormats(tle=True, omm=False),
-        types=OutputTypes(date_files=True, object_files=False),
+        files=[OutputFile(type="date", format="tle", dir=str(outdir))]
     )
     ingest_tles(db_session, [TLE_A, TLE_B, TLE_C])
     generate(db_session, config)

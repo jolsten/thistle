@@ -163,6 +163,10 @@ class TestUninitializedDatabase:
         config_path.write_text(
             f'[database]\ndrivername = "sqlite"\n'
             f'name = "{(tmp_path / "nope.db").as_posix()}"\n'
+            # generate validates output config before touching the database;
+            # an entry keeps this fixture testing the uninitialized-DB path.
+            f'[[output.files]]\ntype = "object"\nformat = "tle"\n'
+            f'dir = "{(tmp_path / "out").as_posix()}"\n'
         )
         return config_path
 
@@ -206,6 +210,14 @@ def _table_counts(db_path):
         return tles, omms
     finally:
         engine.dispose()
+
+
+class TestGenerateCommand:
+    def test_no_outputs_configured_exits_2(self, cli_env):
+        # cli_env's config has no [[output.files]] entries.
+        result = runner.invoke(app, ["-c", str(cli_env), "generate"])
+        assert result.exit_code == 2
+        assert "no outputs configured" in result.stderr
 
 
 class TestDumpCommand:

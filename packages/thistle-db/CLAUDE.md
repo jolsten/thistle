@@ -117,8 +117,11 @@ Any new bulk-write path must follow this pattern and work on all three dialects.
 ## Configuration (`config.py`)
 
 - `config.toml` (path via `-c`, default `./config.toml`), parsed into
-  pydantic-settings models: `[database]`, `[[ingest.sources]]`, `[output]`,
-  `[logging]`.
+  pydantic-settings models: `[database]`, `[[ingest.sources]]`, `[output]`
+  (with `[[output.files]]` entries — see the `generate` command), `[logging]`.
+  `[output]` rejects unknown keys (`extra="forbid"`), so pre-0.12 configs
+  (`dir`, `formats`, `types`) fail validation with a pointer at the key
+  instead of being silently ignored.
 - Database credentials are **never** stored in `config.toml`. Resolution order
   (highest priority first):
   1. Env vars `THISTLE_DB_DATABASE__USERNAME` / `THISTLE_DB_DATABASE__PASSWORD`
@@ -175,12 +178,22 @@ account DML-only rights and readers SELECT-only rights:
   servers belong to native tools (`mariadb-dump`, `pg_dump`, SQLite file
   copy), not this command.
 - `generate [--all] [--window-days N] [--lookback-days N] [--verify]` —
-  write output files per `[output]` config:
-  - `date_files`: `YYYYMMDD.{tle,omm}` — latest element set per satellite for
-    that date.
-  - `object_files`: `NORAD_ID.{tle,omm}` — all element sets for a satellite,
-    ordered by epoch.
-  - Formats toggleable via `[output.formats]` (tle = two-line text, omm = CSV).
+  write output files per `[output]` config. Outputs are declared as
+  `[[output.files]]` entries; each names a `type`, a `format` (`tle` =
+  two-line text, `omm` = CSV), a destination `dir` (created if missing;
+  entries may share or split directories), and a filename scheme. At least
+  one entry is required: with none configured, `generate` prints an error
+  and exits 2 (misconfiguration, not a silent no-op); the library entry
+  point raises `ValueError`. The `init` scaffold ships the standard four
+  entries (date + object files in both formats under `./output`).
+  - `type = "date"`: one file per epoch date — latest element set per
+    satellite for that date. Filename stem from `date_format` (strftime,
+    default `"%Y%m%d"`).
+  - `type = "object"`: one file per satellite — all element sets, ordered
+    by epoch. Filename stem is the NORAD ID, rendered per
+    `object_id = "int"` (default) or `"alpha5"` (always 5 characters, e.g.
+    `00900`, `E5693`); `zero_pad = true` pads int IDs to 5 digits.
+  - `extension` overrides the `.tle`/`.omm` default suffix on any entry.
   - **Incremental by default** — steady-state cost must stay O(new rows),
     independent of catalog size, with no persistent generator state:
     - Date files: rewritten for a trailing epoch window
@@ -189,29 +202,34 @@ account DML-only rights and readers SELECT-only rights:
       old date file.
     - Object files: rows created within `output.lookback_days` (default 7)
       are streamed in keyset batches ordered by `(norad_cat_id, epoch, id)`
-      and **appended** to each object's files behind a tail guard (only rows
-      strictly newer than the file's last epoch are appended; the file mtime
-      distinguishes overlapping-lookback re-runs from genuinely late rows).
+      and **appended** to each object's file in every object output behind
+      a tail guard (only rows strictly newer than the file's last epoch are
+      appended; the file mtime distinguishes overlapping-lookback re-runs
+      from genuinely late rows). Each output decides independently against
+      its own file's tail and mtime.
       The mtime watermark assumes ingest and generate never run
       concurrently — deployments must serialize them (cron chaining with
       `&&`, or a shared `flock`); a row committed mid-generate could
       otherwise be misclassified as already on disk until the next
       `--verify` sweep.
       Any anomaly — late delivery, epoch tie, torn last line, missing or
-      inconsistent file — falls back to a full rewrite of that one object
-      from the database, which is always authoritative. The `.tle` file is
-      the tail authority; the `.omm` file may legitimately hold only a
-      subset (sgp4 cannot export every elset).
+      inconsistent file — falls back to a full rewrite of that object's
+      file from the database, which is always authoritative (outputs
+      needing a rewrite share one fetch). An omm file may legitimately hold
+      only a subset of rows (sgp4 cannot export every elset), so its tail
+      may lag; re-appending a previously seen but unexportable row exports
+      nothing and stays harmless.
     - `--all` rebuilds everything (first run, disaster recovery, or after a
       generation gap longer than the lookback). `lookback_days` must exceed
       the ingest cron cadence.
     - `--verify` follows the normal run with a count-reconciliation sweep:
       per-object database row counts (one aggregated index query) against
-      each `.tle` file's line count, rewriting mismatches — catches damage
-      the tail guard can't see (mid-file truncation/edits, files deleted for
-      quiet objects). Reads all output files, so it belongs on a periodic
-      (e.g. weekly) cron entry, not every run. Requires tle output; the
-      `.tle` file is the verification authority.
+      each tle object output's line count, rewriting failed objects in
+      every output — catches damage the tail guard can't see (mid-file
+      truncation/edits, files deleted for quiet objects). Reads all output
+      files, so it belongs on a periodic (e.g. weekly) cron entry, not
+      every run. Requires a tle object output — tle files hold every row
+      verbatim and are the verification authority.
 
 ## Module map
 
