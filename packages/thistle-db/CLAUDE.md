@@ -52,6 +52,90 @@ Format is auto-detected per file (`reader.detect_format`):
     absorbs the already-seen records). A file that fails to parse gets no
     state recorded, so it is retried next scan. `--force` bypasses skipping.
 
+### Malformed records and quarantine
+
+sgp4's parser is C `strtod`, which accepts the literal text `nan`, `inf` and
+`nan(ind)` in a fixed-width field — exactly what a producer emits when it
+formats a missing value with `printf` — and corrupt text shifts field
+boundaries to the same effect. **Every float column can therefore arrive
+non-finite**, and NaN reaches MariaDB as an unquoted `nan` token that pymysql
+refuses *before* sending SQL, failing the whole insert chunk.
+
+`model._clean_floats` handles this at the one boundary where sgp4 output
+enters the model, driven by the schema's own nullability so a float column
+added later is covered without touching it:
+
+- non-finite in a **nullable** column → `NULL`. `line1`/`line2` remain the
+  lossless source of truth, so a missing derived value costs nothing.
+- non-finite in a **mandatory** element (eccentricity, inclination, RAAN,
+  argument of pericenter, mean anomaly) → `MalformedElsetError`, and the
+  record is rejected. There is no orbit to store: it cannot be propagated or
+  compared, and a row carrying it would be selected by
+  `_latest_per_object_for_date`, *displacing* the object's good elset from
+  that day's output file.
+
+One caveat when writing tests or reproducing a report: whether a `nan` text
+field actually parses to NaN depends on the column *and the process*. Line
+2's plain-float fields are stable, but line 1's `bstar`/`ndot`/`nddot` use
+sgp4's own exponent-format reader, which yields `0.0` instead of NaN once
+numpy has been imported (numpy changes the CRT parse on Windows). A fixture
+built on a `nan` bstar therefore passes standalone and fails under a suite
+that pulls numpy in. Prefer a zero mean motion, whose infinite derived
+values come from arithmetic rather than parsing, and unit-test
+`_clean_floats` directly for the per-column mapping.
+
+No stored float is ever non-finite. Do not relax this by making the
+mandatory columns nullable and flagging invalid rows — that would require
+threading a validity predicate through every read path (both generator
+queries, `tles_for_object`, `nearest_tles_for_date`, `verify_object_files`,
+and thistle's db fallback), and missing one yields silent NaN positions
+downstream.
+
+A second rejection class is the **future-epoch guard**: an elset whose
+epoch runs more than `[ingest] max_epoch_ahead_days` (default 30; 0
+disables) ahead of now is rejected. TLE epochs carry two-digit years
+(00-56 → 2000-2056), so a corrupted epoch field parses *cleanly* into a
+date decades out — and once stored, such a row does two kinds of permanent
+damage: it becomes its object file's tail epoch, so every later legitimate
+elset compares `epoch <= tail` and triggers a full rewrite instead of an
+append, forever; and it plants a junk date file (plus a watermark row)
+that nothing cleans up. Real feeds deliver elsets at most hours to a day
+ahead, so 30 days is generous by orders of magnitude; raise it for
+predicted-elset workflows. The guard is deliberately one-sided — epochs in
+the past are never bounded, so historical archives ingest untouched.
+
+Rejected records are preserved outside the database instead. With
+`[ingest] reject_dir` set, each one is copied to a quarantine directory
+(`rejects.py`) in its source file's own format, mirroring the source tree so
+provenance is visible in the path and a repaired file is directly
+re-ingestable:
+
+    /data/spacetrack/daily/2006/20060101.tle   (source)
+    rejects/daily/2006/20060101.tle            (rejected records, verbatim)
+    rejects/daily/2006/20060101.tle.log        (one reason per record)
+
+Two properties are load-bearing:
+
+- **Live view, not an archive.** Each ingest of a source file overwrites
+  that file's artifacts, and a run with no rejects deletes them. Volume is
+  bounded by what is *currently* broken rather than growing with time, so no
+  retention policy is needed. Partitioning by ingest date would break this
+  (a persistently broken daily feed would write a fresh copy every day, and
+  a backfill would dump every reject into one directory).
+- **Bounded per file.** Past `REJECT_MAX_RECORDS` (10k, a constant — a fuse,
+  not a tuning knob) only a marker with counts and a reason histogram is
+  written. Beyond that cap a file is not a good feed with bad lines but a
+  wrong file (mis-encoded, still gzipped, truncated), and copying it would
+  duplicate the entire delivery.
+
+A quarantine failure is logged and never propagates: it must not turn a
+working ingest into a failed one.
+
+Chunk-level insert failures fall back to row-by-row inserts
+(`ingest._insert_individually`), so a record the database refuses costs only
+itself rather than the 5000-row chunk it was batched with — and, since the
+exception previously propagated out of `ingest_tles`, the rest of the file.
+
 ## Data model (`model.py`)
 
 Single canonical element-set table plus an OMM metadata sidecar. Do **not**
@@ -68,6 +152,16 @@ split OMM into a fully separate element-set table.
 - **`ingest_files`** — per-file ingest state (path, size, mtime_ns, sha256)
   used to skip unchanged source files on scan; keyed by a sha256 of the
   resolved path (bounded length for cross-dialect unique indexes).
+- **`epoch_date_state`** — one row per epoch date holding the newest
+  `created` among that date's element sets; the date pass's scope. Derived
+  data (`date(epoch) -> MAX(created)`), maintained incrementally by ingest
+  and recomputable at any time by `init-db` (`api.rebuild_epoch_date_state`).
+  Two rules are load-bearing: the watermark must be written **in the same
+  transaction** as the rows it describes, so a crash can never leave a date
+  permanently unregenerated; and it holds one row per *date*, not per elset,
+  so checking every date file every run stays affordable as the catalog
+  grows. Rows arriving outside `ingest` (a bulk `COPY`, an admin script)
+  bypass the watermark and need a rebuild — the only realistic drift.
 
 Schema conventions (deliberate, sized for hundreds of millions of rows on
 MariaDB — do not regress them casually):
@@ -117,8 +211,9 @@ Any new bulk-write path must follow this pattern and work on all three dialects.
 ## Configuration (`config.py`)
 
 - `config.toml` (path via `-c`, default `./config.toml`), parsed into
-  pydantic-settings models: `[database]`, `[[ingest.sources]]`, `[output]`
-  (with `[[output.files]]` entries — see the `generate` command), `[logging]`.
+  pydantic-settings models: `[database]`, `[ingest]` (`reject_dir`,
+  `max_epoch_ahead_days`, plus `[[ingest.sources]]` entries), `[output]` (with `[[output.files]]`
+  entries — see the `generate` command), `[logging]`.
   `[output]` rejects unknown keys (`extra="forbid"`), so pre-0.12 configs
   (`dir`, `formats`, `types`) fail validation with a pointer at the key
   instead of being silently ignored.
@@ -156,7 +251,9 @@ account DML-only rights and readers SELECT-only rights:
 - `init` — scaffold `config.toml` and `~/.config/thistle-db.toml`.
 - `init-db [--drop] [--yes]` — create the database schema; the intended DDL
   entry point (run once with an admin account when using MariaDB/PostgreSQL).
-  Idempotent without `--drop`. `--drop` destroys and recreates all tables:
+  Also recomputes `epoch_date_state` from the element sets, which is both
+  the adoption path for an existing database and the repair for rows that
+  were inserted outside `ingest`. Idempotent without `--drop`. `--drop` destroys and recreates all tables:
   it prompts for confirmation, and in non-interactive use fails closed
   unless `--yes` is passed.
 - `ingest [FILES...] [--force]` — ingest specific files (always parsed, even
@@ -194,12 +291,36 @@ account DML-only rights and readers SELECT-only rights:
     `object_id = "int"` (default) or `"alpha5"` (always 5 characters, e.g.
     `00900`, `E5693`); `zero_pad = true` pads int IDs to 5 digits.
   - `extension` overrides the `.tle`/`.omm` default suffix on any entry.
+  - `filename` is a template arranging those pieces, defaulting to
+    `"{id}{ext}"` (object) and `"{date}{ext}"` (date) — an entry that omits
+    it names files exactly as before. Placeholders are `{id}`/`{date}`
+    (rendered per `object_id`/`zero_pad` and `date_format`), `{ext}`,
+    `{format}` and `{type}`; e.g. `filename = "tle_{id}.txt"` →
+    `tle_00900.txt`. Templates are validated at **config load**, not
+    mid-generate: an unknown placeholder, a missing `{id}`/`{date}` (every
+    file would render to one name and overwrite the last), a format spec,
+    or anything containing a path separator or `..` fails there, since a
+    `KeyError` raised while naming the 40,000th file would leave a
+    half-written output tree behind. Directories come from `dir` only.
+    `OutputFile.parse_object_name`/`object_glob` derive the inverse from
+    the same template, so `--verify`'s orphan scan tracks whatever naming
+    is configured.
   - **Incremental by default** — steady-state cost must stay O(new rows),
     independent of catalog size, with no persistent generator state:
-    - Date files: rewritten for a trailing epoch window
-      (`output.window_days`, default 60) plus any date that received new rows
-      within the lookback — so arbitrarily late deliveries land in the right
-      old date file.
+    - Date files: rewritten when the database holds rows **newer than the
+      file**. Scope comes from `epoch_date_state`, a one-row-per-date
+      watermark table ingest maintains in the same transaction as the rows
+      it describes; each date's watermark is compared against that date's
+      file mtime. Because the table grows by a row a day rather than with
+      the catalog, **every** date file is checked on every run — one `stat`
+      per date per output — so there is no trailing window and no lookback
+      for dates. A generation gap of any length, a restore that resets
+      `created`, and a delivery for a date years old all self-correct on
+      the next ordinary run, with no `--all`. The tradeoffs: silent
+      corruption of a file whose watermark is older than it is caught by
+      `--verify` rather than the normal run, and the mtime comparison
+      carries the same requirement as the object pass (ingest and generate
+      must not overlap).
     - Object files: rows created within `output.lookback_days` (default 7)
       are streamed in keyset batches ordered by `(norad_cat_id, epoch, id)`
       and **appended** to each object's file in every object output behind
@@ -222,14 +343,39 @@ account DML-only rights and readers SELECT-only rights:
     - `--all` rebuilds everything (first run, disaster recovery, or after a
       generation gap longer than the lookback). `lookback_days` must exceed
       the ingest cron cadence.
-    - `--verify` follows the normal run with a count-reconciliation sweep:
-      per-object database row counts (one aggregated index query) against
-      each tle object output's line count, rewriting failed objects in
-      every output — catches damage the tail guard can't see (mid-file
+    - `--verify` follows the normal run with a count-reconciliation sweep
+      of **both** file kinds, rewriting whatever disagrees:
+      - object files: per-object database row counts (one aggregated index
+        query) against each tle object output's line count;
+      - date files: per-date distinct object counts (one aggregated query)
+        against each tle date file's line count — the compensating control
+        for the normal run trusting watermarks rather than re-reading
+        files.
+      It catches damage the tail guard can't see (mid-file
       truncation/edits, files deleted for quiet objects). Reads all output
       files, so it belongs on a periodic (e.g. weekly) cron entry, not
-      every run. Requires a tle object output — tle files hold every row
-      verbatim and are the verification authority.
+      every run. Requires a tle output of the kind being verified — tle
+      files hold every row verbatim and are the verification authority.
+
+### Generation performance
+
+Two rules keep generation from regressing:
+
+- **Rows are read as Core column tuples, never ORM entities.** Materializing
+  `TLE` objects cost ~7.6s of a 38s full rebuild and held the whole batch as
+  Python objects. `generator._elset_columns` selects exactly the columns
+  generation reads, and joins `omm_metadata` only when an omm output exists.
+- **Filesystem work runs on a thread pool** (`writer.WritePool`,
+  `output.write_workers`, default auto). Per-file `open`/close was 44% of a
+  full rebuild — pure blocked time, and the GIL is released for it. The pool
+  only ever receives pure filesystem work; the SQLAlchemy `Session` is not
+  thread-safe, so **every query stays on the calling thread** and tasks are
+  handed data already fetched. Work is submitted a chunk of objects at a
+  time, so memory stays bounded and each task owns a distinct path.
+
+`scripts/bench_generate.py` builds a synthetic catalog and times both
+shapes; on 5k objects x 40 days across four outputs, `--all` runs in ~10s
+and a steady-state incremental run in ~2.2s (from 38s and 13.5s).
 
 ## Module map
 
@@ -240,18 +386,26 @@ account DML-only rights and readers SELECT-only rights:
 | `model.py` | SQLAlchemy ORM models (`TLE`, `OmmMetadata`), TLE parsing via sgp4 |
 | `reader.py` | format detection + file readers (TLE, OMM JSON/CSV/XML) |
 | `ingest.py` | bulk insert with dedup, source-directory scanning |
+| `rejects.py` | quarantine for records that could not be ingested |
 | `generator.py` | output file generation from the database |
+| `writer.py` | thread pool for output file writes |
 | `progress.py` | shared rich console (stderr) + no-op-able progress reporter |
 
 ## Error handling philosophy
 
-Ingest is tolerant: a malformed TLE or OMM record is logged (loguru, WARNING)
-and skipped — one bad record must never abort a file, and one bad file must
-never abort a scan. A missing source directory is a warning, not an error.
+Ingest is tolerant: a malformed TLE or OMM record is skipped (and
+quarantined when `reject_dir` is set) — one bad record must never abort a
+file, and one bad file must never abort a scan. A missing source directory
+is a warning, not an error.
 
-Logging levels: routine no-ops (unchanged files skipped on scan) log at
-DEBUG; per-file actions and per-directory summaries at INFO; data problems
-at WARNING. The INFO log of a steady-state cron run should stay short.
+Logging levels: routine no-ops (unchanged files skipped on scan) and
+individual rejected records log at DEBUG; per-file actions and per-directory
+summaries at INFO; data problems at WARNING. Rejections are reported as one
+WARNING per file giving the count **over the total attempted** — the ratio
+is what separates a few bad lines in a good file from an entirely wrong
+file, and a per-record warning would emit thousands of lines for a
+persistently broken feed. The INFO log of a steady-state cron run should
+stay short.
 
 ## Development
 

@@ -1,5 +1,175 @@
 # Changelog
 
+## [Unreleased]
+
+### Breaking — schema and output config
+
+- New `epoch_date_state` table (see below). **Run `thistle-db init-db`
+  after upgrading**: it creates the table and backfills it from the
+  element sets, so no dump/restore is needed. Until it is populated, no
+  date files are generated — `generate` warns rather than silently doing
+  nothing. Re-run `init-db` any time rows are inserted outside `ingest`
+  (a bulk `COPY`, an admin script), since those bypass the watermark.
+- `[output] window_days` and `generate --window-days` are removed. Configs
+  that still set `window_days` fail validation with a pointer at the key
+  (`[output]` is `extra="forbid"`); there is no replacement to set,
+  because date scoping is now exact rather than windowed.
+
+### Fixed
+
+- **A malformed element set no longer costs an entire file's ingest.** sgp4
+  parses TLE fields with C `strtod`, which accepts the literal text `nan`,
+  `inf` and `nan(ind)` — what a producer emits when it formats a missing
+  value with `printf` — so any float field could arrive non-finite. On
+  MariaDB, pymysql refuses NaN while building the statement, *before* any
+  SQL is sent, which failed the whole 5000-row insert chunk and propagated
+  out of `ingest_tles`, losing the rest of the file. On SQLite it was
+  silent: NaN was stored as NULL and `inf` was stored as `inf`.
+
+  Non-finite values are now cleaned where sgp4 output enters the model,
+  driven by the schema's own nullability. Nullable columns (`bstar`,
+  `mean_motion`, `mean_motion_dot`, `mean_motion_ddot`, `semimajor_axis`,
+  `period`, `apoapsis_alt`, `periapsis_alt`) take NULL — `line1`/`line2`
+  remain the lossless source of truth. A non-finite *mandatory* element
+  (eccentricity, inclination, RAAN, argument of pericenter, mean anomaly)
+  means there is no orbit to store, so that record is rejected rather than
+  stored as a row that would displace the object's good elset from a date
+  file. In a 20,000-case fuzz of corrupted lines, ~2.5% of non-finite
+  results fell in the mandatory group; the rest are now stored.
+
+  No schema change: all affected columns were already nullable.
+
+- **A row the database refuses now costs only itself.** `_bulk_insert_ignore`
+  retries a failed chunk row by row, so one unforeseen bad value can no
+  longer take 4999 good records with it.
+
+- `period()` returns NaN (cleaned to NULL) instead of raising `ValueError`
+  for a non-positive semi-major axis, which previously discarded an
+  otherwise storable row.
+
+### Added
+
+- **`filename` on `[[output.files]]` — a template for generated filenames.**
+  Previously only the extension and the stem's rendering were configurable;
+  a template lets the stem carry prefixes and multi-part suffixes:
+
+  ```toml
+  [[output.files]]
+  type = "object"
+  format = "tle"
+  filename = "tle_{id}.txt"    # -> tle_00900.txt
+  zero_pad = true
+  ```
+
+  Placeholders are `{id}` (object outputs) or `{date}` (date outputs),
+  plus `{ext}`, `{format}` and `{type}`. The template only *arranges* the
+  pieces — `object_id`/`zero_pad`, `date_format` and `extension` still
+  decide how each renders. It defaults to `"{id}{ext}"` / `"{date}{ext}"`,
+  so entries that omit it name files exactly as before.
+
+  Templates are validated when the config loads rather than mid-generate:
+  an unknown placeholder, a missing `{id}`/`{date}`, a format spec, or a
+  path separator fails immediately, since a naming error raised partway
+  through a run would leave a half-written output tree behind. `--verify`'s
+  orphan scan derives its glob and its filename parser from the same
+  template, so it tracks whatever naming is configured.
+
+- **`[ingest] max_epoch_ahead_days` — reject elsets whose epoch is too far
+  in the future (default 30 days).** TLE epochs carry two-digit years
+  (00-56 -> 2000-2056), so a corrupted epoch field parses cleanly into a
+  date decades out. Once stored, such a row permanently poisons its object
+  file's tail guard — every later legitimate elset triggers a full rewrite
+  instead of an append — and plants a junk date file nothing cleans up.
+  Rejected elsets are quarantined like any other (see `reject_dir` below).
+
+  The guard is one-sided: past epochs are never bounded, so historical
+  archives ingest exactly as before. Real feeds run at most about a day
+  ahead of now, so the default is generous; raise it for predicted-elset
+  workflows, or set `max_epoch_ahead_days = 0` to disable.
+
+  **Default-on behavior change**: such elsets were previously stored. If
+  one already reached your database, `--verify` will not remove it (it is
+  a valid row); rejecting it going forward starts at the next ingest.
+
+- **`[ingest] reject_dir` — a quarantine directory for records that could
+  not be ingested.** Each rejected record is copied there in its source
+  file's own format, mirroring the source tree, so provenance is visible in
+  the path and a repaired file is directly re-ingestable:
+
+  ```
+  /data/incoming/2006/20060101.tle   (source)
+  rejects/incoming/2006/20060101.tle (rejected records, verbatim)
+  rejects/incoming/2006/20060101.tle.log  (one reason per record)
+  ```
+
+  The directory is a live view of what is currently broken, not an archive:
+  artifacts are overwritten each run and deleted once a file ingests
+  cleanly, so volume is bounded by what is currently broken and no
+  retention policy is needed. Past 10,000 rejected records from one file,
+  only a marker with counts and a reason histogram is written — beyond that
+  the file is not a good feed with bad lines but a wrong file, and copying
+  it would duplicate the whole delivery.
+
+  Unset by default, so existing deployments are unchanged; the `init`
+  scaffold ships it enabled at `./rejects`.
+
+### Changed
+
+- **`generate` is 4-6x faster.** On a synthetic 5k-object / 40-day catalog
+  across four outputs, a full rebuild went from 38.2s to 10.0s and a
+  steady-state incremental run from 13.5s to 2.2s. Four changes, in order
+  of what they bought:
+
+  - **Date files are rewritten only when they are older than their rows.**
+    Previously every date in the trailing `window_days` (default 60) was
+    re-queried and rewritten on every run, whether or not it had new data —
+    10.2s of the 13.5s incremental run, and O(catalog x window) rather than
+    the O(new rows) the design calls for.
+
+    Scope now comes from a new `epoch_date_state` table: one row per epoch
+    date holding the newest `created` among that date's elsets, maintained
+    by ingest in the same transaction as the rows it describes. A run
+    compares each date's watermark against that date's file mtime — one
+    `stat` per date per output — and rewrites only what is genuinely stale.
+
+    **`[output] window_days` and `--window-days` are gone**, and
+    `lookback_days` no longer affects date files at all. Because the table
+    grows by a row a day rather than with the catalog, every date file is
+    checked on every run, so a generation gap of any length, a restore that
+    resets `created`, and a delivery for a date years old all self-correct
+    on the next ordinary run — no `generate --all` rule for date files.
+
+    **Behavior change worth noting**: a date file that is silently
+    corrupted — truncated or hand-edited, so its mtime is *newer* than its
+    watermark — is no longer repaired by the next run. `--verify` now
+    covers date files for exactly this reason; if you relied on the window
+    rewrite as self-healing, add `--verify` to a periodic cron entry.
+
+  - **Output writes run on a thread pool**, sized by the new
+    `[output] write_workers` (0 = auto, 1 = serial). Per-file `open`/close
+    was 44% of a full rebuild — blocked time that releases the GIL.
+  - **Rows load as Core column tuples instead of ORM entities**, which was
+    ~7.6s of the full rebuild; `omm_metadata` is joined only when an omm
+    output exists.
+  - **Cheaper serialization**: one write per TLE file instead of two
+    `print` calls per record, and `csv.writer` over pre-ordered rows
+    instead of `DictWriter`.
+
+  Output content is unchanged — OMM export still goes through sgp4's
+  `export_omm`, so generated files are byte-identical.
+
+- `--verify` now reconciles **date files** as well as object files, using
+  per-date distinct object counts against each tle date file's line count.
+
+- `scripts/bench_generate.py` builds a synthetic catalog and times both
+  generation shapes, so the numbers above stay reproducible.
+
+- Individual rejected records now log at DEBUG. Each file instead gets one
+  WARNING reporting rejections **over the total attempted**
+  (`3 of 30000 records rejected -> ...`) — the ratio distinguishes a few bad
+  lines from an entirely wrong file, and a persistently broken feed no
+  longer emits thousands of warning lines per run.
+
 ## [0.12.0] - 2026-08-19
 
 ### Breaking — output config redesigned

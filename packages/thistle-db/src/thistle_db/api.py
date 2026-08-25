@@ -4,12 +4,12 @@ import datetime
 import json
 import pathlib
 
-from sqlalchemy import func, inspect, select
+from sqlalchemy import delete, func, insert, inspect, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from thistle_db.config import Settings, load_config
-from thistle_db.model import TLE, Base
+from thistle_db.model import TLE, Base, EpochDateState, date_from_sql
 
 
 def init_db(config: Settings, drop: bool = False) -> dict[str, list[str]]:
@@ -33,6 +33,7 @@ def init_db(config: Settings, drop: bool = False) -> dict[str, list[str]]:
             before = set()
         Base.metadata.create_all(engine)
         after = set(inspect(engine).get_table_names()) & model_tables
+        rebuild_epoch_date_state(engine)
         return {
             "dropped": dropped,
             "created": sorted(after - before),
@@ -40,6 +41,50 @@ def init_db(config: Settings, drop: bool = False) -> dict[str, list[str]]:
         }
     finally:
         engine.dispose()
+
+
+def rebuild_epoch_date_state(engine: Engine) -> int:
+    """Recompute `epoch_date_state` from `tle`. Returns the row count.
+
+    The table is derived (`date(epoch) -> MAX(created)`), maintained
+    incrementally by ingest in the same transaction as the rows it
+    describes. This recomputes it from scratch, which is always correct and
+    is needed in three cases:
+
+    - **Adoption.** On a database that predates the table it starts empty,
+      and an empty table means no date file looks stale — generation would
+      silently write nothing. This backfill is the migration path, so an
+      existing deployment upgrades with one statement instead of a
+      dump/restore cycle.
+    - **Rows inserted outside `ingest`** (a bulk `COPY`/`mysqlimport`, an
+      admin script): those dates' watermarks were never bumped, so their
+      output files would never regenerate. This is the only realistic drift
+      in normal operation.
+    - **Bugs** in any future write path that forgets to bump a watermark.
+
+    Crashes are deliberately *not* on that list: the watermark commits with
+    its rows, so a partial ingest cannot leave the table behind.
+
+    Runs as part of `init_db`, which is the only DDL path and is already
+    idempotent — `generate` could not do this even if it wanted to, since
+    the read tier opens read-only connections.
+    """
+    date_expr = func.date(TLE.epoch)
+    with engine.begin() as conn:
+        conn.execute(delete(EpochDateState))
+        source = (
+            select(date_expr, func.max(TLE.created))
+            .where(TLE.epoch.is_not(None))
+            .group_by(date_expr)
+        )
+        rows = [
+            {"epoch_date": date_from_sql(raw), "last_created": last}
+            for raw, last in conn.execute(source)
+            if raw is not None
+        ]
+        if rows:
+            conn.execute(insert(EpochDateState), rows)
+    return len(rows)
 
 
 class DatabaseNotInitializedError(RuntimeError):

@@ -115,6 +115,23 @@ name = "thistle-db.db"
 #   .csv                ->  OMM CSV
 #   .xml                ->  OMM XML
 
+[ingest]
+# Records that cannot be stored (unparseable text, elsets whose mandatory
+# elements are not finite numbers, rows the database refuses) are copied
+# here in their source format for later inspection, mirroring the source
+# tree: ./incoming/20260824.tle -> ./rejects/incoming/20260824.tle (+ .log).
+# Artifacts are overwritten each run and removed once a file ingests
+# cleanly, so the directory always shows only what is currently broken and
+# needs no retention policy. Comment out to drop rejects after logging.
+reject_dir = "./rejects"
+
+# Reject element sets whose epoch is more than this many days in the future
+# (0 disables). A corrupted epoch field parses cleanly into 2000-2056 and,
+# once stored, permanently degrades that object's incremental output. Real
+# feeds run at most ~1 day ahead; raise this if you ingest predicted
+# element sets. Past epochs are never bounded (archives ingest untouched).
+# max_epoch_ahead_days = 30
+
 [[ingest.sources]]
 path = "./incoming"
 pattern = "*.tle"    # glob pattern for matching files
@@ -128,13 +145,13 @@ pattern = "*.tle"    # glob pattern for matching files
 # Output generation
 # ----------------------------------------------
 [output]
-# Generation is incremental: each run rewrites date files for a trailing
-# epoch window and appends new rows to object files. Late deliveries are
-# handled automatically; run `thistle-db generate --all` after an outage
-# longer than lookback_days.
-window_days = 60     # date files: trailing window rewritten every run
+# Generation is incremental: date files are rewritten when their rows are
+# newer than the file, and new rows are appended to object files. Late
+# deliveries are handled automatically.
 lookback_days = 7    # object files: newly created rows considered per run
                      # (must exceed the ingest cron cadence)
+# write_workers = 0  # threads used for output file writes; 0 = auto
+                     # (CPU count x 4, capped), 1 = write serially
 
 # Each [[output.files]] entry defines one generated output; `generate`
 # requires at least one entry:
@@ -148,6 +165,9 @@ lookback_days = 7    # object files: newly created rows considered per run
 #                 e.g. E5693); zero_pad = true pads int IDs to 5 digits
 #   date files:   date_format = strftime stem pattern (default "%Y%m%d")
 #   any:          extension = override the ".tle"/".omm" default suffix
+#                 filename = template arranging the pieces, default
+#                   "{id}{ext}" / "{date}{ext}" — e.g. "tle_{id}.txt".
+#                   Placeholders: {id} or {date}, {ext}, {format}, {type}.
 # Entries may share a directory or use separate ones.
 
 [[output.files]]
@@ -330,6 +350,10 @@ def ingest(
     config = load_config(ctx.obj.config_path)
     _setup_logging(config.logging.level, ctx.obj.log_file)
 
+    reject_dir = (
+        Path(config.ingest.reject_dir) if config.ingest.reject_dir else None
+    )
+
     session, engine = _open_session_or_exit(config)
     try:
         with _progress(ctx.obj) as progress:
@@ -339,7 +363,14 @@ def ingest(
                 failed = 0
                 for file in files:
                     # Explicitly named files always parse; state is still recorded.
-                    status, count = ingest_source_file(session, file, force=True)
+                    # No source root, so their rejects land flat under reject_dir.
+                    status, count = ingest_source_file(
+                        session,
+                        file,
+                        force=True,
+                        reject_dir=reject_dir,
+                        max_epoch_ahead_days=config.ingest.max_epoch_ahead_days,
+                    )
                     if status == FileStatus.FAILED:
                         failed += 1
                     total += count
@@ -356,7 +387,12 @@ def ingest(
                     raise typer.Exit(code=1)
             else:
                 total = ingest_sources(
-                    session, config.ingest.sources, force=force, progress=progress
+                    session,
+                    config.ingest.sources,
+                    force=force,
+                    reject_dir=reject_dir,
+                    max_epoch_ahead_days=config.ingest.max_epoch_ahead_days,
+                    progress=progress,
                 )
                 logger.info(f"Ingested {total} new records from configured sources")
     finally:
@@ -375,14 +411,6 @@ def generate(
             "recovery, or after a generation gap longer than the lookback)",
         ),
     ] = False,
-    window_days: Annotated[
-        Optional[int],
-        typer.Option(
-            "--window-days",
-            help="Override output.window_days: trailing epoch window (days) of "
-            "date files rewritten each run",
-        ),
-    ] = None,
     lookback_days: Annotated[
         Optional[int],
         typer.Option(
@@ -403,9 +431,9 @@ def generate(
 ) -> None:
     """Generate output TLE/OMM files from the database.
 
-    Incremental by default: date files are rewritten for a trailing epoch
-    window plus any date that received new data; object files are appended
-    to. Cost scales with new data, not database size.
+    Incremental by default: date files are rewritten when the database has
+    rows newer than the file, and object files are appended to. Cost scales
+    with new data, not database size.
     """
     config = load_config(ctx.obj.config_path)
     _setup_logging(config.logging.level, ctx.obj.log_file)
@@ -425,7 +453,6 @@ def generate(
                 session,
                 config.output,
                 rebuild_all=rebuild_all,
-                window_days=window_days,
                 lookback_days=lookback_days,
                 verify=verify,
                 progress=progress,

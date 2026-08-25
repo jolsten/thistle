@@ -94,6 +94,15 @@ def read_tles(files: Iterable[PathLike]) -> list[TLETuple]:
     return tles
 
 
+def render_tle(tles: Iterable[TLETuple]) -> str:
+    """Render element sets as two-line text, ready for a single write.
+
+    One join and one write instead of two `print` calls per record: writing
+    a full catalog was 800k `print` calls, all of them buffered churn.
+    """
+    return "".join(f"{line1}\n{line2}\n" for line1, line2 in tles)
+
+
 def write_tle(
     file_path: PathLike,
     tles: Iterable[TLETuple],
@@ -109,9 +118,7 @@ def write_tle(
         tles = sorted(tles, key=tle_satnum)
 
     with open(file_path, "w") as f:
-        for line1, line2 in tles:
-            print(line1, file=f)
-            print(line2, file=f)
+        f.write(render_tle(tles))
 
 
 def write_tles(

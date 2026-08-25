@@ -1,6 +1,6 @@
 import datetime
 import hashlib
-from math import degrees, pi, sqrt
+from math import degrees, isfinite, nan, pi, sqrt
 from typing import Optional
 
 from sgp4.alpha5 import to_alpha5
@@ -8,6 +8,7 @@ from sgp4.api import Satrec
 from sgp4.conveniences import sat_epoch_datetime
 from sqlalchemy import (
     BigInteger,
+    Date,
     DateTime,
     Double,
     Float,
@@ -58,9 +59,19 @@ def object_id(sat: Satrec) -> str:
 
 
 def period(sat: Satrec) -> float:
-    """Calculate orbital period [min]"""
+    """Calculate orbital period [min]
+
+    Returns NaN rather than raising for a semi-major axis that is not a
+    positive finite number — a malformed elset must not cost the whole row
+    here; `_clean_floats` decides what a non-finite value means per column.
+    """
     a_km = sat.a * sat.radiusearthkm
-    return 2 * pi * sqrt(a_km**3 / sat.mu)
+    if not a_km > 0:  # false for NaN, zero and negative alike
+        return nan
+    try:
+        return 2 * pi * sqrt(a_km**3 / sat.mu)
+    except OverflowError:  # a_km**3 beyond float range
+        return nan
 
 
 def mean_motion(sat: Satrec) -> float:
@@ -85,6 +96,16 @@ class Base(DeclarativeBase):
         float: Double(),
         datetime.datetime: EpochDateTime,
     }
+
+
+def date_from_sql(raw) -> datetime.date:
+    """Coerce a `func.date()` result to a `datetime.date`.
+
+    SQLite returns it as a string, MariaDB and PostgreSQL as a date.
+    """
+    if isinstance(raw, datetime.date):
+        return raw
+    return datetime.date.fromisoformat(str(raw))
 
 
 def utcnow() -> datetime.datetime:
@@ -215,30 +236,81 @@ def epoch_from_lines(line1: str, line2: str) -> datetime.datetime:
     return sat_epoch_datetime(sat).replace(tzinfo=None)
 
 
+class MalformedElsetError(ValueError):
+    """A TLE parsed, but a mandatory element is not a finite number.
+
+    Raised by `_clean_floats`; `ingest` catches it per record, so one such
+    elset is quarantined and skipped without costing the rest of the file.
+    """
+
+
+# Nullability comes from the schema itself rather than a hand-maintained
+# list, so a float column added later is covered without touching
+# `_clean_floats`.
+_NULLABLE = {col.name: col.nullable for col in TLE.__table__.columns}
+
+
+def _clean_floats(fields: dict) -> dict:
+    """Replace non-finite floats with None, or reject the elset.
+
+    sgp4's parser is C `strtod`, which accepts the literal text "nan",
+    "inf" and "nan(ind)" in a fixed-width field — exactly what a producer
+    emits when it formats a missing value — and shifted field boundaries in
+    corrupt text produce the same. Every float column can therefore arrive
+    non-finite, and NaN reaches MariaDB as an unquoted `nan` token that the
+    driver refuses *before* sending SQL, failing the whole insert chunk.
+
+    Nullable columns take None: line1/line2 remain the lossless source of
+    truth, so a missing derived value costs nothing. A non-finite *mandatory*
+    element (eccentricity, inclination, RAAN, argument of pericenter, mean
+    anomaly) means there is no orbit to store — the elset cannot be
+    propagated or compared — so the record is rejected instead of being
+    stored as a row that would displace good data in generated output.
+    """
+    unusable = []
+    for name, value in fields.items():
+        if isinstance(value, float) and not isfinite(value):
+            if _NULLABLE.get(name, True):
+                fields[name] = None
+            else:
+                unusable.append(f"{name}={value}")
+    if unusable:
+        raise MalformedElsetError(
+            f"non-finite mandatory element(s): {', '.join(sorted(unusable))}"
+        )
+    return fields
+
+
 def _fields_from_satrec(sat: Satrec) -> dict:
-    """Extract orbital element fields from a populated Satrec object."""
+    """Extract orbital element fields from a populated Satrec object.
+
+    Non-finite values are cleaned at this boundary — the one place sgp4
+    output enters the model — so no other code path has to know about NaN.
+    """
     epoch = sat_epoch_datetime(sat).replace(tzinfo=None)
-    return dict(
-        object_id=object_id(sat),
-        norad_cat_id=sat.satnum,
-        classification=sat.classification,
-        epoch=epoch,
-        mean_motion=mean_motion(sat),
-        eccentricity=sat.ecco,
-        inclination=degrees(sat.inclo),
-        ra_of_asc_node=degrees(sat.nodeo),
-        arg_of_pericenter=degrees(sat.argpo),
-        mean_anomaly=degrees(sat.mo),
-        ephemeris_type=sat.ephtype,
-        element_set_no=sat.elnum,
-        rev_at_epoch=sat.revnum,
-        bstar=sat.bstar,
-        mean_motion_dot=sat.ndot,
-        mean_motion_ddot=sat.nddot,
-        semimajor_axis=sat.a * sat.radiusearthkm,
-        period=period(sat),
-        apoapsis_alt=sat.alta * sat.radiusearthkm,
-        periapsis_alt=sat.altp * sat.radiusearthkm,
+    return _clean_floats(
+        dict(
+            object_id=object_id(sat),
+            norad_cat_id=sat.satnum,
+            classification=sat.classification,
+            epoch=epoch,
+            mean_motion=mean_motion(sat),
+            eccentricity=sat.ecco,
+            inclination=degrees(sat.inclo),
+            ra_of_asc_node=degrees(sat.nodeo),
+            arg_of_pericenter=degrees(sat.argpo),
+            mean_anomaly=degrees(sat.mo),
+            ephemeris_type=sat.ephtype,
+            element_set_no=sat.elnum,
+            rev_at_epoch=sat.revnum,
+            bstar=sat.bstar,
+            mean_motion_dot=sat.ndot,
+            mean_motion_ddot=sat.nddot,
+            semimajor_axis=sat.a * sat.radiusearthkm,
+            period=period(sat),
+            apoapsis_alt=sat.alta * sat.radiusearthkm,
+            periapsis_alt=sat.altp * sat.radiusearthkm,
+        )
     )
 
 
@@ -259,6 +331,31 @@ class OmmMetadata(Base, Mixin):
     decay_date: Mapped[Optional[str]] = mapped_column(String(10))
     originator: Mapped[Optional[str]] = mapped_column(String(20))
     gp_id: Mapped[Optional[int]] = mapped_column()
+
+
+class EpochDateState(Base):
+    """When each epoch date last received a row — the date pass's scope.
+
+    Derived data: always recomputable as ``date(epoch) -> MAX(created)`` over
+    ``tle`` (``init-db`` does exactly that). Maintained incrementally by
+    ingest so the generator can ask "which date files are older than the rows
+    they should hold?" without scanning the element-set table.
+
+    One row per *date*, so it grows by one row a day rather than with the
+    catalog — which is what lets the generator check every date file on every
+    run instead of guessing with a trailing window.
+
+    The watermark must be written in the **same transaction** as the rows it
+    describes (see `ingest._bulk_insert_ignore`). If a chunk could commit
+    without its watermark, that date's files would never regenerate and only
+    a rebuild would notice.
+    """
+
+    __tablename__ = "epoch_date_state"
+
+    epoch_date: Mapped[datetime.date] = mapped_column(Date, primary_key=True)
+    last_created: Mapped[datetime.datetime]
+    """Newest `created` among rows with an epoch on this date."""
 
 
 class IngestFile(Base, Mixin):

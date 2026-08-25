@@ -1,12 +1,14 @@
 import datetime
+import glob
 import os
 import re
 import tomllib
 from functools import cached_property
 from pathlib import Path
+from string import Formatter
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -18,9 +20,25 @@ from sqlalchemy.engine import URL
 
 CONFIG_PATH_ENV = "THISTLE_DB_CONFIG"
 
+# Default for [ingest] max_epoch_ahead_days — how far into the future an
+# elset's epoch may run before ingest rejects it. Real feeds deliver elsets
+# at most hours to a day ahead of now, so 30 days is generous by orders of
+# magnitude while still catching corrupted epoch fields, which parse
+# cleanly into 2000-2056 (TLE years are two digits, 00-56 -> 20xx).
+DEFAULT_MAX_EPOCH_AHEAD_DAYS = 30
+
 # Alpha-5 tops out at Z9999, so no real catalog number exceeds this. Lets
-# object-stem parsing reject 8-digit YYYYMMDD date stems numerically.
+# object-name parsing reject 8-digit YYYYMMDD date stems numerically.
 MAX_SATNUM = 339_999
+
+# Filename template placeholders. The per-file one ({id}/{date}) is required
+# in its output type — without it every file of that output would render to
+# the same name and overwrite the last.
+_REQUIRED_PLACEHOLDER = {"object": "id", "date": "date"}
+_ALLOWED_PLACEHOLDERS = {
+    "object": {"id", "ext", "format", "type"},
+    "date": {"date", "ext", "format", "type"},
+}
 
 _READONLY_STMTS = {
     "sqlite": "PRAGMA query_only=ON",
@@ -91,6 +109,25 @@ class IngestSource(BaseModel):
 
 class IngestConfig(BaseModel):
     sources: list[IngestSource] = []
+    reject_dir: Optional[str] = None
+    """Quarantine directory for records that could not be ingested.
+
+    Unset (the default) keeps the previous behavior: rejected records are
+    logged and dropped. When set, each rejected record is copied there in
+    its source file's format for later inspection — see `rejects.py` for
+    the layout and its bounded-volume guarantees."""
+    max_epoch_ahead_days: int = Field(default=DEFAULT_MAX_EPOCH_AHEAD_DAYS, ge=0)
+    """Reject elsets whose epoch is more than this many days in the future.
+
+    A corrupted epoch field parses cleanly into 2000-2056 (two-digit TLE
+    years), and once stored such a row permanently poisons its object
+    file's tail guard — every later legitimate elset triggers a full
+    rewrite instead of an append — and plants a junk date file nothing
+    cleans up. Real feeds run at most hours to a day ahead of now, so the
+    default (30) is generous; raise it for predicted-elset workflows, or
+    set 0 to disable the guard entirely. One-sided: epochs in the past are
+    never bounded, so historical archives ingest untouched. Rejected
+    records are quarantined like any other (see `reject_dir`)."""
 
 
 class OutputFile(BaseModel):
@@ -115,9 +152,19 @@ class OutputFile(BaseModel):
     zero_pad: bool = False
     """Object files with object_id="int": left-pad the ID to 5 digits."""
     date_format: str = "%Y%m%d"
-    """Date files: strftime pattern for the filename stem."""
+    """Date files: strftime pattern for the `{date}` placeholder."""
     extension: Optional[str] = None
-    """Filename extension; defaults to ".tle"/".omm" per format."""
+    """The `{ext}` placeholder; defaults to ".tle"/".omm" per format."""
+    filename: Optional[str] = None
+    """Filename template, e.g. "tle_{id}.txt" or "{date}_gp{ext}".
+
+    Defaults to "{id}{ext}" for object outputs and "{date}{ext}" for date
+    outputs, so an entry that doesn't set this behaves exactly as before.
+    The template only arranges the pieces — `object_id`/`zero_pad`,
+    `date_format` and `extension` still decide how each renders.
+
+    Placeholders: `{id}` (object outputs, required there), `{date}` (date
+    outputs, required there), `{ext}`, `{format}`, `{type}`."""
 
     @field_validator("extension")
     @classmethod
@@ -126,34 +173,137 @@ class OutputFile(BaseModel):
             return f".{v}"
         return v
 
+    @model_validator(mode="after")
+    def _check_filename(self) -> "OutputFile":
+        """Reject a bad template at config load, not mid-generate.
+
+        A KeyError raised while naming the 40,000th file would leave a
+        half-written output tree behind, so unknown placeholders, a missing
+        required one, and anything that would escape `dir` fail here.
+        """
+        if self.filename is None:
+            return self
+        if not self.filename.strip():
+            raise ValueError("filename template is empty")
+
+        required = _REQUIRED_PLACEHOLDER[self.type]
+        allowed = _ALLOWED_PLACEHOLDERS[self.type]
+        seen: set[str] = set()
+        for literal, field, spec, conversion in Formatter().parse(self.filename):
+            if any(sep in literal for sep in ("/", "\\")) or ".." in literal:
+                raise ValueError(
+                    f"filename template {self.filename!r} must name a file, "
+                    "not a path — use `dir` for the destination directory"
+                )
+            if field is None:
+                continue
+            if field not in allowed:
+                raise ValueError(
+                    f"unknown placeholder {{{field}}} in filename template "
+                    f"{self.filename!r} for {self.type} outputs; available: "
+                    + ", ".join(f"{{{name}}}" for name in sorted(allowed))
+                )
+            if spec or conversion:
+                raise ValueError(
+                    f"placeholder {{{field}}} in filename template "
+                    f"{self.filename!r} may not carry a format spec"
+                )
+            seen.add(field)
+        if required not in seen:
+            raise ValueError(
+                f"filename template {self.filename!r} for {self.type} outputs must "
+                f"contain {{{required}}}, or files would overwrite each other"
+            )
+        return self
+
     @property
     def ext(self) -> str:
         return self.extension if self.extension is not None else f".{self.format}"
 
-    def object_path(self, norad_id: int) -> Path:
+    @property
+    def template(self) -> str:
+        """The filename template in force, explicit or default."""
+        if self.filename is not None:
+            return self.filename
+        return "{id}{ext}" if self.type == "object" else "{date}{ext}"
+
+    def _fixed(self, field: str) -> str:
+        """Value of a placeholder that doesn't vary per file."""
+        return {"ext": self.ext, "format": self.format, "type": self.type}[field]
+
+    def object_stem(self, norad_id: int) -> str:
+        """The `{id}` placeholder's value for `norad_id`."""
         if self.object_id == "alpha5":
-            stem = to_alpha5(norad_id)
-        elif self.zero_pad:
-            stem = f"{norad_id:05d}"
-        else:
-            stem = str(norad_id)
-        return Path(self.dir) / f"{stem}{self.ext}"
+            return to_alpha5(norad_id)
+        if self.zero_pad:
+            return f"{norad_id:05d}"
+        return str(norad_id)
+
+    def object_path(self, norad_id: int) -> Path:
+        name = self.template.format(
+            id=self.object_stem(norad_id),
+            ext=self.ext,
+            format=self.format,
+            type=self.type,
+        )
+        return Path(self.dir) / name
 
     def date_path(self, date_val: datetime.date) -> Path:
-        return Path(self.dir) / f"{date_val.strftime(self.date_format)}{self.ext}"
+        name = self.template.format(
+            date=date_val.strftime(self.date_format),
+            ext=self.ext,
+            format=self.format,
+            type=self.type,
+        )
+        return Path(self.dir) / name
 
-    def parse_object_stem(self, stem: str) -> Optional[int]:
-        """The NORAD ID this output's naming assigns to `stem`, or None if
-        the stem cannot name an object file (used for orphan detection —
-        date files sharing the directory must not look like orphans)."""
-        if self.object_id == "alpha5":
+    @cached_property
+    def _object_name_re(self) -> re.Pattern:
+        """Regex matching filenames this output's template produces.
+
+        Built from the template so the inverse always tracks the forward
+        rendering: literals escaped, `{id}` captured, the fixed placeholders
+        substituted.
+        """
+        # zero_pad only pads; a 6-digit ID stays 6 digits, and an unpadded
+        # leftover file should still be recognizable. So both int modes
+        # accept a bare run of digits, bounded below by MAX_SATNUM.
+        id_pattern = (
             # 5 chars, leading digit or alpha-5 letter (I and O are invalid).
-            if re.fullmatch(r"[0-9A-HJ-NP-Z][0-9]{4}", stem) is None:
-                return None
-            return from_alpha5(stem)
-        if not stem.isdigit():
+            r"[0-9A-HJ-NP-Z][0-9]{4}"
+            if self.object_id == "alpha5"
+            else r"[0-9]+"
+        )
+        parts = []
+        for literal, field, _, _ in Formatter().parse(self.template):
+            parts.append(re.escape(literal))
+            if field is None:
+                continue
+            parts.append(f"({id_pattern})" if field == "id" else re.escape(self._fixed(field)))
+        return re.compile("".join(parts))
+
+    def object_glob(self) -> str:
+        """Glob matching this output's object files, for the orphan scan."""
+        parts = []
+        for literal, field, _, _ in Formatter().parse(self.template):
+            parts.append(glob.escape(literal))
+            if field is None:
+                continue
+            parts.append("*" if field == "id" else glob.escape(self._fixed(field)))
+        return "".join(parts)
+
+    def parse_object_name(self, name: str) -> Optional[int]:
+        """The NORAD ID this output's naming assigns to filename `name`, or
+        None if `name` cannot be one of its object files (used for orphan
+        detection — date files sharing the directory must not look like
+        orphans)."""
+        match = self._object_name_re.fullmatch(name)
+        if match is None:
             return None
-        norad_id = int(stem)
+        raw = match.group(1)
+        if self.object_id == "alpha5":
+            return from_alpha5(raw)
+        norad_id = int(raw)
         return norad_id if norad_id <= MAX_SATNUM else None
 
 
@@ -165,13 +315,17 @@ class OutputConfig(BaseModel):
     files: list[OutputFile] = []
     """Outputs to generate. Empty is valid config (ingest-only deployments),
     but `generate` refuses to run with nothing to produce."""
-    window_days: int = 60
-    """Date files: trailing epoch window (days) rewritten every run."""
     lookback_days: int = 7
     """Object files: rows created within this many days are (re)considered.
 
     Must comfortably exceed the ingest/generate cron cadence; after an outage
     longer than this, run `generate --all`."""
+    write_workers: int = 0
+    """Threads used for output file writes. 0 = auto (CPU count x 4, capped).
+
+    Generation is dominated by per-file syscall latency, which releases the
+    GIL, so a pool recovers most of it. Set to 1 to write serially — for
+    debugging, or a network filesystem that dislikes concurrent writes."""
 
 
 class LoggingConfig(BaseModel):

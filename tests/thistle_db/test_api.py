@@ -81,7 +81,7 @@ def test_get_tles_config_from_env(db_path, monkeypatch):
     assert get_tles(22) == [TLES[0], TLES[1]]
 
 
-MODEL_TABLES = {"tle", "omm_metadata", "ingest_files"}
+MODEL_TABLES = {"tle", "omm_metadata", "ingest_files", "epoch_date_state"}
 
 
 def _settings_from_url(url_str: str) -> Settings:

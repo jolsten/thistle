@@ -14,20 +14,38 @@
 drivername = "sqlite"
 name = "tle.db"
 
+[ingest]
+# Records that cannot be stored (unparseable text, elsets whose mandatory
+# elements are not finite numbers, rows the database refuses) are copied
+# here in their source format for inspection, mirroring the source tree:
+#   /data/incoming/2006/x.tle  ->  rejects/incoming/2006/x.tle  (+ .log)
+# The directory is a live view of what is currently broken — artifacts are
+# overwritten each run and removed once a file ingests cleanly — so it needs
+# no retention policy. Unset (the default) drops rejects after logging them.
+# reject_dir = "./rejects"
+# Reject elsets whose epoch is more than this many days ahead of now
+# (0 disables; past epochs are never bounded). Corrupted epoch fields parse
+# into 2000-2056 and would permanently degrade that object's incremental
+# output. Raise for predicted-elset workflows.
+# max_epoch_ahead_days = 30
+
 [[ingest.sources]]
 path = "/data/incoming"
 pattern = "*.tle"
 
 [output]
 # Incremental generation tuning (see README):
-# window_days = 60     # date files: trailing epoch window rewritten each run
 # lookback_days = 7    # object files: newly created rows considered each run
 #                      # (must exceed the ingest cron cadence)
+# write_workers = 0    # threads for output writes; 0 = auto, 1 = serial
 
 # One [[output.files]] entry per generated output. type: "date" | "object";
 # format: "tle" | "omm". Object filenames: object_id = "int" | "alpha5",
 # zero_pad = true pads int IDs to 5 digits. Date filenames: date_format
 # (strftime, default "%Y%m%d"). extension overrides ".tle"/".omm".
+# filename is a template arranging those pieces, default "{id}{ext}" for
+# object outputs and "{date}{ext}" for date outputs; e.g. "tle_{id}.txt" or
+# "{date}_gp{ext}". Placeholders: {id} or {date}, {ext}, {format}, {type}.
 
 [[output.files]]
 type = "date"

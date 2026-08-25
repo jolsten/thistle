@@ -5,6 +5,7 @@ can have many elsets. sgp4 does not validate checksums, and dedup is on the
 exact text, so edited lines are distinct valid records.
 """
 
+import os
 import pathlib
 
 import pytest
@@ -232,3 +233,236 @@ def test_epoch_from_lines_matches_db(db_session: Session):
     ingest_tles(db_session, [TLE_A])
     row = db_session.execute(select(TLE)).scalar_one()
     assert row.epoch == epoch_from_lines(*TLE_A)
+
+
+# ---------------------------------------------------------------------------
+# Date files: rewrite only what changed
+# ---------------------------------------------------------------------------
+
+
+def _date_config(outdir, *, omm: bool = False) -> OutputConfig:
+    files = [OutputFile(type="date", format="tle", dir=str(outdir))]
+    if omm:
+        files.append(OutputFile(type="date", format="omm", dir=str(outdir)))
+    return OutputConfig(files=files)
+
+
+DATE_FILE = "20250410.tle"
+
+
+def test_unchanged_date_file_is_not_rewritten(db_session: Session, outdir):
+    """The steady-state win: a date whose watermark predates its file costs
+    one stat, not a query and a rewrite."""
+    config = _date_config(outdir)
+    ingest_tles(db_session, [TLE_A, TLE_B])
+    generate(db_session, config)
+
+    path = outdir / DATE_FILE
+    before = path.stat().st_mtime_ns
+
+    generate(db_session, config)  # nothing ingested in between
+
+    assert path.stat().st_mtime_ns == before  # untouched
+    assert path.read_text().splitlines() == [*TLE_B]
+
+
+def test_stale_date_file_is_rewritten(db_session: Session, outdir):
+    """A file older than its watermark is stale however it got that way."""
+    config = _date_config(outdir)
+    ingest_tles(db_session, [TLE_A, TLE_B])
+    generate(db_session, config)
+
+    path = outdir / DATE_FILE
+    path.write_text("clobbered\n")
+    old = path.stat().st_mtime_ns - 10_000_000_000
+    os.utime(path, ns=(old, old))
+
+    generate(db_session, config)
+
+    assert path.read_text().splitlines() == [*TLE_B]
+
+
+def test_changed_date_file_is_rewritten(db_session: Session, outdir):
+    config = _date_config(outdir)
+    ingest_tles(db_session, [TLE_A])
+    generate(db_session, config)
+    assert (outdir / DATE_FILE).read_text().splitlines() == [*TLE_A]
+
+    # A later elset for the same date must replace it as that day's latest.
+    ingest_tles(db_session, [TLE_C])
+    generate(db_session, config)
+    assert (outdir / DATE_FILE).read_text().splitlines() == [*TLE_C]
+
+
+def test_deleted_date_file_is_restored(db_session: Session, outdir):
+    """Self-healing with no window and no lookback: a missing file is stale
+    by definition, however old its date."""
+    config = _date_config(outdir)
+    ingest_tles(db_session, [TLE_A, TLE_B])
+    generate(db_session, config)
+    (outdir / DATE_FILE).unlink()
+
+    # lookback_days=0: nothing qualifies as recently created, and the epoch
+    # date is years old. Neither bounds the date pass any more.
+    generate(db_session, config, lookback_days=0)
+
+    assert (outdir / DATE_FILE).read_text().splitlines() == [*TLE_B]
+
+
+def test_verify_repairs_a_corrupted_date_file(db_session: Session, outdir):
+    """The compensating control for no longer rewriting unchanged dates."""
+    config = _date_config(outdir, omm=True)
+    ingest_tles(db_session, [TLE_A, TLE_OTHER])
+    generate(db_session, config)
+
+    path = outdir / DATE_FILE
+    path.write_text("1 garbage\n")  # truncated in place, still present
+
+    generate(db_session, config, lookback_days=0, verify=True)
+
+    assert path.read_text().splitlines() == [*TLE_A]
+
+
+def test_verify_leaves_intact_date_files_alone(db_session: Session, outdir):
+    config = _date_config(outdir)
+    ingest_tles(db_session, [TLE_A])
+    generate(db_session, config)
+
+    path = outdir / DATE_FILE
+    before = path.stat().st_mtime_ns
+    generate(db_session, config, lookback_days=0, verify=True)
+
+    assert path.stat().st_mtime_ns == before
+
+
+# ---------------------------------------------------------------------------
+# Write pool
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_output_is_identical_regardless_of_worker_count(
+    db_session: Session, tmp_path, workers
+):
+    """Threading must not change a single byte of the output."""
+    outdir = tmp_path / f"out{workers}"
+    outdir.mkdir()
+    config = OutputConfig(
+        files=[
+            OutputFile(type=kind, format=fmt, dir=str(outdir))
+            for kind in ("date", "object")
+            for fmt in ("tle", "omm")
+        ],
+        write_workers=workers,
+    )
+    ingest_tles(db_session, [TLE_A, TLE_B, TLE_C, TLE_OTHER])
+    generate(db_session, config, rebuild_all=True)
+
+    written = {p.name: p.read_bytes() for p in outdir.iterdir()}
+    # TLE_OTHER has a blank international designator, which sgp4 cannot
+    # export as OMM — so its date and object omm files are legitimately
+    # absent, exactly as in the serial path.
+    assert set(written) == {
+        "20250410.tle",
+        "20250410.omm",
+        "20250418.tle",
+        "900.tle",
+        "900.omm",
+        "81069.tle",
+    }
+    assert written["900.tle"].decode().splitlines() == [*TLE_A, *TLE_B, *TLE_C]
+
+
+def test_future_dated_file_is_restored(db_session: Session, outdir):
+    """Feeds carry elsets with epochs ahead of now; their date files must
+    still be inside the self-healing sweep, which stops at the catalog's
+    newest epoch rather than at today."""
+    import datetime
+
+    future = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=2)
+    day_of_year = future.timetuple().tm_yday
+    line1 = (
+        f"1 00900U 59009A   {future.year % 100:02d}{day_of_year:03d}.50000000"
+        "  .00013443  00000-0  59558-3 0  9999"
+    )
+    config = _date_config(outdir)
+    ingest_tles(db_session, [(line1, _L2)])
+    generate(db_session, config)
+
+    path = outdir / f"{future.strftime('%Y%m%d')}.tle"
+    assert path.exists()
+    path.unlink()
+
+    # No date qualifies as "changed": only the missing-file sweep can
+    # restore it, and the epoch is two days past today.
+    generate(db_session, config, lookback_days=0)
+    assert path.exists()
+
+
+def test_far_future_epoch_costs_one_row_and_one_stat(db_session: Session, outdir):
+    """A malformed elset can carry an epoch decades out (a two-digit year
+    maps 00-56 to 2000-2056). Ingest's max_epoch_ahead_days guard rejects
+    those by default, but rows can predate the guard or arrive out of band —
+    and even then, scope comes from the per-date watermark table, so a 2056
+    epoch costs exactly one extra row and one extra stat, not a calendar
+    loop between now and 2056."""
+    from sqlalchemy import select
+
+    from thistle_db.model import EpochDateState
+
+    far_future = (
+        "1 00900U 59009A   56365.50000000  .00013443  00000-0  59558-3 0  9999",
+        _L2,
+    )
+    config = _date_config(outdir)
+    # Guard disabled: simulating a row that got in before the guard existed.
+    ingest_tles(db_session, [TLE_A, far_future], max_epoch_ahead_days=0)
+    generate(db_session, config)
+
+    dates = set(db_session.execute(select(EpochDateState.epoch_date)).scalars())
+    assert len(dates) == 2  # one row per real date, nothing in between
+    # The bogus elset still gets its own date file: it is in the database, and
+    # generation reflects the database. Keeping it out was ingest's job.
+    assert (outdir / "20561230.tle").exists()
+
+
+def test_watermarks_track_ingest(db_session: Session, outdir):
+    """The scope table is maintained by ingest, in the same transaction."""
+    from sqlalchemy import select
+
+    from thistle_db.model import EpochDateState
+
+    ingest_tles(db_session, [TLE_A])
+    first = db_session.execute(select(EpochDateState.last_created)).scalar_one()
+
+    ingest_tles(db_session, [TLE_C])
+    second = db_session.execute(select(EpochDateState.last_created)).scalar_one()
+
+    assert second >= first  # same date, bumped by the later delivery
+
+
+def test_rebuild_recovers_from_out_of_band_inserts(db_session: Session, outdir):
+    """Rows inserted outside ingest leave no watermark, so their date files
+    would never regenerate — the rebuild is the repair."""
+    from sqlalchemy import delete
+
+    from thistle_db.api import rebuild_epoch_date_state
+    from thistle_db.model import EpochDateState
+
+    config = _date_config(outdir)
+    ingest_tles(db_session, [TLE_A])
+    # Simulate a bulk load that bypassed ingest: rows present, watermark gone.
+    db_session.execute(delete(EpochDateState))
+    db_session.commit()
+
+    generate(db_session, config)
+    assert not (outdir / DATE_FILE).exists()  # nothing looks stale
+
+    rebuild_epoch_date_state(db_session.get_bind())
+    # The rebuild ran on its own connection. Under MariaDB's REPEATABLE READ
+    # this session is still on the snapshot it opened above, so end that
+    # transaction before reading — in real use init-db and generate are
+    # separate processes and the question never arises.
+    db_session.commit()
+    generate(db_session, config)
+    assert (outdir / DATE_FILE).read_text().splitlines() == [*TLE_A]
