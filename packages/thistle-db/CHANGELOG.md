@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.13.0] - 2026-08-24
 
 ### Breaking — schema and output config
 
