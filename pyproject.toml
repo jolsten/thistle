@@ -22,3 +22,14 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = [
+    # Third-party deprecations with no fixed release to upgrade to; each
+    # filter is pinned to its exact message so anything new still surfaces.
+    # skyfield (<= 1.55) does `y.dtype = int8` in searchlib.py, deprecated
+    # by NumPy 2.5 — drop this when a skyfield release stops doing it.
+    "ignore:Setting the dtype on a NumPy array has been deprecated:DeprecationWarning",
+    # cartopy (<= 0.25.0, current) reads Locator.locs, deprecated by
+    # Matplotlib 3.11 and removed in 3.13: the degree-formatted axes in
+    # `thistle map` will need a newer cartopy before matplotlib 3.13.
+    "ignore:The locs attribute was deprecated:DeprecationWarning",
+]
