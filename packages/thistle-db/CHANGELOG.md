@@ -1,5 +1,43 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **`init-db --defer-indexes` — fast bulk restores.** Rebuilding a large
+  catalog from files was index-bound on MariaDB: the server has no InnoDB
+  change buffer (removed in MariaDB 11), so every row's
+  `(norad_cat_id, epoch)` index insert touches a real page, and a
+  full-catalog snapshot file scatters those touches across the whole
+  index — random storage I/O once the index outgrows the buffer pool, at
+  which point per-file time is set by storage latency (minutes per 30k-row
+  file on network storage, versus ~40 batched server queries for the
+  inserts themselves).
+
+  `init-db --drop --defer-indexes` now creates the schema without the two
+  read-path indexes; ingest then maintains only the primary key and the
+  unique dedup indexes (never deferred — idempotency holds throughout),
+  both of which stay in hot, localized index regions during a
+  chronological restore. A plain `init-db` afterward builds anything
+  missing as one sorted pass per index:
+
+  ```
+  thistle-db init-db --drop --defer-indexes
+  thistle-db ingest ...
+  thistle-db init-db        # builds the deferred indexes, rebuilds state
+  ```
+
+  `init-db` without flags now reconciles missing model indexes in general,
+  so it also repairs a hand-dropped index.
+
+  Measured on a MariaDB 11 container (32 MB buffer pool, 60 snapshot files
+  x 30k rows): deferred ingest holds a flat ~11k rows/s through all 1.8M
+  rows — there is no secondary index to touch, so the rate is independent
+  of table size and storage latency — and the finalize built both indexes
+  in 12 s. Independently of this flag: size `innodb_buffer_pool_size` to
+  hold the `tle` indexes — deferral removes the restore pain, a
+  right-sized pool keeps steady-state ingest fast too.
+
 ## [0.13.0] - 2026-08-24
 
 ### Breaking — schema and output config

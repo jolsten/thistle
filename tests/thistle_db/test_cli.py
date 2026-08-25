@@ -155,6 +155,28 @@ class TestInitDbCommand:
         result = runner.invoke(app, ["-c", str(cli_env), "get-tle", "00022"])
         assert result.exit_code == 1  # no TLEs left
 
+    def test_defer_indexes_requires_drop(self, cli_env):
+        result = runner.invoke(app, ["-c", str(cli_env), "init-db", "--defer-indexes"])
+        assert result.exit_code == 2
+        assert "--drop" in result.stderr
+        # And nothing was touched.
+        result = runner.invoke(app, ["-c", str(cli_env), "get-tle", "00022"])
+        assert result.exit_code == 0
+
+    def test_defer_and_finalize_flow(self, cli_env):
+        result = runner.invoke(
+            app,
+            ["-c", str(cli_env), "init-db", "--drop", "--yes", "--defer-indexes"],
+        )
+        assert result.exit_code == 0
+        assert "Indexes deferred:" in result.stdout
+        assert "run `thistle-db init-db`" in result.stdout
+
+        result = runner.invoke(app, ["-c", str(cli_env), "init-db"])
+        assert result.exit_code == 0
+        assert "Indexes built:" in result.stdout
+        assert "ix_tle_norad_cat_id_epoch" in result.stdout
+
 
 class TestUninitializedDatabase:
     @pytest.fixture()

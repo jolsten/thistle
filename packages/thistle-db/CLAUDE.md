@@ -249,11 +249,18 @@ in depth on top of DB grants. Deployments can therefore give the cron
 account DML-only rights and readers SELECT-only rights:
 
 - `init` — scaffold `config.toml` and `~/.config/thistle-db.toml`.
-- `init-db [--drop] [--yes]` — create the database schema; the intended DDL
-  entry point (run once with an admin account when using MariaDB/PostgreSQL).
-  Also recomputes `epoch_date_state` from the element sets, which is both
-  the adoption path for an existing database and the repair for rows that
-  were inserted outside `ingest`. Idempotent without `--drop`. `--drop` destroys and recreates all tables:
+- `init-db [--drop] [--yes] [--defer-indexes]` — create the database
+  schema; the intended DDL entry point (run once with an admin account when
+  using MariaDB/PostgreSQL). Also recomputes `epoch_date_state` from the
+  element sets (the adoption path for an existing database and the repair
+  for rows inserted outside `ingest`), and builds any *missing* model
+  index — so a plain `init-db` is also the finalize step after a deferred
+  rebuild. Idempotent without `--drop`.
+  `--defer-indexes` (requires `--drop`) creates the schema without the
+  read-path indexes (`ix_tle_norad_cat_id_epoch`, `ix_tle_created` —
+  `api.DEFERRABLE_INDEXES`) for bulk restores; the unique dedup indexes are
+  never deferred, so ingest idempotency holds throughout. Flow:
+  `init-db --drop --defer-indexes` → ingest everything → `init-db`. `--drop` destroys and recreates all tables:
   it prompts for confirmation, and in non-interactive use fails closed
   unless `--yes` is passed.
 - `ingest [FILES...] [--force]` — ingest specific files (always parsed, even
@@ -270,7 +277,8 @@ account DML-only rights and readers SELECT-only rights:
 - `dump OUTPUT [--force]` — logical backup: write every element set to
   `OUTPUT.tle` (lossless, verbatim line text) and rows with OMM metadata to
   `OUTPUT.json` (Space-Track form, only created when metadata exists).
-  Restore = `init-db` + `ingest` both files; works across dialects. Refuses
+  Restore = `init-db` + `ingest` both files (for large catalogs use the
+  deferred-index flow under "Schema changes"); works across dialects. Refuses
   to overwrite existing outputs without `--force`. Physical backups of live
   servers belong to native tools (`mariadb-dump`, `pg_dump`, SQLite file
   copy), not this command.
@@ -425,9 +433,24 @@ stay short.
 There is intentionally **no Alembic or other migration tooling**. The
 database is a derived store: every row reconstitutes losslessly from a
 `dump`, so schema changes ship as breaking releases migrated by
-`dump` → `init-db --drop` → `ingest` (plus one `generate --all`, since a
-restore resets `created` timestamps and the incremental generator's state
-derives from them). Do not add a migration framework without an explicit
+`dump` → `init-db --drop --defer-indexes` → `ingest` → `init-db` (plus one
+`generate --all`, since a restore resets `created` timestamps and the
+incremental generator's state derives from them).
+
+**Restore performance (MariaDB).** Restoring a large catalog is index-bound,
+not parse- or round-trip-bound: ingest issues ~40 server queries per 30k-row
+file (pymysql batches the chunks), but modern MariaDB has no InnoDB change
+buffer (removed in 11), so every secondary-index insert touches a real
+page. A full-catalog snapshot file scatters one `(norad_cat_id, epoch)`
+page access per row across the whole index; once that index outgrows
+`innodb_buffer_pool_size`, each becomes random storage I/O and per-file
+time is set by storage latency, not by thistle-db. Two remedies, in order:
+defer the read-path indexes during the restore (`--defer-indexes` — the
+final `CREATE INDEX` is one sorted build each), and size the buffer pool
+to hold the `tle` indexes. The unique dedup index stays cheap during
+chronological restores because a snapshot file's epochs land in one hot
+region of the epoch-first index — another reason its column order must not
+change. Do not add a migration framework without an explicit
 decision — the trigger to revisit is when restore downtime becomes
 unacceptable (roughly 100M+ rows). Purely additive changes (a new index, a
 nullable column) may instead ship with hand-written `ALTER` statements for

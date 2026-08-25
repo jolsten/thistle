@@ -297,15 +297,36 @@ def init_db_cmd(
             help="Skip the --drop confirmation prompt (for scripts)",
         ),
     ] = False,
+    defer_indexes: Annotated[
+        bool,
+        typer.Option(
+            "--defer-indexes",
+            help="With --drop: create the schema without the read-path "
+            "indexes, so a bulk restore ingests without maintaining them "
+            "row by row. Run `init-db` again after ingesting to build "
+            "them (one fast sorted pass each). Dedup indexes are never "
+            "deferred.",
+        ),
+    ] = False,
 ) -> None:
     """Create the database schema in the configured database.
 
-    Idempotent: existing tables are left untouched. With --drop, all tables
-    are dropped and recreated (asks for confirmation unless --yes).
+    Idempotent: existing tables are left untouched and any missing model
+    index is built (the finalize step after a --defer-indexes restore).
+    With --drop, all tables are dropped and recreated (asks for
+    confirmation unless --yes).
     """
     config = load_config(ctx.obj.config_path)
     _setup_logging(config.logging.level, ctx.obj.log_file)
     url = config.database.url.render_as_string(hide_password=True)
+
+    if defer_indexes and not drop:
+        print(
+            "Error: --defer-indexes requires --drop (deferring is only "
+            "meaningful when the tables start empty).",
+            file=sys.stderr,
+        )
+        raise typer.Exit(code=2)
 
     if drop and not yes:
         if not sys.stdin.isatty():
@@ -318,7 +339,7 @@ def init_db_cmd(
         if not typer.confirm(f"Drop ALL tables in {url}?"):
             raise typer.Exit(code=1)
 
-    result = init_db(config, drop=drop)
+    result = init_db(config, drop=drop, defer_indexes=defer_indexes)
 
     print(f"Database: {url}")
     if result["dropped"]:
@@ -327,6 +348,14 @@ def init_db_cmd(
         print(f"Created:  {', '.join(result['created'])}")
     if result["existing"]:
         print(f"Existing: {', '.join(result['existing'])} (left untouched)")
+    if result["indexes_created"]:
+        print(f"Indexes built: {', '.join(result['indexes_created'])}")
+    if result["indexes_deferred"]:
+        print(f"Indexes deferred: {', '.join(result['indexes_deferred'])}")
+        print(
+            "Ingest your files, then run `thistle-db init-db` (no flags) "
+            "to build the deferred indexes."
+        )
 
 
 @app.command()

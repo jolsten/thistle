@@ -166,3 +166,80 @@ def test_init_db_drop_recreates_and_wipes(db_path):
     assert set(result["dropped"]) == MODEL_TABLES
     assert set(result["created"]) == MODEL_TABLES
     assert get_tles(22, settings) == []
+
+
+DEFERRABLE = {"ix_tle_norad_cat_id_epoch", "ix_tle_created"}
+
+
+def _tle_index_names(settings) -> set[str]:
+    engine = create_engine(settings.database.url)
+    try:
+        return {ix["name"] for ix in inspect(engine).get_indexes("tle")}
+    finally:
+        engine.dispose()
+
+
+def test_init_db_defer_indexes(tmp_path):
+    """A bulk-restore schema: tables present, read-path indexes absent."""
+    settings = _settings(tmp_path / "fresh.db")
+    result = init_db(settings, drop=True, defer_indexes=True)
+    assert set(result["indexes_deferred"]) == {
+        f"tle.{name}" for name in DEFERRABLE
+    }
+    assert not (DEFERRABLE & _tle_index_names(settings))
+
+
+def test_deferred_schema_still_deduplicates(tmp_path):
+    """Deferring must never touch the dedup machinery: ingesting the same
+    records twice still stores them once."""
+    from thistle_db.ingest import ingest_tles
+
+    settings = _settings(tmp_path / "fresh.db")
+    init_db(settings, drop=True, defer_indexes=True)
+    session, engine = open_session(settings)
+    try:
+        assert ingest_tles(session, TLES) == len(TLES)
+        assert ingest_tles(session, TLES) == 0
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_plain_init_db_builds_deferred_indexes(tmp_path):
+    """The finalize step: a later flagless init-db reconciles the indexes."""
+    settings = _settings(tmp_path / "fresh.db")
+    init_db(settings, drop=True, defer_indexes=True)
+
+    result = init_db(settings)
+    assert set(result["indexes_created"]) == {
+        f"tle.{name}" for name in DEFERRABLE
+    }
+    assert DEFERRABLE <= _tle_index_names(settings)
+
+    # And it stays idempotent: nothing more to build.
+    assert init_db(settings)["indexes_created"] == []
+
+
+def test_defer_indexes_requires_drop(tmp_path):
+    settings = _settings(tmp_path / "fresh.db")
+    with pytest.raises(ValueError, match="drop"):
+        init_db(settings, defer_indexes=True)
+
+
+def test_deferred_restore_round_trip(tmp_path):
+    """The full documented flow: defer -> ingest -> finalize -> query."""
+    from thistle_db.ingest import ingest_tles
+
+    settings = _settings(tmp_path / "fresh.db")
+    init_db(settings, drop=True, defer_indexes=True)
+    session, engine = open_session(settings)
+    try:
+        ingest_tles(session, TLES)
+    finally:
+        session.close()
+        engine.dispose()
+
+    init_db(settings)  # finalize
+
+    assert get_tles(22, settings) != []
+    assert DEFERRABLE <= _tle_index_names(settings)

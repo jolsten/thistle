@@ -4,7 +4,7 @@ import datetime
 import json
 import pathlib
 
-from sqlalchemy import delete, func, insert, inspect, select
+from sqlalchemy import Index, delete, func, insert, inspect, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -12,16 +12,50 @@ from thistle_db.config import Settings, load_config
 from thistle_db.model import TLE, Base, EpochDateState, date_from_sql
 
 
-def init_db(config: Settings, drop: bool = False) -> dict[str, list[str]]:
+# Read-path indexes a bulk rebuild may defer. Row-by-row maintenance of
+# these is what makes restoring a large catalog slow on MariaDB: modern
+# MariaDB has no InnoDB change buffer (removed in 11), so every secondary-
+# index insert touches a real page, and a full-catalog snapshot file
+# scatters ~one page access per row across the whole (norad_cat_id, epoch)
+# index — random I/O once the index outgrows the buffer pool. Building them
+# once at the end is a sorted bulk build instead. Never deferrable: the
+# unique dedup indexes (uq_tle_epoch_line_hash, omm tle_id, ingest_files
+# path_hash), which ingest correctness depends on.
+DEFERRABLE_INDEXES = ("ix_tle_norad_cat_id_epoch", "ix_tle_created")
+
+
+def _model_indexes() -> dict[str, list[Index]]:
+    """Model-declared (non-constraint) indexes, keyed by table name."""
+    return {
+        table.name: sorted(table.indexes, key=lambda ix: ix.name or "")
+        for table in Base.metadata.sorted_tables
+    }
+
+
+def init_db(
+    config: Settings, drop: bool = False, defer_indexes: bool = False
+) -> dict[str, list[str]]:
     """Create the database schema, optionally dropping it first.
 
     The only intended DDL entry point. Idempotent when ``drop`` is False:
-    existing tables are left untouched. With ``drop=True``, all model tables
-    are dropped first — destructive, callers must confirm with the user.
+    existing tables are left untouched, and any *missing* model index is
+    created — which makes a plain ``init_db`` the finalize step after a
+    deferred-index rebuild.
 
-    Returns table names as ``{"dropped": [...], "created": [...],
-    "existing": [...]}``.
+    With ``drop=True``, all model tables are dropped first — destructive,
+    callers must confirm with the user. ``defer_indexes=True`` (only valid
+    with ``drop``) creates the schema without the ``DEFERRABLE_INDEXES``,
+    for bulk restores: ingest everything, then run ``init_db`` again to
+    build them in one pass each.
+
+    Returns names as ``{"dropped": [...], "created": [...],
+    "existing": [...], "indexes_created": [...], "indexes_deferred": [...]}``.
     """
+    if defer_indexes and not drop:
+        raise ValueError(
+            "defer_indexes requires drop=True: deferring is only meaningful "
+            "when the tables start empty"
+        )
     engine = config.database.engine
     try:
         model_tables = set(Base.metadata.tables)
@@ -33,11 +67,39 @@ def init_db(config: Settings, drop: bool = False) -> dict[str, list[str]]:
             before = set()
         Base.metadata.create_all(engine)
         after = set(inspect(engine).get_table_names()) & model_tables
+
+        indexes_created: list[str] = []
+        indexes_deferred: list[str] = []
+        if defer_indexes:
+            # create_all made them along with the (empty) tables; dropping
+            # them now is instant, and ingest then maintains only the PK and
+            # the unique dedup indexes.
+            for table_name, indexes in _model_indexes().items():
+                for index in indexes:
+                    if index.name in DEFERRABLE_INDEXES:
+                        index.drop(engine)
+                        indexes_deferred.append(f"{table_name}.{index.name}")
+        else:
+            # Reconcile: build any model index the database lacks (the
+            # finalize step after a deferred rebuild, or repair after a
+            # hand-dropped index). A bulk CREATE INDEX is a sorted build —
+            # minutes for tens of millions of rows, not hours of row-by-row
+            # page churn.
+            inspector = inspect(engine)
+            for table_name, indexes in _model_indexes().items():
+                existing = {ix["name"] for ix in inspector.get_indexes(table_name)}
+                for index in indexes:
+                    if index.name not in existing:
+                        index.create(engine)
+                        indexes_created.append(f"{table_name}.{index.name}")
+
         rebuild_epoch_date_state(engine)
         return {
             "dropped": dropped,
             "created": sorted(after - before),
             "existing": sorted(before),
+            "indexes_created": sorted(indexes_created),
+            "indexes_deferred": sorted(indexes_deferred),
         }
     finally:
         engine.dispose()
