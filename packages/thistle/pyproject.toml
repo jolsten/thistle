@@ -37,7 +37,10 @@ cli = [
 ]
 plot = [
     "thistle[cli]",
-    "matplotlib>=3.8; python_version >= '3.10'",
+    # <3.13: cartopy (through 0.25) reads Formatter.locs, which Matplotlib
+    # deprecated in 3.11 and removes in 3.13 — map axis rendering would
+    # crash. Lift the cap once a cartopy release stops using it.
+    "matplotlib>=3.8,<3.13; python_version >= '3.10'",
     "cartopy>=0.23; python_version >= '3.10'",
 ]
 db = [

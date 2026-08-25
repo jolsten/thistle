@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- The `plot` extra now caps `matplotlib<3.13`: cartopy (through 0.25, the
+  current release) reads `Formatter.locs`, which Matplotlib deprecated in
+  3.11 and removes in 3.13 — `thistle map` axis rendering would crash. The
+  cap will be lifted once a cartopy release stops using it.
+
 ## [0.4.1]
 
 ### Fixed
