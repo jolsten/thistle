@@ -425,8 +425,15 @@ stay short.
   `THISTLE_DB_TEST_POSTGRES=1` (requires Docker) to run the MariaDB and
   PostgreSQL backends via testcontainers — CI runs all three. Dialect-specific
   behavior (upserts) must be tested against all three.
-- Test fixtures live in `tests/thistle_db/data/` (real TLE text files and
-  Space-Track OMM JSON).
+- Test fixtures live in `tests/thistle_db/data/` — real TLE text files and
+  Space-Track OMM JSON, **truncated to a few hundred records each** so the
+  suite stays fast (~8s on SQLite); realism comes from the records being
+  genuine provider output (3LE name lines, odd designators), not from
+  volume. The one deliberate exception: `20250418.txt` keeps 6,001 records
+  — above `CHUNK_SIZE` (5000) — so multi-chunk ingest and the final
+  partial chunk stay exercised. Don't re-add bulk fixtures for logic
+  tests; a test that genuinely needs volume should generate it
+  (see `scripts/bench_generate.py`).
 
 ### Schema changes (no migration framework — deliberate)
 
