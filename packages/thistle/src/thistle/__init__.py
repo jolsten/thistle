@@ -22,6 +22,7 @@ from thistle.propagator import (
     Propagator,
     SwitchingStrategy,
     TCASwitchStrategy,
+    TLEExtrapolationWarning,
 )
 from thistle.utils import load_tle, read_tle
 
@@ -30,6 +31,7 @@ __all__ = [
     "read_tle",
     "load_tle",
     "SwitchingStrategy",
+    "TLEExtrapolationWarning",
     "EpochSwitchStrategy",
     "MidpointSwitchStrategy",
     "TCASwitchStrategy",

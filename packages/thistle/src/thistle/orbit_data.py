@@ -542,7 +542,7 @@ def _generate_with_propagator(
     # Merge segments back into full arrays
     result: GenerateResult = {}
     if segment_results:
-        all_keys = set(segment_results[0][1].keys())
+        all_keys = segment_results[0][1].keys()
         for key in all_keys:
             first_segment_value = segment_results[0][1][key]
             output_array = np.empty(len(times), dtype=first_segment_value.dtype)

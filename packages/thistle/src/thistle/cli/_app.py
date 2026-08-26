@@ -27,6 +27,7 @@ from thistle.cli._helpers import (
     parse_site,
     parse_tle_epochs,
     read_and_emit_tles,
+    report_tle_warnings,
     rev_bounds,
     revnum_at,
     warn_if_tty,
@@ -178,6 +179,14 @@ def find_tle(
         bool,
         typer.Option("--unique", help="Only output each unique TLE once"),
     ] = False,
+    warn_days: Annotated[
+        float,
+        typer.Option(
+            "--warn-days",
+            help="Warn when requested times are more than this many days "
+            "from the nearest TLE epoch (0 disables)",
+        ),
+    ] = 7.0,
 ) -> None:
     """Find the correct TLE for given timestamps read from stdin."""
     from thistle import Propagator, read_tle as read_tle_file
@@ -193,35 +202,36 @@ def find_tle(
         print(f"Error: no TLEs found in {file}", file=sys.stderr)
         raise typer.Exit(code=2)
 
-    propagator = Propagator(tles, method=switch.value)
+    propagator = Propagator(tles, method=switch.value, warn_threshold=warn_days)
 
     warn_if_tty(sys.stdin, "find-tle")
 
     seen: Optional[set[tuple[str, str]]] = set() if unique else None
 
-    for raw_line in sys.stdin:
-        time_str = raw_line.strip()
-        if not time_str:
-            continue
-
-        try:
-            dt = datetime.fromisoformat(time_str)
-        except ValueError:
-            print(
-                f"Warning: skipping unparseable time: {time_str}",
-                file=sys.stderr,
-            )
-            continue
-
-        line1, line2 = propagator.find_tle(dt)
-
-        if seen is not None:
-            key = (line1, line2)
-            if key in seen:
+    with report_tle_warnings():
+        for raw_line in sys.stdin:
+            time_str = raw_line.strip()
+            if not time_str:
                 continue
-            seen.add(key)
 
-        sys.stdout.write(line1 + "\n" + line2 + "\n")
+            try:
+                dt = datetime.fromisoformat(time_str)
+            except ValueError:
+                print(
+                    f"Warning: skipping unparseable time: {time_str}",
+                    file=sys.stderr,
+                )
+                continue
+
+            line1, line2 = propagator.find_tle(dt)
+
+            if seen is not None:
+                key = (line1, line2)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+            sys.stdout.write(line1 + "\n" + line2 + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +681,14 @@ def groundtrack_cmd(
         Optional[str],
         typer.Option("--title", help="Figure title"),
     ] = None,
+    warn_days: Annotated[
+        float,
+        typer.Option(
+            "--warn-days",
+            help="Warn when requested times are more than this many days "
+            "from the nearest TLE epoch (0 disables)",
+        ),
+    ] = 7.0,
 ) -> None:
     """Plot ground traces on a world map from spec lines.
 
@@ -725,31 +743,34 @@ def groundtrack_cmd(
             if not tles:
                 print(f"Warning: no TLEs found in {resolved}", file=sys.stderr)
                 return None
-            propagators[resolved] = Propagator(tles, method="midpoint")
+            propagators[resolved] = Propagator(
+                tles, method="midpoint", warn_threshold=warn_days
+            )
         return propagators[resolved]
 
     from thistle.cli._map import trace_lla
 
     traces: list[tuple[np.ndarray, np.ndarray, dict]] = []
     all_alts: list[np.ndarray] = []
-    for sp in specs:
-        if sp.sat is not None:
-            source = pathlib.Path(sp.sat)
-        elif tle is not None:
-            source = tle
-        else:
-            print(
-                f"Warning: skipping spec line (no sat= and no TLE argument): "
-                f"{sp.start.isoformat()}",
-                file=sys.stderr,
-            )
-            continue
-        propagator = get_propagator(source)
-        if propagator is None:
-            continue
-        lons, lats, alts = trace_lla(propagator, sp.start, sp.stop, step)
-        traces.append((lons, lats, sp.plot_kwargs))
-        all_alts.append(alts)
+    with report_tle_warnings():
+        for sp in specs:
+            if sp.sat is not None:
+                source = pathlib.Path(sp.sat)
+            elif tle is not None:
+                source = tle
+            else:
+                print(
+                    f"Warning: skipping spec line (no sat= and no TLE argument): "
+                    f"{sp.start.isoformat()}",
+                    file=sys.stderr,
+                )
+                continue
+            propagator = get_propagator(source)
+            if propagator is None:
+                continue
+            lons, lats, alts = trace_lla(propagator, sp.start, sp.stop, step)
+            traces.append((lons, lats, sp.plot_kwargs))
+            all_alts.append(alts)
 
     if not traces:
         print("Error: no valid traces to plot", file=sys.stderr)
@@ -1171,6 +1192,14 @@ def propagate(
         Optional[list[str]],
         typer.Option("--site", help="Ground site: NAME:LAT:LON[:ALT] (repeatable)"),
     ] = None,
+    warn_days: Annotated[
+        float,
+        typer.Option(
+            "--warn-days",
+            help="Warn when requested times are more than this many days "
+            "from the nearest TLE epoch (0 disables)",
+        ),
+    ] = 7.0,
 ) -> None:
     """Propagate TLEs and generate orbital data from stdin timestamps."""
     flag_map = {
@@ -1211,7 +1240,7 @@ def propagate(
         print(f"Error: no TLEs found in {file}", file=sys.stderr)
         raise typer.Exit(code=2)
 
-    propagator = Propagator(tles, method=switch.value)
+    propagator = Propagator(tles, method=switch.value, warn_threshold=warn_days)
 
     out_delim = delimiter if delimiter is not None else " "
     header_emitted = False
@@ -1259,33 +1288,34 @@ def propagate(
             for row in rows:
                 sys.stdout.write(out_delim.join(row) + "\n")
 
-    while True:
-        chunk_times: list[np.datetime64] = []
-        chunk_iso: list[str] = []
+    with report_tle_warnings():
+        while True:
+            chunk_times: list[np.datetime64] = []
+            chunk_iso: list[str] = []
 
-        for line in sys.stdin:
-            stripped = line.rstrip("\r\n")
-            if not stripped:
-                continue
-            time_str = stripped.split()[0] if delimiter is None else stripped.split(delimiter)[0]
+            for line in sys.stdin:
+                stripped = line.rstrip("\r\n")
+                if not stripped:
+                    continue
+                time_str = stripped.split()[0] if delimiter is None else stripped.split(delimiter)[0]
 
-            try:
-                dt = datetime.fromisoformat(time_str)
-                chunk_times.append(np.datetime64(dt.isoformat(), "ns"))
-                chunk_iso.append(time_str)
-            except ValueError:
-                print(
-                    f"Warning: skipping unparseable time: {time_str}",
-                    file=sys.stderr,
-                )
-                continue
+                try:
+                    dt = datetime.fromisoformat(time_str)
+                    chunk_times.append(np.datetime64(dt.isoformat(), "ns"))
+                    chunk_iso.append(time_str)
+                except ValueError:
+                    print(
+                        f"Warning: skipping unparseable time: {time_str}",
+                        file=sys.stderr,
+                    )
+                    continue
 
-            if len(chunk_times) >= chunk:
+                if len(chunk_times) >= chunk:
+                    break
+
+            if not chunk_times:
                 break
 
-        if not chunk_times:
-            break
-
-        times_arr = np.array(chunk_times, dtype="datetime64[ns]")
-        data = generate(times_arr, propagator, groups, sites=sites_dict)
-        _emit_rows(data, chunk_iso)
+            times_arr = np.array(chunk_times, dtype="datetime64[ns]")
+            data = generate(times_arr, propagator, groups, sites=sites_dict)
+            _emit_rows(data, chunk_iso)

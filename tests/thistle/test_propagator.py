@@ -1,4 +1,5 @@
 import datetime
+import warnings
 from typing import Type
 
 import numpy as np
@@ -9,12 +10,14 @@ from sgp4.api import Satrec
 from sgp4.exporter import export_tle
 from skyfield.api import EarthSatellite, load
 
+from thistle.events import find_node_crossings
 from thistle.propagator import (
     EpochSwitchStrategy,
     MidpointSwitchStrategy,
     Propagator,
     SwitchingStrategy,
     TCASwitchStrategy,
+    TLEExtrapolationWarning,
     _find_tca,
     _slices_by_transitions,
 )
@@ -23,6 +26,7 @@ from thistle.utils import (
     DATETIME64_MIN,
     datetime_to_dt64,
     dt64_to_datetime,
+    dt64_to_time,
     pairwise,
     read_tle,
     trange,
@@ -543,3 +547,151 @@ class TestStrategyInstance:
         """Passing an invalid type raises TypeError."""
         with pytest.raises(TypeError, match="strategy name or SwitchingStrategy"):
             Propagator(ISS_TLES, method=42)
+
+
+# ---------------------------------------------------------------------------
+# TLEExtrapolationWarning
+# ---------------------------------------------------------------------------
+
+
+def _tle_checksum(line: str) -> str:
+    total = sum(int(c) if c.isdigit() else 1 if c == "-" else 0 for c in line)
+    return str(total % 10)
+
+
+def _tle_at_epoch(epoch: str) -> tuple[str, str]:
+    """An ISS-like TLE with the given line-1 epoch field (cols 19-32)."""
+    base_l1 = "1 25544U 98067A   24001.50000000  .00016717  00000-0  10270-3 0  9005"
+    base_l2 = "2 25544  51.6400 208.9163 0006703  30.5502 329.5947 15.49560532  1001"
+    line1 = base_l1[:18] + epoch + base_l1[32:68]
+    return line1 + _tle_checksum(line1), base_l2
+
+
+WARN_TLE_A = _tle_at_epoch("24001.50000000")  # epoch 2024-01-01T12:00
+WARN_TLE_B = _tle_at_epoch("24041.50000000")  # epoch 2024-02-10T12:00
+
+
+@pytest.fixture
+def gap_propagator() -> Propagator:
+    """Two TLEs 40 days apart, default 7-day warn threshold."""
+    return Propagator([WARN_TLE_A, WARN_TLE_B])
+
+
+class TestExtrapolationWarning:
+    def test_array_beyond_last_epoch(self, gap_propagator: Propagator) -> None:
+        times = trange(
+            datetime.datetime(2024, 3, 14), datetime.datetime(2024, 3, 15), 3600
+        )
+        with pytest.warns(
+            TLEExtrapolationWarning,
+            match=r"satellite 25544: all 24 propagation times are more than 7 days",
+        ) as rec:
+            gap_propagator.segment_times(times)
+        assert len(rec) == 1
+        w = rec[0].message
+        assert w.n_bad == w.n_total == 24
+        assert w.threshold == datetime.timedelta(days=7)
+        assert w.span == (
+            datetime.datetime(2024, 1, 1, 12),
+            datetime.datetime(2024, 2, 10, 12),
+        )
+        assert datetime.timedelta(days=32) < w.max_offset < datetime.timedelta(days=34)
+        assert str(w).endswith("warn_threshold=None disables.")
+
+    def test_at_beyond_last_epoch(self, gap_propagator: Propagator) -> None:
+        times = trange(
+            datetime.datetime(2024, 3, 14), datetime.datetime(2024, 3, 15), 3600
+        )
+        t = dt64_to_time(times, gap_propagator.ts)
+        with pytest.warns(
+            TLEExtrapolationWarning, match="TLEs cover 2024-01-01 to 2024-02-10"
+        ):
+            gap_propagator.at(t)
+
+    def test_array_before_first_epoch(self, gap_propagator: Propagator) -> None:
+        times = trange(
+            datetime.datetime(2023, 12, 1), datetime.datetime(2023, 12, 2), 3600
+        )
+        with pytest.warns(TLEExtrapolationWarning, match="more than 7 days"):
+            gap_propagator.segment_times(times)
+
+    def test_partial_count_phrasing(self, gap_propagator: Propagator) -> None:
+        # Daily times Feb 10-19 at 00:00; only Feb 18 and 19 are > 7 days
+        # from the Feb 10 12:00 epoch.
+        times = trange(
+            datetime.datetime(2024, 2, 10), datetime.datetime(2024, 2, 20), 86400
+        )
+        with pytest.warns(
+            TLEExtrapolationWarning, match=r"2 of 10 propagation times"
+        ):
+            gap_propagator.segment_times(times)
+
+    def test_scalar_interior_gap(self, gap_propagator: Propagator) -> None:
+        with pytest.warns(
+            TLEExtrapolationWarning,
+            match=r"requested time 2024-01-21T12:00Z is 20 days",
+        ):
+            gap_propagator.find_satellite(datetime.datetime(2024, 1, 21, 12))
+
+    def test_scalar_find_tle(self, gap_propagator: Propagator) -> None:
+        with pytest.warns(
+            TLEExtrapolationWarning, match="requested time 2024-03-15T00:00Z"
+        ):
+            gap_propagator.find_tle(datetime.datetime(2024, 3, 15))
+
+    def test_no_warning_within_coverage(self, gap_propagator: Propagator) -> None:
+        times = trange(
+            datetime.datetime(2024, 1, 1), datetime.datetime(2024, 1, 3), 3600
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", TLEExtrapolationWarning)
+            gap_propagator.segment_times(times)
+            gap_propagator.find_satellite(datetime.datetime(2024, 2, 12))
+
+    @pytest.mark.parametrize("threshold", [None, 0, -1.0])
+    def test_disabled(self, threshold) -> None:
+        prop = Propagator([WARN_TLE_A, WARN_TLE_B], warn_threshold=threshold)
+        assert prop.warn_threshold is None
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", TLEExtrapolationWarning)
+            prop.find_satellite(datetime.datetime(2025, 6, 1))
+
+    def test_threshold_as_days_number(self) -> None:
+        prop = Propagator([WARN_TLE_A, WARN_TLE_B], warn_threshold=45)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", TLEExtrapolationWarning)
+            prop.find_satellite(datetime.datetime(2024, 3, 15))
+
+        prop = Propagator(
+            [WARN_TLE_A, WARN_TLE_B], warn_threshold=datetime.timedelta(days=1)
+        )
+        with pytest.warns(TLEExtrapolationWarning, match=r"warn threshold: 1 day\)"):
+            prop.find_satellite(datetime.datetime(2024, 1, 4))
+
+    def test_check_coverage_window(self, gap_propagator: Propagator) -> None:
+        with pytest.warns(
+            TLEExtrapolationWarning,
+            match=r"requested window 2024-04-01T00:00Z to 2024-05-01T00:00Z extends",
+        ):
+            gap_propagator.check_coverage(
+                datetime.datetime(2024, 4, 1), datetime.datetime(2024, 5, 1)
+            )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", TLEExtrapolationWarning)
+            gap_propagator.check_coverage(
+                datetime.datetime(2024, 2, 8), datetime.datetime(2024, 2, 12)
+            )
+
+    def test_events_emit_single_window_warning(
+        self, gap_propagator: Propagator
+    ) -> None:
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            find_node_crossings(
+                np.datetime64("2024-04-01T00:00:00", "us"),
+                np.datetime64("2024-04-01T03:00:00", "us"),
+                gap_propagator,
+            )
+        found = [w for w in rec if issubclass(w.category, TLEExtrapolationWarning)]
+        assert len(found) == 1
+        assert "requested window" in str(found[0].message)

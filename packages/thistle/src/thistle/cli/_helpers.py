@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import sys
+import warnings
 from datetime import datetime, timedelta
 from typing import TextIO
 
@@ -63,6 +65,69 @@ ALL_GROUPS = [
     "mag_total",
     "mag_ecef",
 ]
+
+
+@contextlib.contextmanager
+def report_tle_warnings():
+    """Present TLEExtrapolationWarnings as clean one-line CLI warnings.
+
+    The first warning per satellite is printed to stderr immediately in
+    "Warning: ..." style with the CLI remedy; repeats are suppressed while
+    their counts accumulate, and an accurate per-satellite total is printed
+    at the end when repeats occurred.
+    """
+    from thistle.propagator import (
+        _REMEDY_STEM,
+        TLEExtrapolationWarning,
+        _fmt_satnum,
+        _fmt_timedelta,
+    )
+
+    stats: dict[int, dict] = {}
+
+    with warnings.catch_warnings():
+        # Guarantee repeats reach showwarning so tallies stay accurate.
+        warnings.simplefilter("always", TLEExtrapolationWarning)
+        default_show = warnings.showwarning
+
+        def _show(message, category, filename, lineno, file=None, line=None):
+            if not isinstance(message, TLEExtrapolationWarning):
+                default_show(message, category, filename, lineno, file, line)
+                return
+            s = stats.get(message.satnum)
+            if s is None:
+                stats[message.satnum] = {
+                    "n_bad": message.n_bad or 0,
+                    "n_total": message.n_total or 0,
+                    "max_offset": message.max_offset,
+                    "threshold": message.threshold,
+                    "repeats": 0,
+                }
+                print(
+                    f"Warning: {message.body} {_REMEDY_STEM}"
+                    "--warn-days N (0 disables).",
+                    file=sys.stderr,
+                )
+            else:
+                s["repeats"] += 1
+                s["n_bad"] += message.n_bad or 0
+                s["n_total"] += message.n_total or 0
+                s["max_offset"] = max(s["max_offset"], message.max_offset)
+
+        warnings.showwarning = _show
+        try:
+            yield
+        finally:
+            for satnum, s in stats.items():
+                if s["repeats"] and s["n_total"]:
+                    print(
+                        f"Warning: satellite {_fmt_satnum(satnum)}: in total, "
+                        f"{s['n_bad']:,} of {s['n_total']:,} propagation times "
+                        f"were more than {_fmt_timedelta(s['threshold'])} from "
+                        "the nearest TLE epoch "
+                        f"(worst: {_fmt_timedelta(s['max_offset'])}).",
+                        file=sys.stderr,
+                    )
 
 
 def warn_if_tty(stream: TextIO, name: str) -> None:

@@ -431,6 +431,10 @@ class TestGenerate:
         for key in ("eci_x", "eci_y", "eci_z"):
             assert result[key].dtype == np.float64, f"{key} not float64"
 
+    @pytest.mark.filterwarnings(
+        # The 10-day window deliberately runs past the 3 loaded TLE epochs.
+        "ignore::thistle.propagator.TLEExtrapolationWarning"
+    )
     def test_generate_with_propagator(self):
         """Test generate() with a Propagator object."""
         # Load multiple TLEs

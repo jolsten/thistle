@@ -1,5 +1,6 @@
 """Functions for finding satellite events: passes, node crossings, sunlit/eclipse and ascending/descending periods."""
 
+import warnings
 from typing import Optional, Union, cast
 
 import numpy as np
@@ -34,15 +35,23 @@ def _split_window(
     propagator: "Propagator",
 ) -> list[tuple[np.datetime64, np.datetime64, EarthSatellite]]:
     """Split a time window into sub-windows at TLE transition boundaries."""
-    transitions = propagator.switcher.transitions
-    inner = transitions[(transitions > start) & (transitions < stop)]
-    boundaries = np.concatenate([[start], inner, [stop]])
-    result = []
-    for i in range(len(boundaries) - 1):
-        sub_start, sub_stop = boundaries[i], boundaries[i + 1]
-        sat = propagator.find_satellite(sub_start + (sub_stop - sub_start) // 2)
-        result.append((sub_start, sub_stop, sat))
-    return result
+    from thistle.propagator import TLEExtrapolationWarning
+
+    # One window-phrased coverage warning per events call; the per-midpoint
+    # find_satellite warnings below are suppressed so an out-of-coverage
+    # window does not warn once per sub-window.
+    propagator.check_coverage(start, stop, stacklevel=5)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=TLEExtrapolationWarning)
+        transitions = propagator.switcher.transitions
+        inner = transitions[(transitions > start) & (transitions < stop)]
+        boundaries = np.concatenate([[start], inner, [stop]])
+        result = []
+        for i in range(len(boundaries) - 1):
+            sub_start, sub_stop = boundaries[i], boundaries[i + 1]
+            sat = propagator.find_satellite(sub_start + (sub_stop - sub_start) // 2)
+            result.append((sub_start, sub_stop, sat))
+        return result
 
 
 def _merge_periods(periods: list[dict]) -> list[dict]:

@@ -3,11 +3,15 @@
 Provides a :class:`Propagator` that manages multiple TLEs for a satellite and
 selects the most appropriate one at each propagation time using a configurable
 :class:`SwitchingStrategy`.
+
+Requested times far from every loaded TLE epoch produce a
+:class:`TLEExtrapolationWarning` (see :class:`Propagator`'s ``warn_threshold``).
 """
 
 import abc
 import datetime
-from typing import Literal, Union, get_args
+import warnings
+from typing import Literal, Optional, Union, get_args
 
 import numpy as np
 import numpy.typing as npt
@@ -22,7 +26,9 @@ from thistle.utils import (
     DATETIME_MIN,
     EPOCH_DTYPE,
     datetime_to_dt64,
+    dt64_to_datetime,
     time_to_dt64,
+    to_alpha5,
     validate_datetime64,
 )
 
@@ -35,6 +41,88 @@ UTC = datetime.timezone.utc
 
 SwitchingStrategies = Literal["epoch", "midpoint", "tca"]
 """Valid switching strategy names for :class:`Propagator`."""
+
+DEFAULT_WARN_THRESHOLD = datetime.timedelta(days=7)
+"""Default ``warn_threshold`` for :class:`Propagator`."""
+
+_CONSEQUENCE = "SGP4 accuracy degrades rapidly; results may be unreliable."
+_REMEDY_STEM = "Consider adding TLEs covering the requested times, or adjust with "
+_API_KNOB = (
+    "Propagator(..., warn_threshold=timedelta(days=N)); "
+    "warn_threshold=None disables."
+)
+
+
+class TLEExtrapolationWarning(UserWarning):
+    """Propagation was requested far from any loaded TLE epoch.
+
+    Emitted by :class:`Propagator` when requested times are farther than its
+    ``warn_threshold`` from the nearest TLE epoch -- before the oldest epoch,
+    after the newest, or inside an interior coverage gap.
+
+    Attributes:
+        body: Diagnosis and consequence text without the API remedy tail
+            (the CLI appends its own remedy instead).
+        satnum: Satellite catalog number.
+        n_bad: Number of requested times beyond the threshold, or None for
+            a window check (:meth:`Propagator.check_coverage`).
+        n_total: Total number of requested times in the call, or None for
+            a window check.
+        max_offset: Largest distance from an offending time to its nearest
+            TLE epoch.
+        threshold: The propagator's ``warn_threshold``.
+        span: (first, last) TLE epoch of the loaded set.
+    """
+
+    def __init__(
+        self,
+        body: str,
+        *,
+        satnum: int,
+        n_bad: Optional[int],
+        n_total: Optional[int],
+        max_offset: datetime.timedelta,
+        threshold: datetime.timedelta,
+        span: "tuple[datetime.datetime, datetime.datetime]",
+    ) -> None:
+        self.body = body
+        self.satnum = satnum
+        self.n_bad = n_bad
+        self.n_total = n_total
+        self.max_offset = max_offset
+        self.threshold = threshold
+        self.span = span
+        super().__init__(f"{body} {_REMEDY_STEM}{_API_KNOB}")
+
+
+def _fmt_timedelta(td: datetime.timedelta) -> str:
+    """Format a timedelta as e.g. '32.4 days', '7 days', or '18.2 hours'."""
+    seconds = td.total_seconds()
+    days = seconds / 86400.0
+    if days >= 1.0:
+        value, unit = days, "day"
+    else:
+        value, unit = seconds / 3600.0, "hour"
+    text = str(int(round(value))) if abs(value - round(value)) < 1e-9 else f"{value:.1f}"
+    plural = "" if text == "1" else "s"
+    return f"{text} {unit}{plural}"
+
+
+def _fmt_satnum(satnum: int) -> str:
+    """Format a catalog number, using Alpha-5 above the 5-digit range."""
+    return to_alpha5(satnum) if satnum > 99_999 else str(satnum)
+
+
+def _fmt_minute(dt64: np.datetime64) -> str:
+    """Format a datetime64 as an ISO 8601 string at minute precision, UTC."""
+    return str(dt64.astype("datetime64[m]")) + "Z"
+
+
+def _fmt_epoch_span(epochs: npt.NDArray[np.datetime64]) -> str:
+    """Format the first/last epoch dates as a coverage span."""
+    first = str(epochs[0].astype("datetime64[D]"))
+    last = str(epochs[-1].astype("datetime64[D]"))
+    return first if first == last else f"{first} to {last}"
 
 
 # Transition Examples
@@ -298,11 +386,15 @@ class Propagator:
         satellites: EarthSatellite objects created from the input TLEs.
         switcher: The active TLE switching strategy.
         ts: Skyfield timescale used for time conversions.
+        warn_threshold: Distance from the nearest TLE epoch beyond which
+            requested times trigger a :class:`TLEExtrapolationWarning`,
+            or None when the warning is disabled.
     """
 
     satellites: list[EarthSatellite]
     switcher: SwitchingStrategy
     ts: Timescale
+    warn_threshold: Optional[datetime.timedelta]
 
     def __init__(
         self,
@@ -311,6 +403,7 @@ class Propagator:
         method: Union[SwitchingStrategies, SwitchingStrategy] = "epoch",
         start: Union[datetime.datetime, None] = None,
         stop: Union[datetime.datetime, None] = None,
+        warn_threshold: Union[datetime.timedelta, float, None] = DEFAULT_WARN_THRESHOLD,
     ) -> None:
         """Initialize the propagator.
 
@@ -325,6 +418,10 @@ class Propagator:
                 to this time range will be kept.
             stop: Optional stop time to filter TLEs. Only TLEs relevant
                 to this time range will be kept.
+            warn_threshold: Distance from the nearest TLE epoch beyond which
+                requested times trigger a :class:`TLEExtrapolationWarning`.
+                A timedelta, or a number of days; None or a non-positive
+                value disables the warning. Defaults to 7 days.
 
         Raises:
             ValueError: If method is a string that is not a valid strategy name.
@@ -352,6 +449,18 @@ class Propagator:
 
             self.satellites = self.satellites[lo:hi]
 
+        if warn_threshold is not None and not isinstance(
+            warn_threshold, datetime.timedelta
+        ):
+            warn_threshold = datetime.timedelta(days=warn_threshold)
+        if warn_threshold is not None and warn_threshold.total_seconds() <= 0:
+            warn_threshold = None
+        self.warn_threshold = warn_threshold
+        self._epochs = np.array(
+            [datetime_to_dt64(s.epoch.utc_datetime()) for s in self.satellites],
+            dtype=EPOCH_DTYPE,
+        )
+
         if isinstance(method, SwitchingStrategy):
             method.satellites = sorted(
                 self.satellites, key=lambda sat: sat.epoch.utc_datetime()
@@ -376,8 +485,142 @@ class Propagator:
 
         self.switcher.compute_transitions()
 
+    def _nearest_epoch_distance(
+        self, times: npt.NDArray[np.datetime64]
+    ) -> npt.NDArray[np.timedelta64]:
+        """Distance from each time to the nearest loaded TLE epoch."""
+        epochs = self._epochs
+        idx = np.searchsorted(epochs, times)
+        prev_idx = np.clip(idx - 1, 0, epochs.size - 1)
+        next_idx = np.clip(idx, 0, epochs.size - 1)
+        return np.minimum(
+            np.abs(times - epochs[prev_idx]),
+            np.abs(epochs[next_idx] - times),
+        )
+
+    def _emit_extrapolation_warning(
+        self,
+        body: str,
+        n_bad: Optional[int],
+        n_total: Optional[int],
+        max_offset: datetime.timedelta,
+        threshold: datetime.timedelta,
+        stacklevel: int,
+    ) -> None:
+        warnings.warn(
+            TLEExtrapolationWarning(
+                body,
+                satnum=self.satellites[0].model.satnum,
+                n_bad=n_bad,
+                n_total=n_total,
+                max_offset=max_offset,
+                threshold=threshold,
+                span=(
+                    dt64_to_datetime(self._epochs[0]),
+                    dt64_to_datetime(self._epochs[-1]),
+                ),
+            ),
+            stacklevel=stacklevel,
+        )
+
+    def _warn_if_outside_coverage(
+        self, times: npt.NDArray[np.datetime64], stacklevel: int = 4
+    ) -> None:
+        """Warn when requested times are far from every loaded TLE epoch.
+
+        ``stacklevel`` is measured from the internal ``warnings.warn`` call;
+        the default points at the caller of the public method that invoked
+        this helper.
+        """
+        threshold = self.warn_threshold
+        if threshold is None or self._epochs.size == 0:
+            return
+        times = np.asarray(times)
+        if times.size == 0:
+            return
+        times_us = times.astype(EPOCH_DTYPE)
+        dist = self._nearest_epoch_distance(times_us)
+        threshold64 = np.timedelta64(round(threshold.total_seconds() * 1_000_000), "us")
+        n_bad = int(np.count_nonzero(dist > threshold64))
+        if n_bad == 0:
+            return
+        max_offset = datetime.timedelta(
+            microseconds=int(dist.max() / np.timedelta64(1, "us"))
+        )
+        n_total = int(times_us.size)
+        satnum = _fmt_satnum(self.satellites[0].model.satnum)
+        span = _fmt_epoch_span(self._epochs)
+        thr = _fmt_timedelta(threshold)
+        if n_total == 1:
+            body = (
+                f"satellite {satnum}: requested time {_fmt_minute(times_us[0])} "
+                f"is {_fmt_timedelta(max_offset)} from the nearest TLE epoch "
+                f"(TLEs cover {span}; warn threshold: {thr}). {_CONSEQUENCE}"
+            )
+        else:
+            count = (
+                f"all {n_total:,}" if n_bad == n_total else f"{n_bad:,} of {n_total:,}"
+            )
+            body = (
+                f"satellite {satnum}: {count} propagation times are more than "
+                f"{thr} from the nearest TLE epoch "
+                f"(worst: {_fmt_timedelta(max_offset)}; TLEs cover {span}). "
+                f"{_CONSEQUENCE}"
+            )
+        self._emit_extrapolation_warning(
+            body, n_bad, n_total, max_offset, threshold, stacklevel
+        )
+
+    def check_coverage(
+        self, start: DateTime, stop: DateTime, *, stacklevel: int = 3
+    ) -> None:
+        """Warn if any part of [start, stop] is far from the loaded TLE epochs.
+
+        Emits a single :class:`TLEExtrapolationWarning` when some instant in
+        the window lies more than ``warn_threshold`` from the nearest TLE
+        epoch. The nearest-epoch distance peaks either at a window bound or
+        at the midpoint between consecutive epochs, so only those points
+        need testing.
+
+        Args:
+            start: Start of the time window.
+            stop: End of the time window.
+            stacklevel: Stack level for ``warnings.warn``, measured from the
+                internal warn call (the default points at the caller).
+        """
+        threshold = self.warn_threshold
+        if threshold is None or self._epochs.size == 0:
+            return
+        t0 = validate_datetime64(start)
+        t1 = validate_datetime64(stop)
+        epochs = self._epochs
+        mids = epochs[:-1] + (epochs[1:] - epochs[:-1]) // 2
+        inner = mids[(mids > t0) & (mids < t1)]
+        samples = np.concatenate([np.atleast_1d(t0), inner, np.atleast_1d(t1)])
+        dist = self._nearest_epoch_distance(samples)
+        threshold64 = np.timedelta64(round(threshold.total_seconds() * 1_000_000), "us")
+        max_dist = dist.max()
+        if max_dist <= threshold64:
+            return
+        max_offset = datetime.timedelta(
+            microseconds=int(max_dist / np.timedelta64(1, "us"))
+        )
+        body = (
+            f"satellite {_fmt_satnum(self.satellites[0].model.satnum)}: "
+            f"the requested window {_fmt_minute(t0)} to {_fmt_minute(t1)} "
+            f"extends up to {_fmt_timedelta(max_offset)} from the nearest TLE "
+            f"epoch (TLEs cover {_fmt_epoch_span(epochs)}; warn threshold: "
+            f"{_fmt_timedelta(threshold)}). {_CONSEQUENCE}"
+        )
+        self._emit_extrapolation_warning(
+            body, None, None, max_offset, threshold, stacklevel
+        )
+
     def find_satellite(self, time: DateTime) -> EarthSatellite:
         """Find the appropriate satellite for a given time.
+
+        Emits :class:`TLEExtrapolationWarning` when the time is farther than
+        ``warn_threshold`` from the nearest TLE epoch.
 
         Args:
             time: The target time as a datetime or numpy.datetime64.
@@ -387,6 +630,7 @@ class Propagator:
             given time according to the switching strategy.
         """
         time = validate_datetime64(time)
+        self._warn_if_outside_coverage(np.atleast_1d(time))
         indices = _slices_by_transitions(self.switcher.transitions, np.atleast_1d(time))
         idx, _ = indices[0]
         return self.satellites[idx]
@@ -424,6 +668,9 @@ class Propagator:
         strategy to produce the most accurate position across the time
         range.
 
+        Emits :class:`TLEExtrapolationWarning` when requested times are
+        farther than ``warn_threshold`` from the nearest TLE epoch.
+
         Args:
             tt: A skyfield Time object, scalar or array.
 
@@ -432,6 +679,7 @@ class Propagator:
             segments.
         """
         dt64 = time_to_dt64(tt)
+        self._warn_if_outside_coverage(dt64)
         indices = _slices_by_transitions(self.switcher.transitions, dt64)
         geos = []
         for idx, slice_ in indices:
@@ -447,6 +695,9 @@ class Propagator:
         Each segment pairs a contiguous slice of the input times with the
         EarthSatellite that should be used for propagation in that interval.
 
+        Emits :class:`TLEExtrapolationWarning` when requested times are
+        farther than ``warn_threshold`` from the nearest TLE epoch.
+
         Args:
             times: Sorted array of datetime64 values.
 
@@ -454,6 +705,7 @@ class Propagator:
             A list of (time_slice, satellite) tuples, ordered
             chronologically.
         """
+        self._warn_if_outside_coverage(times)
         slices = _slices_by_transitions(self.switcher.transitions, times)
         return [
             (times[indices], self.satellites[sat_idx])

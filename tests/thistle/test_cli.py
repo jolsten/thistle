@@ -914,3 +914,71 @@ def test_main_without_typer(monkeypatch, capsys):
     assert exc.value.code == 1
     err = capsys.readouterr().err
     assert "pip install 'thistle[cli]'" in err
+
+
+# ---- extrapolation warnings -----------------------------------------------
+
+
+def test_propagate_warns_stale_times(runner, tle_file):
+    result = runner.invoke(
+        app,
+        ["propagate", str(tle_file), "--eci"],
+        input="2024-03-01T00:00:00\n2024-03-01T01:00:00\n",
+    )
+    assert result.exit_code == 0
+    assert result.stdout.startswith("2024-03-01T00:00:00 ")
+    assert result.stderr.count("Warning: satellite 25544") == 1
+    assert "all 2 propagation times are more than 7 days" in result.stderr
+    assert "--warn-days N (0 disables)." in result.stderr
+    assert "in total" not in result.stderr  # single chunk: no tally line
+
+
+def test_propagate_warn_days_zero_disables(runner, tle_file):
+    result = runner.invoke(
+        app,
+        ["propagate", str(tle_file), "--eci", "--warn-days", "0"],
+        input="2024-03-01T00:00:00\n",
+    )
+    assert result.exit_code == 0
+    assert "Warning: satellite" not in result.stderr
+
+
+def test_propagate_warn_days_widens(runner, tle_file):
+    result = runner.invoke(
+        app,
+        ["propagate", str(tle_file), "--eci", "--warn-days", "90"],
+        input="2024-03-01T00:00:00\n",
+    )
+    assert result.exit_code == 0
+    assert "Warning: satellite" not in result.stderr
+
+
+def test_propagate_warning_tally_across_chunks(runner, tle_file):
+    times = "".join(f"2024-03-0{d}T00:00:00\n" for d in range(1, 4))
+    result = runner.invoke(
+        app,
+        ["propagate", str(tle_file), "--eci", "--chunk", "1"],
+        input=times,
+    )
+    assert result.exit_code == 0
+    # First warning immediately, then one accurate tally at the end.
+    assert result.stderr.count("Warning: satellite 25544") == 2
+    assert "in total, 3 of 3 propagation times" in result.stderr
+
+
+def test_find_tle_warns_stale_time(runner, tle_file):
+    result = runner.invoke(
+        app, ["find-tle", str(tle_file)], input="2024-03-01T00:00:00\n"
+    )
+    assert result.exit_code == 0
+    assert result.stdout.startswith("1 25544U")  # TLE still emitted
+    assert "requested time 2024-03-01T00:00Z is" in result.stderr
+    assert "--warn-days N (0 disables)." in result.stderr
+
+
+def test_find_tle_no_warning_near_epoch(runner, tle_file):
+    result = runner.invoke(
+        app, ["find-tle", str(tle_file)], input="2024-01-01T12:00:00\n"
+    )
+    assert result.exit_code == 0
+    assert "Warning: satellite" not in result.stderr

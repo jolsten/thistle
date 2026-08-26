@@ -220,6 +220,24 @@ lats, lons = visibility_circle(28.57, -80.65, alt=0.0, sat_alt=408_000, min_el=1
 
 SGP4 propagation from TLEs is inherently limited to roughly 1-10 km near epoch, degrading to 10-100 km over days. For sub-kilometer accuracy, use precision ephemerides (SP3) instead of TLEs.
 
+### Extrapolation warnings
+
+When requested times are more than 7 days from the nearest loaded TLE epoch -- before the first TLE, after the last, or inside a coverage gap -- `Propagator` emits a `thistle.TLEExtrapolationWarning`, since SGP4 results that far from epoch are questionable. Tune or disable it per propagator, or with the standard warnings machinery:
+
+```python
+import warnings
+from datetime import timedelta
+from thistle import Propagator, TLEExtrapolationWarning
+
+prop = Propagator(tles, warn_threshold=timedelta(days=14))  # widen
+prop = Propagator(tles, warn_threshold=None)                # disable
+
+warnings.filterwarnings("ignore", category=TLEExtrapolationWarning)  # global
+warnings.simplefilter("error", TLEExtrapolationWarning)  # make it fatal
+```
+
+The CLI commands that propagate (`propagate`, `find-tle`, `groundtrack`) print the same warning once per satellite on stderr and accept `--warn-days N` (0 disables).
+
 ### Time scale
 
 Thistle treats UTC as UT1, introducing ~0.2-0.9 seconds of time offset (~1-7 m position error for LEO). This is negligible compared to TLE propagation errors and avoids the ~12x overhead of proper UTC/leap-second handling.

@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.9.0]
+
+### Added
+
+- `Propagator` now warns when requested propagation times are more than
+  `warn_threshold` (default: 7 days) from the nearest loaded TLE epoch --
+  before the first TLE, after the last, or inside a coverage gap -- since
+  SGP4 results that far from epoch are questionable. The new
+  `thistle.TLEExtrapolationWarning` carries the offending counts, worst
+  offset, threshold, and epoch span as attributes; `warn_threshold` accepts
+  a timedelta or a number of days, and `None`/`0` disables. `at()`,
+  `segment_times()` (and therefore `generate()`/`generate_range()`),
+  `find_satellite()`/`find_satrec()`/`find_tle()`, and the event-finding
+  functions all participate; a new `Propagator.check_coverage(start, stop)`
+  checks a whole window. Event functions emit at most one window-phrased
+  warning per call.
+- CLI: `propagate`, `find-tle`, and `groundtrack` gained `--warn-days N`
+  (default 7, 0 disables) and present the warning as a clean one-line
+  `Warning: ...` on stderr -- printed once per satellite, with an accurate
+  end-of-run total when more warnings were suppressed. stdout is unaffected.
+
+### Fixed
+
+- `generate()` with a `Propagator` returned its data dict in a
+  nondeterministic key order (it iterated a `set`), so `thistle propagate`
+  column order could differ between runs. Keys now follow the requested
+  group order.
+
 ## [0.8.1]
 
 ### Changed
