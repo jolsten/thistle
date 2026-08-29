@@ -3169,6 +3169,15 @@ wheels = [
 ]
 
 [[package]]
+name = "skyfield-data"
+version = "7.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d3/6a/2f8d001dfcacb737cbdbc96db566eb9de9ebf0493bf9780785c42215c397/skyfield_data-7.0.0.tar.gz", hash = "sha256:df3b4f0f5b5b57e5adf5a0a5d30d73ca23dd4066ee666da3222d7bd63d580bbd", size = 16984524, upload-time = "2025-08-26T21:03:16.436Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bb/46/e815e37cfb1f1108d80e45ee100c8a6d9f1d5999ccf1cf14dab7be6858dc/skyfield_data-7.0.0-py2.py3-none-any.whl", hash = "sha256:4279f999f7f8c5ef5d8bf1b714f301a0844ae5df3a3f0d23610b20d8789073f5", size = 17000415, upload-time = "2025-08-26T21:01:59.484Z" },
+]
+
+[[package]]
 name = "sniffio"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
@@ -3324,6 +3333,7 @@ dependencies = [
     { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "sgp4" },
     { name = "skyfield" },
+    { name = "skyfield-data" },
 ]
 
 [package.optional-dependencies]
@@ -3350,6 +3360,7 @@ requires-dist = [
     { name = "scipy", specifier = ">=1.13.1" },
     { name = "sgp4", specifier = ">=2.23" },
     { name = "skyfield", specifier = ">=1.53" },
+    { name = "skyfield-data", specifier = ">=7.0.0" },
     { name = "thistle-db", marker = "python_full_version >= '3.11' and extra == 'db'", editable = "packages/thistle-db" },
     { name = "typer", marker = "python_full_version >= '3.10' and extra == 'cli'", specifier = ">=0.12" },
     { name = "typer", marker = "python_full_version >= '3.10' and extra == 'db'", specifier = ">=0.12" },

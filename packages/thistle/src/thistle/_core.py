@@ -5,12 +5,13 @@ It is internal (not part of the public API) but its non-underscore names
 are the stable inter-module contract.
 """
 
-import pathlib
+import warnings
 from typing import Dict, Sequence, Tuple, Union, cast
 
 import numpy as np
 import numpy.typing as npt
-from skyfield.api import EarthSatellite, load, wgs84
+from skyfield.api import EarthSatellite, Loader, wgs84
+from skyfield_data import get_skyfield_data_path
 
 from thistle.utils import dt64_to_time
 
@@ -18,10 +19,23 @@ from thistle.utils import dt64_to_time
 # Singletons
 # ---------------------------------------------------------------------------
 
-_DATA_DIR = pathlib.Path(__file__).parent / "data"
+# The ephemeris comes from skyfield-data, which bundles de421.bsp in its
+# wheel — nothing is ever downloaded at runtime (the Loader would only
+# fetch a file missing from that directory, and de421.bsp is guaranteed
+# present there).
+#
+# get_skyfield_data_path() emits a RuntimeWarning when any bundled file's
+# snapshot has expired — in practice finals2000A.all, whose predictions
+# run out about a year after each skyfield-data release. thistle never
+# reads that file: timescales are built with skyfield's builtin tables,
+# and de421.bsp only needs its coverage window (through 2053), so the
+# warning is suppressed here rather than surfaced to every caller.
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", RuntimeWarning)
+    _load = Loader(get_skyfield_data_path(), verbose=False)
 
-ts = load.timescale()
-eph = load(str(_DATA_DIR / "de421.bsp"))
+ts = _load.timescale()
+eph = _load("de421.bsp")
 
 # ---------------------------------------------------------------------------
 # Constants

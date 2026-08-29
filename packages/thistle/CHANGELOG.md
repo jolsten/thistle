@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.10.0] - 2026-08-29
+
+### Changed
+
+- The bundled 17 MB `de421.bsp` ephemeris is no longer shipped inside the
+  thistle wheel (now ~58 KB). It comes from the new `skyfield-data`
+  dependency instead, which bundles the same file in *its* wheel — so
+  installs remain fully offline, nothing is ever downloaded at runtime,
+  and the ephemeris data is identical. `skyfield-data` also carries
+  `finals2000A.all` (Earth rotation data) and warns when its bundled
+  files expire; thistle never reads that file (timescales use skyfield's
+  builtin tables — verified offline against an empty data directory), so
+  the expiration warning is suppressed at import rather than surfaced to
+  every caller. de421.bsp itself is a frozen product with coverage
+  through 2053.
+
 ## [0.9.0]
 
 ### Added

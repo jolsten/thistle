@@ -28,6 +28,9 @@ dependencies = [
     "scipy>=1.13.1",
     "sgp4>=2.23",
     "skyfield>=1.53",
+    # Bundles de421.bsp in its wheel, so no runtime download is ever needed
+    # (replaces the 17 MB copy previously vendored in thistle itself).
+    "skyfield-data>=7.0.0",
 ]
 dynamic = ["version"]
 
