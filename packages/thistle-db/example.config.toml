@@ -14,6 +14,15 @@
 drivername = "sqlite"
 name = "tle.db"
 
+# Alternative: no element-set database at all. Ingest writes the output
+# files directly; the first type="object", format="tle" entry below is the
+# canonical store. The [database] section is then ignored, and omm outputs
+# are not supported. See CLAUDE.md "Storage backends".
+# [storage]
+# backend = "files"
+# state = "./thistle-state.sqlite"  # ingest file-tracking cache (auto-created)
+# flush_records = 1000000           # memory budget per flush
+
 [ingest]
 # Records that cannot be stored (unparseable text, elsets whose mandatory
 # elements are not finite numbers, rows the database refuses) are copied

@@ -11,6 +11,7 @@ from sqlalchemy import Table, select
 from sqlalchemy.orm import Session
 
 from thistle_db.config import DEFAULT_MAX_EPOCH_AHEAD_DAYS, IngestSource
+from thistle_db.filestore import FileStore, StoredElset
 from thistle_db.model import (
     EpochDateState,
     IngestFile,
@@ -226,29 +227,18 @@ def _bulk_insert_ignore(
     return total_inserted
 
 
-def ingest_tles(
-    session: Session,
+def _validated_tles(
     tles: Iterable[TLETuple],
-    rejects: RejectSink = NO_REJECTS,
-    *,
-    max_epoch_ahead_days: int = DEFAULT_MAX_EPOCH_AHEAD_DAYS,
-) -> int:
-    """Ingest TLE tuples into the database.
+    rejects: RejectSink,
+    max_epoch_ahead_days: int,
+) -> Iterable[TLE]:
+    """Parse and validate TLE tuples, yielding storable `TLE` objects.
 
-    Consumes the iterable lazily in CHUNK_SIZE batches, so arbitrarily large
-    inputs (full-catalog restores) never materialize in memory. Skips
-    malformed records and duplicates. Returns count of newly inserted rows.
-
-    Records that cannot be stored are reported to `rejects` — quarantined
-    for inspection when the caller supplies a writer, dropped otherwise.
-    That includes elsets whose epoch runs more than `max_epoch_ahead_days`
-    into the future (see `config.IngestConfig.max_epoch_ahead_days`; 0
-    disables) — a corrupted epoch parses cleanly into 2000-2056, and a
-    stored one permanently degrades that object's incremental output.
+    The one validation path shared by both storage backends: malformed
+    records (no orbit to store), unparseable text, and future-epoch elsets
+    are reported to `rejects` and skipped; everything yielded is safe to
+    store. Lazy, so arbitrarily large inputs never materialize.
     """
-    table = _TLE_TABLE
-    total = 0
-    records: list[dict] = []
     epoch_limit = _epoch_limit(max_epoch_ahead_days)
     for line1, line2 in tles:
         rejects.seen()
@@ -277,7 +267,83 @@ def ingest_tles(
                     line2=line2,
                 )
             else:
-                records.append(_tle_to_record(tle))
+                yield tle
+
+
+def _to_stored_elset(tle: TLE, rejects: RejectSink) -> Optional[StoredElset]:
+    """A validated TLE as a file-store record, or None (rejected).
+
+    The files backend routes every record to its object's file, so a record
+    without a NORAD ID has no home there (the database keeps such rows but
+    they appear in no output either way).
+    """
+    if tle.norad_cat_id is None:
+        rejects.reject(
+            "no NORAD ID (files backend stores records per object)",
+            line1=tle.line1,
+            line2=tle.line2,
+        )
+        return None
+    return StoredElset(
+        norad_cat_id=tle.norad_cat_id,
+        epoch=tle.epoch,
+        line1=tle.line1,
+        line2=tle.line2,
+        line_hash=tle.line_hash,
+    )
+
+
+def _store_tles(
+    store: FileStore,
+    tles: Iterable[TLETuple],
+    rejects: RejectSink = NO_REJECTS,
+    *,
+    max_epoch_ahead_days: int = DEFAULT_MAX_EPOCH_AHEAD_DAYS,
+) -> int:
+    """Files-backend counterpart of `ingest_tles`: validate and buffer.
+
+    Returns the count newly buffered (post within-run dedup); on-disk
+    duplicates are dropped at flush time.
+    """
+    total = 0
+    batch: list[StoredElset] = []
+    for tle in _validated_tles(tles, rejects, max_epoch_ahead_days):
+        rec = _to_stored_elset(tle, rejects)
+        if rec is None:
+            continue
+        batch.append(rec)
+        if len(batch) >= CHUNK_SIZE:
+            total += store.add(batch)
+            batch = []
+    total += store.add(batch)
+    return total
+
+
+def ingest_tles(
+    session: Session,
+    tles: Iterable[TLETuple],
+    rejects: RejectSink = NO_REJECTS,
+    *,
+    max_epoch_ahead_days: int = DEFAULT_MAX_EPOCH_AHEAD_DAYS,
+) -> int:
+    """Ingest TLE tuples into the database.
+
+    Consumes the iterable lazily in CHUNK_SIZE batches, so arbitrarily large
+    inputs (full-catalog restores) never materialize in memory. Skips
+    malformed records and duplicates. Returns count of newly inserted rows.
+
+    Records that cannot be stored are reported to `rejects` — quarantined
+    for inspection when the caller supplies a writer, dropped otherwise.
+    That includes elsets whose epoch runs more than `max_epoch_ahead_days`
+    into the future (see `config.IngestConfig.max_epoch_ahead_days`; 0
+    disables) — a corrupted epoch parses cleanly into 2000-2056, and a
+    stored one permanently degrades that object's incremental output.
+    """
+    table = _TLE_TABLE
+    total = 0
+    records: list[dict] = []
+    for tle in _validated_tles(tles, rejects, max_epoch_ahead_days):
+        records.append(_tle_to_record(tle))
         if len(records) >= CHUNK_SIZE:
             total += _bulk_insert_ignore(
                 session, table, records, _TLE_CONFLICT, rejects
@@ -312,27 +378,19 @@ def _tle_to_record(tle: TLE, now=None) -> dict:
     return record
 
 
-def ingest_omm(
-    session: Session,
+def _validated_omm(
     omm_records: list[dict],
-    rejects: RejectSink = NO_REJECTS,
-    *,
-    max_epoch_ahead_days: int = DEFAULT_MAX_EPOCH_AHEAD_DAYS,
-) -> int:
-    """Ingest OMM records into the database.
+    rejects: RejectSink,
+    max_epoch_ahead_days: int,
+) -> Iterable[tuple[TLE, dict]]:
+    """Parse and validate OMM records, yielding (TLE, omm record) pairs.
 
-    Extracts TLE_LINE1/TLE_LINE2 from each record, inserts into TLE table,
-    then populates OmmMetadata for rows that don't have it yet.
-    Returns count of newly inserted TLE rows.
-
-    Records that cannot be stored are reported to `rejects`, which
-    quarantines them as OMM JSON — the original record, not just its lines.
+    The OMM twin of `_validated_tles`, shared by both storage backends:
+    records without TLE lines, unparseable/malformed lines, and
+    future-epoch elsets are reported to `rejects` (as OMM JSON — the
+    original record, not just its lines) and skipped.
     """
-    # Build TLE records from OMM data
-    tle_records = []
-    omm_by_hash: dict[bytes, dict] = {}
     epoch_limit = _epoch_limit(max_epoch_ahead_days)
-
     for omm in omm_records:
         rejects.seen()
         line1 = omm.get("TLE_LINE1", "").strip()
@@ -366,9 +424,60 @@ def ingest_omm(
                     record=omm,
                 )
             else:
-                record = _tle_to_record(tle)
-                tle_records.append(record)
-                omm_by_hash[record["line_hash"]] = omm
+                yield tle, omm
+
+
+def _store_omm(
+    store: FileStore,
+    omm_records: list[dict],
+    rejects: RejectSink = NO_REJECTS,
+    *,
+    max_epoch_ahead_days: int = DEFAULT_MAX_EPOCH_AHEAD_DAYS,
+) -> int:
+    """Files-backend counterpart of `ingest_omm`: buffer the TLE lines.
+
+    The metadata fields are discarded — the files backend has no metadata
+    store (config validation already refuses omm *outputs*); the caller
+    warns per file so the discard is visible. Returns the count newly
+    buffered.
+    """
+    total = 0
+    batch: list[StoredElset] = []
+    for tle, _omm in _validated_omm(omm_records, rejects, max_epoch_ahead_days):
+        rec = _to_stored_elset(tle, rejects)
+        if rec is None:
+            continue
+        batch.append(rec)
+        if len(batch) >= CHUNK_SIZE:
+            total += store.add(batch)
+            batch = []
+    total += store.add(batch)
+    return total
+
+
+def ingest_omm(
+    session: Session,
+    omm_records: list[dict],
+    rejects: RejectSink = NO_REJECTS,
+    *,
+    max_epoch_ahead_days: int = DEFAULT_MAX_EPOCH_AHEAD_DAYS,
+) -> int:
+    """Ingest OMM records into the database.
+
+    Extracts TLE_LINE1/TLE_LINE2 from each record, inserts into TLE table,
+    then populates OmmMetadata for rows that don't have it yet.
+    Returns count of newly inserted TLE rows.
+
+    Records that cannot be stored are reported to `rejects`, which
+    quarantines them as OMM JSON — the original record, not just its lines.
+    """
+    # Build TLE records from OMM data
+    tle_records = []
+    omm_by_hash: dict[bytes, dict] = {}
+    for tle, omm in _validated_omm(omm_records, rejects, max_epoch_ahead_days):
+        record = _tle_to_record(tle)
+        tle_records.append(record)
+        omm_by_hash[record["line_hash"]] = omm
 
     # Bulk insert TLE rows
     inserted = _bulk_insert_ignore(
@@ -429,12 +538,18 @@ def ingest_file(
     session: Session,
     path: pathlib.Path,
     *,
+    store: Optional[FileStore] = None,
     reject_dir: Optional[pathlib.Path] = None,
     reject_root: Optional[pathlib.Path] = None,
     reject_namespace: Optional[str] = None,
     max_epoch_ahead_days: int = DEFAULT_MAX_EPOCH_AHEAD_DAYS,
 ) -> int:
-    """Detect format and ingest a single file. Returns count of newly inserted rows.
+    """Detect format and ingest a single file. Returns count of newly inserted
+    rows (with `store` set: count newly buffered — see `FileStore.add`).
+
+    With `store` set (files backend), validated records go to the file-store
+    buffer instead of the database; OMM inputs still ingest (their TLE lines
+    are real data) but their metadata is discarded with a warning.
 
     With `reject_dir` set, records that cannot be stored are quarantined
     under it, mirroring the file's path below `reject_root` (the configured
@@ -452,21 +567,35 @@ def ingest_file(
     ) as rejects:
         ahead = max_epoch_ahead_days
         if fmt == "tle":
-            count = ingest_tles(
-                session, read_tle(path), rejects, max_epoch_ahead_days=ahead
-            )
-        elif fmt == "omm_json":
-            count = ingest_omm(
-                session, read_omm_json(path), rejects, max_epoch_ahead_days=ahead
-            )
-        elif fmt == "omm_csv":
-            count = ingest_omm(
-                session, read_omm_csv(path), rejects, max_epoch_ahead_days=ahead
-            )
+            if store is not None:
+                count = _store_tles(
+                    store, read_tle(path), rejects, max_epoch_ahead_days=ahead
+                )
+            else:
+                count = ingest_tles(
+                    session, read_tle(path), rejects, max_epoch_ahead_days=ahead
+                )
         else:
-            count = ingest_omm(
-                session, read_omm_xml(path), rejects, max_epoch_ahead_days=ahead
-            )
+            readers = {
+                "omm_json": read_omm_json,
+                "omm_csv": read_omm_csv,
+                "omm_xml": read_omm_xml,
+            }
+            records = readers[fmt](path)
+            if store is not None:
+                count = _store_omm(
+                    store, records, rejects, max_epoch_ahead_days=ahead
+                )
+                if count:
+                    logger.warning(
+                        f"  {path.name}: {count} OMM record(s) ingested as TLE "
+                        "lines; metadata discarded (files backend has no "
+                        "metadata store)"
+                    )
+            else:
+                count = ingest_omm(
+                    session, records, rejects, max_epoch_ahead_days=ahead
+                )
 
         summary = rejects.summary() if isinstance(rejects, RejectWriter) else None
     if summary:
@@ -530,6 +659,7 @@ def ingest_source_file(
     session: Session,
     path: pathlib.Path,
     *,
+    store: Optional[FileStore] = None,
     force: bool = False,
     reject_dir: Optional[pathlib.Path] = None,
     reject_root: Optional[pathlib.Path] = None,
@@ -542,6 +672,11 @@ def ingest_source_file(
     being opened. Returns (status, newly_inserted_row_count). Never raises for
     per-file problems — logs a warning and returns (FAILED, 0) instead, leaving
     the file's state unrecorded so it is retried on the next scan.
+
+    With `store` set (files backend), `session` is the state database and a
+    successfully parsed file's state is *deferred* to the store's next flush
+    rather than committed here — its records are still only in memory, and a
+    crash must not mark the file ingested before they reach disk.
     """
     try:
         resolved, key = _path_key(path)
@@ -574,13 +709,18 @@ def ingest_source_file(
         count = ingest_file(
             session,
             path,
+            store=store,
             reject_dir=reject_dir,
             reject_root=reject_root,
             reject_namespace=reject_namespace,
             max_epoch_ahead_days=max_epoch_ahead_days,
         )
 
-        if row is None:
+        if store is not None:
+            store.defer_file_state(
+                resolved, key, stat.st_size, stat.st_mtime_ns, digest
+            )
+        elif row is None:
             session.add(
                 IngestFile(
                     path=resolved,
@@ -590,11 +730,12 @@ def ingest_source_file(
                     sha256=digest,
                 )
             )
+            session.commit()
         else:
             row.size = stat.st_size
             row.mtime_ns = stat.st_mtime_ns
             row.sha256 = digest
-        session.commit()
+            session.commit()
 
         return FileStatus.INGESTED, count
     except Exception as exc:
@@ -607,6 +748,7 @@ def ingest_sources(
     session: Session,
     sources: list[IngestSource],
     *,
+    store: Optional[FileStore] = None,
     force: bool = False,
     reject_dir: Optional[pathlib.Path] = None,
     max_epoch_ahead_days: int = DEFAULT_MAX_EPOCH_AHEAD_DAYS,
@@ -624,6 +766,10 @@ def ingest_sources(
 
     With `reject_dir` set, unstorable records are quarantined there under a
     namespace per source directory (see `rejects.namespaces`).
+
+    With `store` set (files backend), records buffer into the file store —
+    the caller owns the store's lifecycle and must `close()` it after the
+    scan to flush the tail of the buffer.
     """
     total = 0
     roots = [pathlib.Path(source.path) for source in sources]
@@ -659,6 +805,7 @@ def ingest_sources(
             status, count = ingest_source_file(
                 session,
                 file,
+                store=store,
                 force=force,
                 reject_dir=reject_dir,
                 reject_root=source_path,

@@ -327,10 +327,16 @@ def get_tles(satnum: int, config: Settings | None = None) -> list[tuple[str, str
     """Return (line1, line2) pairs for one satellite, ordered by epoch.
 
     Opens a session on the configured database (config.toml / THISTLE_DB_*
-    env vars when `config` is None) and disposes it before returning.
+    env vars when `config` is None) and disposes it before returning. On
+    the files backend this is a plain read of the object's store file — no
+    database is opened at all.
     """
     if config is None:
         config = load_config(None)
+    if config.storage.backend == "files":
+        from thistle_db.filestore import read_object_tles
+
+        return read_object_tles(config.output, satnum)
     session, engine = open_session(config, readonly=True)
     try:
         return [(tle.line1, tle.line2) for tle in tles_for_object(session, satnum)]

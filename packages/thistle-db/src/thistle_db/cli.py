@@ -17,6 +17,16 @@ from thistle_db.api import (
     tles_for_object,
 )
 from thistle_db.config import load_config
+from thistle_db.filestore import (
+    FileStore,
+    dump_store,
+    open_state_session,
+    read_object_tles,
+    rebuild_derived,
+)
+from thistle_db.filestore import (
+    nearest_tles_for_date as nearest_tles_for_date_files,
+)
 from thistle_db.generator import generate as generate_outputs
 from thistle_db.ingest import FileStatus, ingest_source_file, ingest_sources
 from thistle_db.progress import ProgressReporter, console
@@ -104,6 +114,22 @@ name = "thistle-db.db"
 #   3. System secrets file:    set secrets_file below
 #
 # secrets_file = "/etc/thistle-db/secrets.toml"
+
+# ----------------------------------------------
+# Storage backend
+# ----------------------------------------------
+# Where element sets live. The default ("database") keeps everything in the
+# SQL database above and derives output files with `generate`. With
+# backend = "files" there is no element-set database: ingest writes the
+# output files directly — the first type="object", format="tle" entry under
+# [[output.files]] is the canonical store, and date files are updated in
+# the same pass. `generate` is then only needed as `generate --all` to
+# rebuild derived outputs. The files backend does not support omm outputs.
+#
+# [storage]
+# backend = "files"
+# state = "./thistle-state.sqlite"  # ingest file-tracking cache (auto-created)
+# flush_records = 1000000           # memory budget: records buffered per flush
 
 # ----------------------------------------------
 # Ingest sources
@@ -320,6 +346,19 @@ def init_db_cmd(
     _setup_logging(config.logging.level, ctx.obj.log_file)
     url = config.database.url.render_as_string(hide_password=True)
 
+    if config.storage.backend == "files":
+        # No element-set database to create. The state DB is a cache and
+        # would be created on first ingest anyway; creating it here just
+        # lets `init-db` remain the "set up a new deployment" step.
+        session, engine = open_state_session(config)
+        session.close()
+        engine.dispose()
+        print(
+            f"Files backend: no database schema needed. "
+            f"State database ready: {config.storage.state}"
+        )
+        return
+
     if defer_indexes and not drop:
         print(
             "Error: --defer-indexes requires --drop (deferring is only "
@@ -375,7 +414,7 @@ def ingest(
         ),
     ] = False,
 ) -> None:
-    """Ingest TLE/OMM files into the database."""
+    """Ingest TLE/OMM files into the database (or the file store)."""
     config = load_config(ctx.obj.config_path)
     _setup_logging(config.logging.level, ctx.obj.log_file)
 
@@ -383,9 +422,20 @@ def ingest(
         Path(config.ingest.reject_dir) if config.ingest.reject_dir else None
     )
 
-    session, engine = _open_session_or_exit(config)
-    try:
-        with _progress(ctx.obj) as progress:
+    with _progress(ctx.obj) as progress:
+        if config.storage.backend == "files":
+            # State DB (ingest_files only) — a cache, created on first use.
+            session, engine = open_state_session(config)
+            store = FileStore(
+                session,
+                config.output,
+                flush_records=config.storage.flush_records,
+                progress=progress,
+            )
+        else:
+            session, engine = _open_session_or_exit(config)
+            store = None
+        try:
             if files:
                 task = progress.task("Ingesting files", total=len(files))
                 total = 0
@@ -396,6 +446,7 @@ def ingest(
                     status, count = ingest_source_file(
                         session,
                         file,
+                        store=store,
                         force=True,
                         reject_dir=reject_dir,
                         max_epoch_ahead_days=config.ingest.max_epoch_ahead_days,
@@ -404,6 +455,8 @@ def ingest(
                         failed += 1
                     total += count
                     progress.advance(task)
+                if store is not None:
+                    store.close()
                 logger.info(
                     f"Ingested {total} new records from {len(files)} files"
                     + (f" ({failed} failed)" if failed else "")
@@ -418,15 +471,18 @@ def ingest(
                 total = ingest_sources(
                     session,
                     config.ingest.sources,
+                    store=store,
                     force=force,
                     reject_dir=reject_dir,
                     max_epoch_ahead_days=config.ingest.max_epoch_ahead_days,
                     progress=progress,
                 )
+                if store is not None:
+                    store.close()
                 logger.info(f"Ingested {total} new records from configured sources")
-    finally:
-        session.close()
-        engine.dispose()
+        finally:
+            session.close()
+            engine.dispose()
 
 
 @app.command()
@@ -474,6 +530,29 @@ def generate(
             file=sys.stderr,
         )
         raise typer.Exit(code=2)
+
+    if config.storage.backend == "files":
+        # Outputs are maintained by ingest itself on this backend; there is
+        # no incremental generate step and nothing to look back over.
+        if verify:
+            logger.warning(
+                "--verify is not yet implemented for the files backend; "
+                "use `generate --all` to rebuild derived outputs"
+            )
+        if rebuild_all:
+            with _progress(ctx.obj) as progress:
+                rebuild_derived(
+                    config.output,
+                    flush_records=config.storage.flush_records,
+                    progress=progress,
+                )
+        elif not verify:
+            logger.info(
+                "Files backend: outputs are maintained by ingest; "
+                "run `generate --all` to rebuild derived outputs "
+                "(after adding an output entry, or for disaster recovery)"
+            )
+        return
 
     session, engine = _open_session_or_exit(config, readonly=True)
     try:
@@ -527,6 +606,12 @@ def dump(
             file=sys.stderr,
         )
         raise typer.Exit(code=1)
+
+    if config.storage.backend == "files":
+        tle_count = dump_store(config.output, tle_path)
+        print(f"Wrote {tle_path} ({tle_count} TLEs)")
+        print(f"Files backend holds no OMM metadata; {omm_path} not written")
+        return
 
     session, engine = _open_session_or_exit(config, readonly=True)
     try:
@@ -588,6 +673,23 @@ def get_tle(
 
     config = load_config(ctx.obj.config_path)
     _setup_logging(config.logging.level, ctx.obj.log_file)
+
+    if config.storage.backend == "files":
+        try:
+            if isinstance(parsed, int):
+                pairs = read_object_tles(config.output, parsed)
+            else:
+                pairs = nearest_tles_for_date_files(config.output, parsed, days)
+        except ValueError as err:  # date query without a date output
+            print(f"Error: {err}", file=sys.stderr)
+            raise typer.Exit(code=2) from None
+        for line1, line2 in pairs:
+            print(line1)
+            print(line2)
+        if not pairs:
+            logger.warning(f"No TLEs found for {target}")
+            raise typer.Exit(code=1)
+        return
 
     session, engine = _open_session_or_exit(config, readonly=True)
     try:

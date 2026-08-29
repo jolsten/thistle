@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.15.0] - 2026-08-29
+
+### Added
+
+- **`[storage] backend = "files"` — a file-backed store, no database.**
+  For deployments where SQLite index maintenance at large scale is the
+  bottleneck and the output files are the product. Ingest writes the
+  output trees directly: the first `type="object", format="tle"` entry
+  under `[[output.files]]` becomes the canonical store (per-object,
+  epoch-ordered, deduplicated verbatim TLE text), and date files are
+  updated from the same in-memory delta in the same pass. Because the
+  dedup key (exact line text) encodes both the NORAD ID and the epoch,
+  per-file dedup is equivalent to the database's unique index.
+
+  The ingest/generate cycle collapses to a single pass — no watermark
+  tables, no lookback window, no ingest/generate serialization rule; the
+  steady-state cron entry is just `thistle-db ingest`. New records append
+  behind the generator's tail guard; late deliveries, epoch ties, and
+  torn tails merge-rewrite atomically (the merge is also the self-heal).
+  Memory is bounded by `[storage] flush_records`; flushes are idempotent,
+  so the budget is never a correctness knob. Source-file skip state lives
+  in a small SQLite cache (`[storage] state`, auto-created) and commits
+  only after the flush covering the file, so a crash never marks a file
+  ingested before its records reach disk.
+
+  `generate --all` rebuilds derived outputs from the store (one linear
+  scan); `get-tle`, `dump`, and thistle's `get_tles` fallback read the
+  file tree directly. OMM *outputs* are rejected at config load (the
+  backend has no metadata store); OMM *inputs* still ingest as TLE lines
+  with a warning that metadata is discarded. `generate --verify` is not
+  yet implemented on this backend. Record validation, the future-epoch
+  guard, and quarantine behave identically on both backends.
+
 ## [0.14.0] - 2026-08-25
 
 ### Added

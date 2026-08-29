@@ -328,6 +328,34 @@ class OutputConfig(BaseModel):
     debugging, or a network filesystem that dislikes concurrent writes."""
 
 
+class StorageConfig(BaseModel):
+    """Where element sets live: a SQL database, or the output files themselves.
+
+    With ``backend = "files"`` there is no element-set database. The first
+    ``type="object", format="tle"`` entry in ``[[output.files]]`` is the
+    canonical store (one epoch-ordered, deduplicated file of verbatim TLE
+    text per satellite), and every other output is derived from the same
+    in-memory delta during ingest — see ``filestore.py``. The dedup key
+    (exact line text) encodes both the NORAD ID and the epoch, so per-file
+    dedup is globally equivalent to the database's unique index.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    backend: Literal["database", "files"] = "database"
+    state: str = "./thistle-state.sqlite"
+    """Files backend: SQLite file holding ingest file-tracking state.
+
+    A cache, not a store — created automatically, and losing it only costs
+    re-reading source files (absorbed by dedup)."""
+    flush_records: int = Field(default=1_000_000, ge=1)
+    """Files backend: buffered records that trigger an early flush.
+
+    Purely a memory budget, never a correctness knob: flushes are
+    idempotent, so an early flush only means touching hot files more than
+    once per run. ~300-400 bytes per buffered record."""
+
+
 class LoggingConfig(BaseModel):
     level: str = "INFO"
 
@@ -341,7 +369,43 @@ class Settings(BaseSettings):
     database: Database = Database()
     ingest: IngestConfig = IngestConfig()
     output: OutputConfig = OutputConfig()
+    storage: StorageConfig = StorageConfig()
     logging: LoggingConfig = LoggingConfig()
+
+    @model_validator(mode="after")
+    def _check_files_backend(self) -> "Settings":
+        """Reject configurations the files backend cannot honor — at config
+        load, not mid-run (the same rule as filename-template validation).
+
+        - OMM outputs need the ``omm_metadata`` sidecar (object names), which
+          only the database backend has; an entry that silently produced
+          nameless CSV would look like data loss.
+        - The store must exist: without a ``type="object", format="tle"``
+          entry there is nowhere lossless to put the records.
+
+        OMM *input* files remain ingestable (their TLE lines are real data);
+        only their metadata is discarded, with a warning — see
+        ``ingest.ingest_file``.
+        """
+        if self.storage.backend != "files":
+            return self
+        for i, entry in enumerate(self.output.files):
+            if entry.format == "omm":
+                raise ValueError(
+                    f"[[output.files]] entry {i + 1} has format='omm', which "
+                    "the files backend does not support (OMM metadata needs "
+                    "the database backend) — remove the entry or use "
+                    "storage.backend='database'"
+                )
+        if not any(
+            f.type == "object" and f.format == "tle" for f in self.output.files
+        ):
+            raise ValueError(
+                "storage.backend='files' requires a [[output.files]] entry "
+                "with type='object' and format='tle' — that entry is the "
+                "canonical store the backend keeps every record in"
+            )
+        return self
 
     @classmethod
     def settings_customise_sources(

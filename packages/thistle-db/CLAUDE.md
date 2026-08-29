@@ -11,6 +11,12 @@ thistle-db is a database manager for orbital element sets. It ingests TLE
 directories into a SQL database with uniqueness guarantees, and generates
 organized output files (by date and by satellite) from that database.
 
+With `[storage] backend = "files"` there is no element-set database at all:
+ingest maintains the output files directly, with the per-object file tree as
+the canonical store — see "Storage backends" below. Everything in this
+document about the SQL data model, watermarks, and `generate` describes the
+default `database` backend unless that section says otherwise.
+
 ## Core workflow
 
 1. TLE/OMM files are delivered into directories defined in `config.toml`
@@ -136,6 +142,88 @@ Chunk-level insert failures fall back to row-by-row inserts
 itself rather than the 5000-row chunk it was batched with — and, since the
 exception previously propagated out of `ingest_tles`, the rest of the file.
 
+## Storage backends (`[storage]`, `filestore.py`)
+
+`backend = "database"` (default) is everything described elsewhere in this
+document. `backend = "files"` trades ad-hoc SQL and OMM metadata for
+scale-independent ingest with no database server:
+
+```toml
+[storage]
+backend = "files"
+state = "./thistle-state.sqlite"  # ingest file-tracking cache
+flush_records = 1000000           # memory budget per flush
+```
+
+- **The store.** The first `type="object", format="tle"` entry under
+  `[[output.files]]` is the canonical store: one epoch-ordered,
+  deduplicated file of verbatim TLE text per satellite — lossless, exactly
+  the property that makes tle object outputs the `--verify` authority on
+  the database backend. Config load **requires** that entry and **rejects**
+  any `format="omm"` output entry (no metadata store to feed it; failing
+  loudly beats silently nameless CSV). OMM *inputs* still ingest — their
+  TLE lines are real data — with a per-file WARNING that metadata is
+  discarded.
+- **Why per-file dedup is global dedup.** The dedup key is the exact line
+  text, and both the NORAD ID and epoch are encoded in it, so every record
+  deterministically maps to one object file; deduplicating within each
+  file is equivalent to the database's `UNIQUE(epoch, line_hash)`. A
+  record with no NORAD ID has no home and is rejected (quarantined as
+  usual).
+- **Single pass — the delta is the buffer.** Ingest validates records
+  through the same path as the database backend (`_validated_tles` /
+  `_validated_omm`; rejects, future-epoch guard, quarantine all identical),
+  buffers them in memory grouped by object, and flushes at end of scan or
+  at `flush_records` (a pure memory budget — flushes are idempotent, so an
+  early flush only touches hot files more than once). At flush time the
+  buffer *is* the delta, which is what eliminates the whole cross-run
+  machinery: no `created` column, no `epoch_date_state`, no lookback
+  window, no mtime-watermark clock rules, and no ingest/generate
+  serialization requirement. The steady-state cron entry is just
+  `thistle-db ingest`.
+- **Append or merge, per object, per output** (the generator's tail guard,
+  restated for files): every buffered epoch strictly greater than the
+  file's tail epoch → append; anything else — late delivery, epoch tie,
+  re-delivery, torn/damaged tail — → merge-rewrite (read the file, drop
+  records whose line hash is present, stable-sort by epoch, write tmp +
+  atomic rename). The merge is also the self-heal for torn appends.
+  Nothing new and an intact file → no write at all. Date outputs are
+  upserted from the same delta ("latest per object that day" can only
+  change when a newer-epoch record for that (object, date) arrives), and a
+  derived *object* output whose file is missing (entry added later,
+  deleted file) is healed by copying the store's file.
+- **Tie rule** (replaces the database's `id DESC`): merges keep existing
+  records before new ones among equal epochs, so file order among ties is
+  ingestion order; date files replace on `epoch >=`, so newest-ingested
+  wins. Incremental updates and `generate --all` rebuilds therefore agree.
+  One nuance: re-delivering an old duplicate whose epoch ties the current
+  date-file winner can flip that winner to the re-delivered text — "last
+  ingested wins" applied literally; the database backend would keep the
+  original. Harmless, but don't "fix" one side without the other.
+- **Crash safety without transactions.** Rewrites are atomic renames;
+  appends are guarded by the torn-tail check; and source-file state
+  (`ingest_files`, kept in the small `state` SQLite — a cache, created on
+  first use, safe to delete) is committed only **after** the flush covering
+  that file — the files analog of the watermark-in-same-transaction rule. A
+  crash anywhere re-ingests at most the files whose state was never
+  recorded, and dedup absorbs the replay.
+- **Commands.** `ingest` does everything; `generate` is vestigial —
+  `--all` rebuilds derived outputs from the store in one linear scan
+  (disaster recovery, or backfill after adding an output entry), the
+  plain form logs that there is nothing to do, and `--verify` is
+  **[NOT YET IMPLEMENTED]** (warns and does nothing). `get-tle NORAD`
+  reads the object's store file; `get-tle YYYYMMDD` reads the date files
+  (candidates are each day's latest-per-object records, so a superseded
+  same-day elset nearer to noon is not considered — a bounded
+  approximation the database backend doesn't make; requires a tle date
+  output). `dump` concatenates the store (no `.json` — no metadata).
+  `init-db` just creates the state cache. thistle's `get_tles` fallback
+  reads the store directly.
+- **When to choose it.** Files: serverless deployments where SQLite's
+  100M-row index maintenance is the bottleneck and outputs are the
+  product. Database: OMM metadata, ad-hoc SQL, or many concurrent
+  writers.
+
 ## Data model (`model.py`)
 
 Single canonical element-set table plus an OMM metadata sidecar. Do **not**
@@ -211,7 +299,8 @@ Any new bulk-write path must follow this pattern and work on all three dialects.
 ## Configuration (`config.py`)
 
 - `config.toml` (path via `-c`, default `./config.toml`), parsed into
-  pydantic-settings models: `[database]`, `[ingest]` (`reject_dir`,
+  pydantic-settings models: `[database]`, `[storage]` (backend selection —
+  see "Storage backends"), `[ingest]` (`reject_dir`,
   `max_epoch_ahead_days`, plus `[[ingest.sources]]` entries), `[output]` (with `[[output.files]]`
   entries — see the `generate` command), `[logging]`.
   `[output]` rejects unknown keys (`extra="forbid"`), so pre-0.12 configs
@@ -393,7 +482,8 @@ and a steady-state incremental run in ~2.2s (from 38s and 13.5s).
 | `config.py` | pydantic-settings config + layered secrets resolution |
 | `model.py` | SQLAlchemy ORM models (`TLE`, `OmmMetadata`), TLE parsing via sgp4 |
 | `reader.py` | format detection + file readers (TLE, OMM JSON/CSV/XML) |
-| `ingest.py` | bulk insert with dedup, source-directory scanning |
+| `ingest.py` | shared record validation, bulk insert with dedup, source-directory scanning |
+| `filestore.py` | files backend: object-file store, buffered flush, rebuild |
 | `rejects.py` | quarantine for records that could not be ingested |
 | `generator.py` | output file generation from the database |
 | `writer.py` | thread pool for output file writes |
