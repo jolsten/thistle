@@ -6,12 +6,59 @@ matplotlib (the ``plot`` extra) are imported only inside :func:`make_map`.
 
 from __future__ import annotations
 
+import pathlib
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
 import numpy as np
+
+# Natural Earth shapefiles for the default map features, bundled so the map
+# renders offline on a fresh machine (cartopy ships no geometry data and
+# downloads features on first use). Mirrors cartopy's cache layout — see
+# thistle/data/cartopy/README.md.
+_VENDORED_CARTOPY_DATA = pathlib.Path(__file__).parent.parent / "data" / "cartopy"
+
+
+def _configure_cartopy() -> None:
+    """Point cartopy at the vendored shapefiles (unless already configured).
+
+    ``pre_existing_data_dir`` is a read-only directory cartopy checks before
+    its download cache, so the bundled features never touch the network while
+    anything not vendored still falls through to the normal download path.
+    """
+    import cartopy
+
+    if not cartopy.config.get("pre_existing_data_dir"):
+        cartopy.config["pre_existing_data_dir"] = str(_VENDORED_CARTOPY_DATA)
+
+
+def _add_base_features(ax) -> None:
+    """Add coastlines and borders, degrading gracefully when unavailable.
+
+    Feature shapefiles resolve lazily at draw time, so a missing file (a
+    non-vendored feature on an offline machine) would otherwise crash the
+    render long after this function returns. Forcing geometry resolution
+    here turns that into a skipped layer with a warning: a ground-track map
+    without borders is degraded, not useless.
+    """
+    import cartopy.feature as cfeature
+
+    for feature, kwargs in (
+        (cfeature.COASTLINE, {"linewidth": 0.5}),
+        (cfeature.BORDERS, {"linewidth": 0.3}),
+    ):
+        try:
+            next(iter(feature.geometries()))  # force shapefile resolution
+        except Exception as exc:  # cartopy raises OSError/URLError variants
+            print(
+                f"Warning: map feature '{feature.name}' unavailable "
+                f"(offline and not cached?); drawing without it: {exc}",
+                file=sys.stderr,
+            )
+            continue
+        ax.add_feature(feature, **kwargs)
 
 # spec key -> matplotlib kwarg (value converter applied where not str)
 _KWARG_KEYS = {
@@ -106,17 +153,16 @@ def make_map(
     ring_alt_m: satellite altitude for visibility rings; None = markers only.
     """
     import cartopy.crs as ccrs
-    import cartopy.feature as cfeature
     import matplotlib.pyplot as plt
 
     from thistle import visibility_circle
 
+    _configure_cartopy()
     fig, ax = plt.subplots(
         figsize=(12, 7), subplot_kw={"projection": ccrs.PlateCarree()}
     )
     ax.set_global()
-    ax.coastlines(linewidth=0.5)
-    ax.add_feature(cfeature.BORDERS, linewidth=0.3)
+    _add_base_features(ax)
     ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.5)
 
     any_label = False

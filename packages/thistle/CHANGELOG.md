@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- `thistle groundtrack` now works fully offline. cartopy ships no geometry
+  data and downloads Natural Earth shapefiles on first render, so a fresh
+  machine without internet failed to draw the map. The two features the map
+  uses (110m coastlines and country borders, ~0.65 MB; ~130 KB compressed in
+  the wheel) are now vendored under `thistle/data/cartopy` and served via
+  cartopy's `pre_existing_data_dir`, which is checked before the download
+  cache — verified against an empty cartopy data directory that nothing is
+  fetched or copied. Any *other* cartopy feature still downloads as before,
+  and a feature that cannot be resolved (offline, not cached) is now skipped
+  with a stderr warning instead of crashing the render — a map without
+  borders is degraded, not useless. Natural Earth data is public domain.
+
 ## [0.10.0] - 2026-08-29
 
 ### Changed

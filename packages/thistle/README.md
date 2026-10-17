@@ -18,6 +18,13 @@ pip install 'thistle[plot]'  # CLI plus plot/groundtrack commands
 pip install 'thistle[db]'    # CLI plus thistle-db database fallback (Python >= 3.11)
 ```
 
+Everything works offline: the planetary ephemeris ships in the
+`skyfield-data` wheel, and the map data `groundtrack` needs (Natural Earth
+110m coastlines and borders) is bundled in the package, so nothing is ever
+downloaded at runtime. Other cartopy features, if you add any, download and
+cache on first use as usual (pre-seed cartopy's cache or set
+`CARTOPY_DATA_DIR` for air-gapped machines).
+
 With `thistle[db]` installed and a [thistle-db](https://pypi.org/project/thistle-db/)
 database configured (`THISTLE_DB_*` environment variables or a config.toml
 named by `THISTLE_DB_CONFIG`), CLI commands resolve NORAD catalog IDs from the
