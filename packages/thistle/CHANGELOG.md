@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- New `thistle events` command group exposing the event finders from
+  `thistle.events` on the command line. `thistle events sunlight` and
+  `thistle events eclipse` print the satellite's sunlit/eclipse periods
+  (start, stop, duration) within a `--start`/`--stop` UTC window;
+  `thistle events passes` prints passes over one or more `--site`
+  ground sites (site, start, stop, duration, peak time, peak elevation)
+  above `--min-elevation`/`--min-el` (default 0 deg), sorted by start
+  time. All three accept `--switch`, `--warn-days`, and
+  the usual output options (`-d`, `--print-header`, `--align`), and
+  resolve catalog IDs via `THISTLE_TLE_DIR` like other commands.
+  Periods are clipped to the window, so a boundary equal to `--start`
+  or `--stop` is not a true transition instant.
+
 ## [0.10.1] - 2026-10-17
 
 ### Changed

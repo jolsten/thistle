@@ -982,3 +982,224 @@ def test_find_tle_no_warning_near_epoch(runner, tle_file):
     )
     assert result.exit_code == 0
     assert "Warning: satellite" not in result.stderr
+
+
+# ---- events ----------------------------------------------------------------
+
+# Spans the fixture's two TLE epochs (12:00 and 18:00), so midpoint
+# switching exercises the sub-window split inside the event finders.
+EVENTS_WINDOW = ["--start", "2024-01-01T12:00:00", "--stop", "2024-01-01T18:00:00"]
+
+
+def test_events_in_top_level_help(runner):
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "events" in result.stdout
+
+
+def test_events_help_lists_subcommands(runner):
+    result = runner.invoke(app, ["events", "--help"])
+    assert result.exit_code == 0
+    for sub in ("sunlight", "eclipse", "passes"):
+        assert sub in result.stdout
+
+
+def test_events_sunlight(runner, tle_file):
+    result = runner.invoke(
+        app, ["events", "sunlight", str(tle_file), *EVENTS_WINDOW, "--print-header"]
+    )
+    assert result.exit_code == 0
+    lines = result.stdout.strip().splitlines()
+    assert lines[0].split() == ["start", "stop", "duration_s"]
+    assert len(lines) >= 2  # the ISS is sunlit at least once in 6 hours
+    for line in lines[1:]:
+        start, stop, dur = line.split()
+        assert start < stop  # ISO 8601 strings sort chronologically
+        assert float(dur) > 0
+
+
+def test_events_sunlight_eclipse_partition_window(runner, tle_file):
+    """Sunlit and eclipse periods together cover the whole window."""
+    total = 0.0
+    for sub in ("sunlight", "eclipse"):
+        result = runner.invoke(app, ["events", sub, str(tle_file), *EVENTS_WINDOW])
+        assert result.exit_code == 0
+        total += sum(
+            float(line.split()[2])
+            for line in result.stdout.strip().splitlines()
+            if line
+        )
+    assert total == pytest.approx(6 * 3600.0, abs=5.0)
+
+
+def test_events_eclipse_matches_api(runner, tle_file):
+    import numpy as np
+
+    from thistle import Propagator
+    from thistle.events import find_eclipse_periods
+    from thistle.utils import read_tle
+
+    propagator = Propagator(read_tle(tle_file), method="midpoint")
+    periods = find_eclipse_periods(
+        np.datetime64("2024-01-01T12:00:00", "us"),
+        np.datetime64("2024-01-01T18:00:00", "us"),
+        propagator,
+    )
+    result = runner.invoke(app, ["events", "eclipse", str(tle_file), *EVENTS_WINDOW])
+    assert result.exit_code == 0
+    lines = [line for line in result.stdout.strip().splitlines() if line]
+    assert len(lines) == len(periods)
+
+
+def test_events_sunlight_csv_delimiter(runner, tle_file):
+    result = runner.invoke(
+        app,
+        ["events", "sunlight", str(tle_file), *EVENTS_WINDOW, "-d", ",", "--print-header"],
+    )
+    assert result.exit_code == 0
+    assert result.stdout.splitlines()[0] == "start,stop,duration_s"
+
+
+def test_events_passes(runner, tle_file):
+    result = runner.invoke(
+        app,
+        [
+            "events", "passes", str(tle_file),
+            "--start", "2024-01-01T00:00:00",
+            "--stop", "2024-01-02T00:00:00",
+            "--site", "boulder:40.015:-105.2705",
+            "--print-header",
+        ],
+    )
+    assert result.exit_code == 0
+    lines = result.stdout.strip().splitlines()
+    assert lines[0].split() == [
+        "site", "start", "stop", "duration_s", "peak_time", "peak_el_deg",
+    ]
+    assert len(lines) >= 2  # at least one ISS pass over Boulder in 24h
+    prev_start = ""
+    for line in lines[1:]:
+        site, p_start, p_stop, dur, peak_time, peak_el = line.split()
+        assert site == "boulder"
+        assert p_start <= peak_time <= p_stop
+        assert float(dur) > 0
+        assert float(peak_el) >= 0.0 - 0.5
+        assert prev_start <= p_start
+        prev_start = p_start
+
+
+def test_events_passes_min_elevation_filters(runner, tle_file):
+    args = [
+        "events", "passes", str(tle_file),
+        "--start", "2024-01-01T00:00:00",
+        "--stop", "2024-01-02T00:00:00",
+        "--site", "boulder:40.015:-105.2705",
+    ]
+    default = runner.invoke(app, args)
+    high = runner.invoke(app, [*args, "--min-el", "30"])  # --min-elevation alias
+    assert default.exit_code == high.exit_code == 0
+    default_lines = default.stdout.strip().splitlines()
+    high_lines = [line for line in high.stdout.strip().splitlines() if line]
+    assert len(high_lines) <= len(default_lines)
+    for line in high_lines:
+        assert float(line.split()[5]) >= 30.0 - 0.5
+
+
+def test_events_passes_multiple_sites_sorted(runner, tle_file):
+    result = runner.invoke(
+        app,
+        [
+            "events", "passes", str(tle_file),
+            "--start", "2024-01-01T00:00:00",
+            "--stop", "2024-01-02T00:00:00",
+            "--site", "boulder:40.015:-105.2705",
+            "--site", "hawaii:19.8:-155.5:100",
+        ],
+    )
+    assert result.exit_code == 0
+    lines = result.stdout.strip().splitlines()
+    assert {line.split()[0] for line in lines} == {"boulder", "hawaii"}
+    starts = [line.split()[1] for line in lines]
+    assert starts == sorted(starts)
+
+
+def test_events_start_after_stop(runner, tle_file):
+    result = runner.invoke(
+        app,
+        [
+            "events", "sunlight", str(tle_file),
+            "--start", "2024-01-02T00:00:00",
+            "--stop", "2024-01-01T00:00:00",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "--start must be before --stop" in result.stderr
+
+
+def test_events_bad_timestamp(runner, tle_file):
+    result = runner.invoke(
+        app,
+        [
+            "events", "eclipse", str(tle_file),
+            "--start", "bogus",
+            "--stop", "2024-01-01T00:00:00",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "ISO 8601" in result.stderr
+
+
+def test_events_passes_bad_site(runner, tle_file):
+    result = runner.invoke(
+        app,
+        ["events", "passes", str(tle_file), *EVENTS_WINDOW, "--site", "badsite"],
+    )
+    assert result.exit_code == 2
+
+
+def test_events_passes_requires_site(runner, tle_file):
+    result = runner.invoke(app, ["events", "passes", str(tle_file), *EVENTS_WINDOW])
+    assert result.exit_code == 2
+
+
+def test_events_multi_object(runner, multi_object_file):
+    result = runner.invoke(
+        app, ["events", "sunlight", str(multi_object_file), *EVENTS_WINDOW]
+    )
+    assert result.exit_code == 2
+    assert "filter --satnum" in result.stderr
+
+
+def test_events_missing_file(runner):
+    result = runner.invoke(
+        app, ["events", "eclipse", "/nonexistent/file.tle", *EVENTS_WINDOW]
+    )
+    assert result.exit_code == 2
+
+
+def test_events_warns_stale_window(runner, tle_file):
+    result = runner.invoke(
+        app,
+        [
+            "events", "sunlight", str(tle_file),
+            "--start", "2024-03-01T00:00:00",
+            "--stop", "2024-03-01T03:00:00",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "Warning:" in result.stderr
+    assert "--warn-days N (0 disables)." in result.stderr
+
+
+def test_events_warn_days_zero_disables(runner, tle_file):
+    result = runner.invoke(
+        app,
+        [
+            "events", "sunlight", str(tle_file),
+            "--start", "2024-03-01T00:00:00",
+            "--stop", "2024-03-01T03:00:00",
+            "--warn-days", "0",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "Warning:" not in result.stderr

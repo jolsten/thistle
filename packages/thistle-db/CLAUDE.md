@@ -4,32 +4,72 @@ This file is the **target design spec** for thistle-db. Where the code and this
 document disagree, this document wins — update the code to match, not the other
 way around. Sections marked **[NOT YET IMPLEMENTED]** are known gaps.
 
+**Architecture status (2026-09):** this spec describes the GP-record
+architecture adopted from `PLAN-gp-store.md` (kept beside this file as the
+design rationale). The shipping code still implements the previous
+architecture — dual `database`/`files` backends, TLE-line stores, a
+steady-state `generate` command with `epoch_date_state` watermarks; see this
+file's git history for its documentation. That machinery is scheduled for
+replacement per the build order at the bottom: fix bugs in it, but do not
+extend it. `record.py` (the canonical record) is implemented and tested.
+
 ## What thistle-db is
 
 thistle-db is a database manager for orbital element sets. It ingests TLE
 (Two-Line Element) and OMM (Orbit Mean-Elements Message) files from configured
-directories into a SQL database with uniqueness guarantees, and generates
-organized output files (by date and by satellite) from that database.
+directories into a canonical store — a per-object file tree or a SQL
+database — and maintains organized output files (TLE by object and by date;
+STK-compatible OMM CSV) directly from ingest.
 
-With `[storage] backend = "files"` there is no element-set database at all:
-ingest maintains the output files directly, with the per-object file tree as
-the canonical store — see "Storage backends" below. Everything in this
-document about the SQL data model, watermarks, and `generate` describes the
-default `database` backend unless that section says otherwise.
+## Shape of the system [NOT YET IMPLEMENTED]
+
+```
+sources ──► readers ──► validation ──► delta buffer (GP records, by object)
+(TLE/OMM)               (rejects,           │  flush at end-of-scan / flush_records
+                         epoch guard,       ▼
+                         quarantine)   1. store.add(delta)         dedup by RECORD_HASH
+                                       2. output.apply(delta) ×N   merge-dedup / tail guard / date upsert
+                                       3. commit ingest_files state
+```
+
+Three ideas, one per layer:
+
+1. **One canonical record** — the GP record (`record.py`), an OMM-superset
+   modeled on Space-Track's published GP class, carrying verbatim TLE lines
+   as fields. Everything produces, stores, or projects this record.
+2. **One engine** — the single-pass delta flush. Ingest validates records,
+   buffers them grouped by object, and at flush time hands the same delta to
+   every sink. Source-file state commits only after all sinks succeed.
+   **Every sink is idempotent against replay** (store dedups on
+   `RECORD_HASH`; object outputs dedup on merge and guard appends by tail
+   epoch; date outputs upsert on `epoch >=`), so that one ordering rule is
+   the entire crash-safety story: a crash replays at most the files whose
+   state was never recorded, and every sink absorbs the duplicates. Outputs
+   consume the *validated buffer, pre-dedup* — they never ask the store
+   which rows were new, which is what eliminates watermark/lookback
+   machinery for both store types.
+3. **One store interface, two implementations** — filesystem or SQL, chosen
+   per deployment. Outputs are lossy projections, identical in behavior
+   regardless of store.
+
+There is no steady-state `generate`. Ingest maintains the outputs. The cron
+entry is `thistle-db ingest`.
 
 ## Core workflow
 
 1. TLE/OMM files are delivered into directories defined in `config.toml`
-   (`[[ingest.sources]]` entries: a `path` plus a glob `pattern`).
-   The schema is created once with `thistle-db init-db` — the **only** DDL
-   path; other commands never create tables and fail with a clear
-   "run `thistle-db init-db`" error (exit 3) against an uninitialized
+   (`[[ingest.sources]]` entries: a `path` plus a glob `pattern`). For the
+   database store, the schema is created once with `thistle-db init-db` — the
+   **only** DDL path; other commands never create tables and fail with a
+   clear "run `thistle-db init-db`" error (exit 3) against an uninitialized
    database.
-2. `thistle-db ingest` scans those directories, auto-detects each file's format,
-   parses the element sets, and inserts them into the database. Duplicates are
-   silently skipped — ingest is **idempotent**: running it twice over the same
-   files must never create duplicate rows or fail.
-3. `thistle-db generate` writes output files from the database.
+2. `thistle-db ingest` scans those directories, auto-detects each file's
+   format, parses and validates the element sets, adds them to the store,
+   and updates every configured output — all in one pass. Duplicates are
+   silently absorbed — ingest is **idempotent**: running it twice over the
+   same files must never create duplicate records or fail.
+3. `rebuild`, `verify`, and `export` cover disaster recovery, periodic
+   reconciliation, and interchange (see CLI).
 
 ### File formats
 
@@ -46,75 +86,134 @@ Format is auto-detected per file (`reader.detect_format`):
 
 - **New file per delivery** (e.g. daily `YYYYMMDD.txt`): straightforward scan-and-ingest.
 - **In-place updates**: a provider may append to or rewrite an existing file
-  rather than delivering a delta. This must be handled elegantly:
-  - Correctness comes from DB-level dedup — re-reading a whole updated file and
-    inserting only the new element sets is always safe.
-  - Efficiency comes from **file-state tracking**: each successfully ingested
-    file's path, size, mtime, and content hash is recorded in the
-    `ingest_files` table (`IngestFile` model). On scan
-    (`ingest.ingest_source_file`), unchanged files (size + mtime match) are
-    skipped without being opened; a changed file whose content hash still
-    matches just refreshes its state; otherwise the file is re-ingested (dedup
-    absorbs the already-seen records). A file that fails to parse gets no
-    state recorded, so it is retried next scan. `--force` bypasses skipping.
+  rather than delivering a delta. Correctness comes from store-level dedup —
+  re-reading a whole updated file is always safe. Efficiency comes from
+  **file-state tracking**: each successfully ingested file's path, size,
+  mtime, and content hash is recorded (`ingest_files`). On scan, unchanged
+  files (size + mtime match) are skipped without being opened; a changed
+  file whose content hash still matches just refreshes its state; otherwise
+  the file is re-ingested (dedup absorbs the already-seen records). A file
+  that fails to parse gets no state recorded, so it is retried next scan.
+  `--force` bypasses skipping.
+
+## The canonical GP record (`record.py`)
+
+One flattened GP record per element set. Column vocabulary is CCSDS OMM
+keywords; the column set is anchored to Space-Track's published GP class
+(minus derived values, plus `RECORD_HASH`), so schema evolution has an
+external trigger rather than being a thistle design activity.
+
+| Class | Columns | Rule |
+|---|---|---|
+| Identity | `RECORD_HASH` (first column) | See Uniqueness |
+| Parsed or delivered | `NORAD_CAT_ID`, `OBJECT_ID`, `EPOCH` (ISO-8601, µs), `MEAN_MOTION`, `ECCENTRICITY`, `INCLINATION`, `RA_OF_ASC_NODE`, `ARG_OF_PERICENTER`, `MEAN_ANOMALY`, `BSTAR`, `MEAN_MOTION_DOT`, `MEAN_MOTION_DDOT`, `EPHEMERIS_TYPE`, `CLASSIFICATION_TYPE`, `ELEMENT_SET_NO`, `REV_AT_EPOCH` | From the OMM when delivered as OMM; parsed from the lines when TLE-only (Space-Track/TLE-text units for the derivatives) |
+| Implicit semantics | `MEAN_ELEMENT_THEORY`, `REF_FRAME`, `TIME_SYSTEM`, `CENTER_NAME` | For TLE-only records, materialized from a **per-`EPHEMERIS_TYPE` table** (type 0 → SGP4/TEME/UTC/EARTH; type 4 → SGP4-XP), never hardcoded — the first SGP4-XP TLE that arrives is stored truthfully. python-sgp4 (2.27) parses type-4 lines fine but would silently *propagate* them with classic SGP4 — thistle-db stores and never propagates, but don't hand type-4 records to sgp4's propagator in tests or tooling |
+| Metadata | `OBJECT_NAME`, `OBJECT_TYPE`, `RCS_SIZE`, `COUNTRY_CODE`, `LAUNCH_DATE`, `SITE`, `DECAY_DATE` | From OMM; null for TLE-only (except `OBJECT_NAME` from a 3LE name line). Never inferred |
+| Provenance | `GP_ID`, `FILE`, `CREATION_DATE`, `ORIGINATOR` | From OMM; null for TLE-only. Never backfillable except by OMM re-delivery |
+| Verbatim rendering | `TLE_LINE0`, `TLE_LINE1`, `TLE_LINE2` | Delivered bytes (TLE delivery) or the provider's embedded lines (OMM delivery); null for an OMM-native record with no lines |
+
+Decisions with rationale:
+
+- **Element columns are stored even when redundant with the lines**: uniform
+  readers, grep/spreadsheet usability, projection without running sgp4.
+  ~600 B/record instead of ~350; accepted.
+- **Derived values (`SEMIMAJOR_AXIS`, `PERIOD`, `APOAPSIS`, `PERIAPSIS`) are
+  not canonical** — recomputed where needed. For today's type-0 records the
+  OMM element fields carry no more precision than the TLE rendering anyway
+  (`BSTAR "0.00168730000000"` is `16873-2` expanded).
+- **TLE lines stay first-class and byte-verbatim.** TLE → OMM → TLE does not
+  round-trip byte-exactly (space- vs zero-padded catalog numbers, sign
+  rendering, `00000-0`/`00000+0` bstar forms). Delivered bytes are the audit
+  trail and make TLE output a passthrough.
+
+### Uniqueness
+
+`RECORD_HASH` (lowercase hex sha256):
+
+- **Lines present**: hash of `line1 + "\n" + line2` (`record.line_hash`; the
+  database's `line_hash` column stores the same digest raw). Textually
+  distinct near-duplicates from different providers deliberately coexist.
+  Do not change this key to `(norad_cat_id, epoch)` or similar without an
+  explicit decision.
+- **Line-less** (OMM-native records unrepresentable as TLE): semantic
+  identity — a re-issue with changed metadata or a new `GP_ID` enriches the
+  existing record rather than coexisting. The frozen `thistle-gp1`
+  serialization (`record.semantic_hash`): sha256 over the UTF-8 `"\n"`-join
+  of the literal `thistle-gp1`; `NORAD_CAT_ID` as unpadded decimal; the
+  stored µs epoch as `YYYY-MM-DDTHH:MM:SS.ffffff`; `MEAN_ELEMENT_THEORY`
+  uppercase; then `MEAN_MOTION`, `ECCENTRICITY`, `INCLINATION`,
+  `RA_OF_ASC_NODE`, `ARG_OF_PERICENTER`, `MEAN_ANOMALY`, `BSTAR`,
+  `MEAN_MOTION_DOT`, `MEAN_MOTION_DDOT` as Python `float.hex()` of the
+  stored doubles (`-0.0` normalized to `0.0`, empty string for null drag
+  terms). Hex floats are exact and reimplementable anywhere; hashing the
+  *parsed doubles* means formatting variants of one value hash equal while
+  last-ulp parse differences coexist. Changing this serialization changes
+  identity → major store-format bump; the tag makes the bump self-announcing.
+
+### Enrichment merge (`record.merge`)
+
+"TLE first, identical-lined OMM later" updates the existing record's null
+columns (in the files store this lands on the merge-rewrite path, which a
+duplicate delivery forces anyway; in the database store it is the one
+sanctioned UPDATE). Precedence:
+
+1. Non-null beats null.
+2. Both non-null and unequal (a re-issue: same lines, new `GP_ID`): newest
+   `CREATION_DATE` wins field-wise; null `CREATION_DATE` loses to non-null;
+   full tie (both equal or both absent) → **last-ingested wins**. Chosen over
+   an ingest-timestamp ordinal: matches the date-file tie rule and keeps
+   thistle state out of the canonical record. Accepted consequence: replaying
+   *genuinely conflicting* redeliveries in a different order can flip such
+   fields (replay of identical data cannot).
+3. `RECORD_HASH`, `EPOCH`, and `TLE_LINE1/2` never change; `TLE_LINE0` is
+   fill-if-null (renames land in `OBJECT_NAME` via rule 2).
+
+Immutability convention: **identity and lines immutable; other fields
+enrichable.** Epoch-tie ordering in files: existing records before new.
 
 ### Malformed records and quarantine
 
 sgp4's parser is C `strtod`, which accepts the literal text `nan`, `inf` and
 `nan(ind)` in a fixed-width field — exactly what a producer emits when it
 formats a missing value with `printf` — and corrupt text shifts field
-boundaries to the same effect. **Every float column can therefore arrive
-non-finite**, and NaN reaches MariaDB as an unquoted `nan` token that pymysql
-refuses *before* sending SQL, failing the whole insert chunk.
+boundaries to the same effect. **Every float can therefore arrive
+non-finite.** Cleaning happens at the one boundary where parsed values enter
+the record (`record._clean_floats`, mirrored by `model._clean_floats` for
+the database rows):
 
-`model._clean_floats` handles this at the one boundary where sgp4 output
-enters the model, driven by the schema's own nullability so a float column
-added later is covered without touching it:
-
-- non-finite in a **nullable** column → `NULL`. `line1`/`line2` remain the
-  lossless source of truth, so a missing derived value costs nothing.
+- non-finite in a **nullable** field → `NULL`. Verbatim lines remain the
+  lossless source of truth, so a missing value costs nothing.
 - non-finite in a **mandatory** element (eccentricity, inclination, RAAN,
-  argument of pericenter, mean anomaly) → `MalformedElsetError`, and the
-  record is rejected. There is no orbit to store: it cannot be propagated or
-  compared, and a row carrying it would be selected by
-  `_latest_per_object_for_date`, *displacing* the object's good elset from
-  that day's output file.
+  argument of pericenter, mean anomaly) → `MalformedRecordError`, and the
+  record is rejected. There is no orbit to store, and such a record would
+  displace the object's good elset in date outputs.
+- a record with **no NORAD ID** has no home in a per-object store and is
+  rejected (quarantined as usual).
 
-One caveat when writing tests or reproducing a report: whether a `nan` text
-field actually parses to NaN depends on the column *and the process*. Line
-2's plain-float fields are stable, but line 1's `bstar`/`ndot`/`nddot` use
-sgp4's own exponent-format reader, which yields `0.0` instead of NaN once
-numpy has been imported (numpy changes the CRT parse on Windows). A fixture
-built on a `nan` bstar therefore passes standalone and fails under a suite
-that pulls numpy in. Prefer a zero mean motion, whose infinite derived
-values come from arithmetic rather than parsing, and unit-test
-`_clean_floats` directly for the per-column mapping.
+No stored float is ever non-finite. Do not relax this by flagging invalid
+records instead — a validity predicate would have to thread through every
+read path, and missing one yields silent NaN positions downstream.
 
-No stored float is ever non-finite. Do not relax this by making the
-mandatory columns nullable and flagging invalid rows — that would require
-threading a validity predicate through every read path (both generator
-queries, `tles_for_object`, `nearest_tles_for_date`, `verify_object_files`,
-and thistle's db fallback), and missing one yields silent NaN positions
-downstream.
+One caveat for tests: whether `nan` text parses to NaN depends on the column
+*and the process*. Line 2's plain-float fields are stable, but line 1's
+`bstar`/`ndot`/`nddot` use sgp4's exponent-format reader, which yields `0.0`
+instead of NaN once numpy has been imported (numpy changes the CRT parse on
+Windows). Prefer a zero mean motion (infinite *derived* values from
+arithmetic) and unit-test the cleaning directly.
 
-A second rejection class is the **future-epoch guard**: an elset whose
-epoch runs more than `[ingest] max_epoch_ahead_days` (default 30; 0
-disables) ahead of now is rejected. TLE epochs carry two-digit years
-(00-56 → 2000-2056), so a corrupted epoch field parses *cleanly* into a
-date decades out — and once stored, such a row does two kinds of permanent
-damage: it becomes its object file's tail epoch, so every later legitimate
-elset compares `epoch <= tail` and triggers a full rewrite instead of an
-append, forever; and it plants a junk date file (plus a watermark row)
-that nothing cleans up. Real feeds deliver elsets at most hours to a day
-ahead, so 30 days is generous by orders of magnitude; raise it for
-predicted-elset workflows. The guard is deliberately one-sided — epochs in
-the past are never bounded, so historical archives ingest untouched.
+The **future-epoch guard**: an elset whose epoch runs more than
+`[ingest] max_epoch_ahead_days` (default 30; 0 disables) ahead of now is
+rejected. TLE epochs carry two-digit years (00-56 → 2000-2056), so a
+corrupted epoch parses *cleanly* into a date decades out — and once stored it
+becomes its object file's tail epoch (forcing merge-rewrites forever) and
+plants a junk date file. Real feeds deliver at most hours to a day ahead;
+raise it for predicted-elset workflows. Deliberately one-sided — past epochs
+are never bounded, so historical archives ingest untouched.
 
-Rejected records are preserved outside the database instead. With
-`[ingest] reject_dir` set, each one is copied to a quarantine directory
-(`rejects.py`) in its source file's own format, mirroring the source tree so
-provenance is visible in the path and a repaired file is directly
-re-ingestable:
+Rejected records are preserved outside the store. With `[ingest] reject_dir`
+set, each is copied to a quarantine directory (`rejects.py`) in its source
+file's own format, mirroring the source tree so provenance is visible in the
+path and a repaired file is directly re-ingestable:
 
     /data/spacetrack/daily/2006/20060101.tle   (source)
     rejects/daily/2006/20060101.tle            (rejected records, verbatim)
@@ -122,192 +221,157 @@ re-ingestable:
 
 Two properties are load-bearing:
 
-- **Live view, not an archive.** Each ingest of a source file overwrites
-  that file's artifacts, and a run with no rejects deletes them. Volume is
-  bounded by what is *currently* broken rather than growing with time, so no
-  retention policy is needed. Partitioning by ingest date would break this
-  (a persistently broken daily feed would write a fresh copy every day, and
-  a backfill would dump every reject into one directory).
-- **Bounded per file.** Past `REJECT_MAX_RECORDS` (10k, a constant — a fuse,
-  not a tuning knob) only a marker with counts and a reason histogram is
-  written. Beyond that cap a file is not a good feed with bad lines but a
-  wrong file (mis-encoded, still gzipped, truncated), and copying it would
-  duplicate the entire delivery.
+- **Live view, not an archive.** Each ingest of a source file overwrites that
+  file's artifacts, and a run with no rejects deletes them. Volume is bounded
+  by what is *currently* broken, so no retention policy is needed.
+- **Bounded per file.** Past `REJECT_MAX_RECORDS` (10k — a fuse, not a tuning
+  knob) only a marker with counts and a reason histogram is written; beyond
+  that cap a file is not a good feed with bad lines but a wrong file.
 
 A quarantine failure is logged and never propagates: it must not turn a
 working ingest into a failed one.
 
-Chunk-level insert failures fall back to row-by-row inserts
-(`ingest._insert_individually`), so a record the database refuses costs only
-itself rather than the 5000-row chunk it was batched with — and, since the
-exception previously propagated out of `ingest_tles`, the rest of the file.
+## The store [NOT YET IMPLEMENTED]
 
-## Storage backends (`[storage]`, `filestore.py`)
-
-`backend = "database"` (default) is everything described elsewhere in this
-document. `backend = "files"` trades ad-hoc SQL and OMM metadata for
-scale-independent ingest with no database server:
+One interface, two implementations, chosen in config:
 
 ```toml
 [storage]
-backend = "files"
-state = "./thistle-state.sqlite"  # ingest file-tracking cache
+type = "files"                    # or "database"
+state = "./thistle-state.sqlite"  # files store only: source-file tracking
 flush_records = 1000000           # memory budget per flush
 ```
 
-- **The store.** The first `type="object", format="tle"` entry under
-  `[[output.files]]` is the canonical store: one epoch-ordered,
-  deduplicated file of verbatim TLE text per satellite — lossless, exactly
-  the property that makes tle object outputs the `--verify` authority on
-  the database backend. Config load **requires** that entry and **rejects**
-  any `format="omm"` output entry (no metadata store to feed it; failing
-  loudly beats silently nameless CSV). OMM *inputs* still ingest — their
-  TLE lines are real data — with a per-file WARNING that metadata is
-  discarded.
-- **Why per-file dedup is global dedup.** The dedup key is the exact line
-  text, and both the NORAD ID and epoch are encoded in it, so every record
-  deterministically maps to one object file; deduplicating within each
-  file is equivalent to the database's `UNIQUE(epoch, line_hash)`. A
-  record with no NORAD ID has no home and is rejected (quarantined as
-  usual).
-- **Single pass — the delta is the buffer.** Ingest validates records
-  through the same path as the database backend (`_validated_tles` /
-  `_validated_omm`; rejects, future-epoch guard, quarantine all identical),
-  buffers them in memory grouped by object, and flushes at end of scan or
-  at `flush_records` (a pure memory budget — flushes are idempotent, so an
-  early flush only touches hot files more than once). At flush time the
-  buffer *is* the delta, which is what eliminates the whole cross-run
-  machinery: no `created` column, no `epoch_date_state`, no lookback
-  window, no mtime-watermark clock rules, and no ingest/generate
-  serialization requirement. The steady-state cron entry is just
-  `thistle-db ingest`.
-- **Append or merge, per object, per output** (the generator's tail guard,
-  restated for files): every buffered epoch strictly greater than the
-  file's tail epoch → append; anything else — late delivery, epoch tie,
-  re-delivery, torn/damaged tail — → merge-rewrite (read the file, drop
-  records whose line hash is present, stable-sort by epoch, write tmp +
-  atomic rename). The merge is also the self-heal for torn appends.
-  Nothing new and an intact file → no write at all. Date outputs are
-  upserted from the same delta ("latest per object that day" can only
-  change when a newer-epoch record for that (object, date) arrives), and a
-  derived *object* output whose file is missing (entry added later,
-  deleted file) is healed by copying the store's file.
-- **Tie rule** (replaces the database's `id DESC`): merges keep existing
-  records before new ones among equal epochs, so file order among ties is
-  ingestion order; date files replace on `epoch >=`, so newest-ingested
-  wins. Incremental updates and `generate --all` rebuilds therefore agree.
-  One nuance: re-delivering an old duplicate whose epoch ties the current
-  date-file winner can flip that winner to the re-delivered text — "last
-  ingested wins" applied literally; the database backend would keep the
-  original. Harmless, but don't "fix" one side without the other.
-- **Crash safety without transactions.** Rewrites are atomic renames;
-  appends are guarded by the torn-tail check; and source-file state
-  (`ingest_files`, kept in the small `state` SQLite — a cache, created on
-  first use, safe to delete) is committed only **after** the flush covering
-  that file — the files analog of the watermark-in-same-transaction rule. A
-  crash anywhere re-ingests at most the files whose state was never
-  recorded, and dedup absorbs the replay.
-- **Commands.** `ingest` does everything; `generate` is vestigial —
-  `--all` rebuilds derived outputs from the store in one linear scan
-  (disaster recovery, or backfill after adding an output entry), the
-  plain form logs that there is nothing to do, and `--verify` is
-  **[NOT YET IMPLEMENTED]** (warns and does nothing). `get-tle NORAD`
-  reads the object's store file; `get-tle YYYYMMDD` reads the date files
-  (candidates are each day's latest-per-object records, so a superseded
-  same-day elset nearer to noon is not considered — a bounded
-  approximation the database backend doesn't make; requires a tle date
-  output). `dump` concatenates the store (no `.json` — no metadata).
-  `init-db` just creates the state cache. thistle's `get_tles` fallback
-  reads the store directly.
-- **When to choose it.** Files: serverless deployments where SQLite's
-  100M-row index maintenance is the bottleneck and outputs are the
-  product. Database: OMM metadata, ad-hoc SQL, or many concurrent
-  writers.
+Interface: `add(delta)` (idempotent), linear scan (rebuild/export),
+per-object read, date-candidate read, per-object and per-date counts
+(verify). Outputs are **lossy projections** (TLE has no metadata; the STK
+CSV has no provenance), so the store must be full-fidelity in either
+implementation — never reconstructible from outputs. Moving between stores
+goes through `export` + `ingest`.
 
-## Data model (`model.py`)
+### `type = "files"` — GP-CSV object tree
 
-Single canonical element-set table plus an OMM metadata sidecar. Do **not**
-split OMM into a fully separate element-set table.
+One epoch-ordered CSV file per object (naming via the `object_id` /
+`zero_pad` / `filename` templating), one record per line
+(`record.STORE_COLUMNS` order), plus the small state SQLite (a cache,
+created on first use, safe to delete).
 
-- **`tle`** — one row per unique element set. Stores the raw `line1`/`line2`
-  text, a `line_hash` (sha256 hex of the exact text — the dedup key), parsed
-  fields (norad_cat_id, epoch, Keplerian elements, drag terms) and derived
-  values (semimajor axis, period, apoapsis/periapsis altitude). Parsing goes
-  through `sgp4.Satrec`.
-- **`omm_metadata`** — OMM-only fields (object name/type, country code, RCS
-  size, launch/decay date, site, originator, GP_ID), one-to-one with a `tle`
-  row via `tle_id`.
-- **`ingest_files`** — per-file ingest state (path, size, mtime_ns, sha256)
-  used to skip unchanged source files on scan; keyed by a sha256 of the
-  resolved path (bounded length for cross-dialect unique indexes).
-- **`epoch_date_state`** — one row per epoch date holding the newest
-  `created` among that date's element sets; the date pass's scope. Derived
-  data (`date(epoch) -> MAX(created)`), maintained incrementally by ingest
-  and recomputable at any time by `init-db` (`api.rebuild_epoch_date_state`).
-  Two rules are load-bearing: the watermark must be written **in the same
-  transaction** as the rows it describes, so a crash can never leave a date
-  permanently unregenerated; and it holds one row per *date*, not per elset,
-  so checking every date file every run stays affordable as the catalog
-  grows. Rows arriving outside `ingest` (a bulk `COPY`, an admin script)
-  bypass the watermark and need a rebuild — the only realistic drift.
+- Append-or-merge per object: all buffered epochs strictly newer than the
+  file's tail → append; anything else (late, tie, re-delivery, torn tail,
+  enrichment) → merge-rewrite (tmp + atomic rename). Torn CSV tail = drop
+  the unparseable last line, healed by the next merge.
+- ~500–600 B/record; a 100k-elset worst-case object ≈ 60 MB. If size ever
+  matters, per-object zstd with merge-time recompression is the escape hatch
+  (never gzip-member appends).
+- **Format versioning** (the price of normalization, paid deliberately):
+  every file begins with a header row, authoritative for that file's
+  columns; readers tolerate unknown columns and treat missing nullable
+  columns as null (`record.from_csv_dict` implements this), so additive
+  change touches zero existing files. A tree-root `store.toml` records
+  format version and store-defining rules. Only additive changes within a
+  major version.
+- `get-tle YYYYMMDD` reads date outputs when configured (candidates are each
+  day's winners — a bounded approximation); exact nearest-to-noon needs the
+  database store.
+
+### `type = "database"` — SQL
+
+The two-table shape survives on merits: `tle` (one row per record, verbatim
+lines + parsed columns) + `omm_metadata` (sparse sidecar, unique FK — now
+also carrying provenance: `GP_ID`, `FILE`, `CREATION_DATE`, `ORIGINATOR`
+**[NOT YET IMPLEMENTED: FILE/CREATION_DATE columns]**), with `ingest_files`
+in the same database. Enrichment is an UPDATE of the metadata row — the one
+sanctioned mutation; `tle` rows stay immutable.
 
 Schema conventions (deliberate, sized for hundreds of millions of rows on
-MariaDB — do not regress them casually):
+MariaDB — do not regress casually):
 
-- Surrogate keys are **BIGINT** (`INTEGER` on SQLite for rowid autoincrement):
-  `INSERT IGNORE` burns auto-increment values on every duplicate it skips, so
-  id consumption tracks rows *attempted*, not stored.
+- Surrogate keys are **BIGINT** (`INTEGER` on SQLite): `INSERT IGNORE` burns
+  auto-increment values on every duplicate skipped, so id consumption tracks
+  rows *attempted*.
 - All stored datetimes are **naive UTC with microseconds** (`DATETIME(6)` on
-  MariaDB); `epoch` must round-trip exactly for the generator's tail guard.
-- Element/derived float columns are **single precision** (`Float32` =
-  FLOAT(24)): the TLE text carries at most 7 significant digits everywhere
-  except `mean_motion` (10 digits — kept DOUBLE), and `line1`/`line2` are
-  the lossless source of truth, so these columns are a re-derivable
-  convenience view. Never compare them for equality; recompute from the
-  lines when full precision matters.
-- Rows are immutable once inserted — there is no `modified` column.
-- The `tle` **index budget is intentionally minimal** (PK,
-  `UNIQUE(epoch, line_hash)`, `(norad_cat_id, epoch)`, `(created)`). Every
-  additional secondary index taxes every insert; add one only with a query
-  that needs it.
+  MariaDB); `epoch` must round-trip exactly for the tail guard.
+- Element/derived float columns are **single precision** (`Float32`) except
+  `mean_motion` (10 significant digits — DOUBLE); the lines are the lossless
+  truth, so these are a re-derivable convenience view. Never compare them
+  for equality.
+- The `tle` **index budget is minimal** (PK, `UNIQUE(epoch, line_hash)`,
+  `(norad_cat_id, epoch)`, `(created)`). Epoch-first uniqueness keeps normal
+  ingest probing the hot right edge of the index regardless of table size,
+  and keeps the index 32 bytes wide instead of 560 (`BINARY(32)`; use
+  `HEX(line_hash)` in ad-hoc SQL). Every added secondary index taxes every
+  insert; add one only with a query that needs it.
+- Dedup is enforced with dialect-aware upserts (`ON CONFLICT DO NOTHING` for
+  SQLite/PostgreSQL, `INSERT IGNORE` for MySQL/MariaDB), chunked
+  (`CHUNK_SIZE = 5000`); chunk failures fall back to row-by-row inserts so a
+  refused record costs only itself. Any new bulk-write path must follow this
+  pattern on all three dialects.
 
-### Uniqueness
+This store's reason to exist: exact `nearest_tles_for_date` over all elsets,
+ad-hoc SQL, fast metadata queries. Its schema changes via `export` →
+`init-db --drop` → `ingest`; there is intentionally **no migration
+framework** (see Schema changes below).
 
-The dedup key is the **exact text of `(line1, line2)`**, enforced as
-`UNIQUE(epoch, line_hash)` where `line_hash` is the raw 32-byte sha256 of
-`line1 + "\n" + line2` (`BINARY(32)` on MariaDB — a plain BLOB could not
-back the unique index; use `HEX(line_hash)` in ad-hoc SQL). This is
-semantically identical to a unique constraint on the raw text (the epoch is
-encoded in line1, so identical lines always share an epoch) but keeps the
-index 32 bytes wide instead of 560. Epoch-first ordering means
-normal "recent elsets" ingest probes only the hot right edge of the index
-regardless of table size. Textual near-duplicates from different providers
-coexist as separate rows — this is deliberate. Do not change the key to
-`(norad_cat_id, epoch)` or similar without an explicit decision.
+## Outputs [NOT YET IMPLEMENTED]
 
-If a TLE is delivered first and the OMM version of the same element set arrives
-later (with identical lines), the TLE row is **not** duplicated — the OMM
-delivery attaches an `omm_metadata` row to the existing `tle` row (resolved by
-`line_hash`). Both representations are thereby preserved: the TLE lines in
-`tle`, the OMM extras in `omm_metadata`.
+Declarative `[[output.files]]` entries, all maintained incrementally by the
+flush engine, identical behavior on either store. Each entry names a `type`
+(`object` / `date`), a `format`, a destination `dir`, and a filename scheme.
+At least one entry is required (misconfiguration exits 2, not a silent
+no-op).
 
-Dedup is enforced at the database with dialect-aware upserts
-(`ingest._bulk_insert_ignore`): `ON CONFLICT DO NOTHING` for SQLite/PostgreSQL,
-`INSERT IGNORE` for MySQL/MariaDB. Inserts are chunked (`CHUNK_SIZE = 5000`).
-Any new bulk-write path must follow this pattern and work on all three dialects.
+- **`format = "tle"`**: verbatim passthrough of stored lines — the
+  compatibility surface for TLE-only consumers (GMAT, legacy pipelines).
+  Records with null lines are **always skipped and counted** (one WARNING
+  per run): TLE outputs never contain a byte thistle synthesized, keeping
+  exporter fidelity out of the correctness surface. Object files: all
+  records, epoch order. Date files: latest record per object per epoch date.
+- **`format = "omm-csv"`**: header row + the CelesTrak/STK 17-column
+  projection (`reader.OMM_CSV_FIELDS` order; `record.to_omm_dict`) —
+  verified against live CelesTrak output and STK's documented "OMM-based
+  CSV" acceptance. All 17 fields are populated even for TLE-only deliveries,
+  so every record is exportable — no subset caveat. `columns = "stk"`
+  (default) | `"full"` (all store columns). Acceptance check: a generated
+  file loads in STK's SGP4 propagator.
+- Filename templating as currently implemented: `extension` overrides the
+  default suffix; `filename` arranges `{id}`/`{date}`/`{ext}`/`{format}`/
+  `{type}`, validated at **config load** (unknown placeholder, missing
+  `{id}`/`{date}`, format specs, path separators, `..` all fail there — a
+  `KeyError` while naming the 40,000th file would leave a half-written
+  tree). Directories come from `dir` only. `parse_object_name`/`object_glob`
+  derive the inverse for verify's orphan scan.
+- An `object_id = "alpha5"` output meeting `NORAD_CAT_ID` > 339,999 **falls
+  back to the plain integer stem for that object** with one WARNING per run —
+  ingest never fails or drops valid data over an output naming choice;
+  `parse_object_name`/`object_glob` must accept both stems.
+- Date outputs are upserted from the delta ("latest per object that day" can
+  only change when a newer-epoch record for that (object, date) arrives);
+  replace on `epoch >=`, so newest-ingested wins ties.
+
+Filesystem work runs on the write pool (`writer.WritePool`,
+`output.write_workers`): per-file open/close was 44% of a full rebuild —
+pure blocked time with the GIL released. The pool only ever receives pure
+filesystem work; sessions/queries stay on the calling thread; work is
+submitted a chunk of objects at a time so memory stays bounded and each task
+owns a distinct path. Rows are read as Core column tuples, never ORM
+entities (materializing ORM objects cost ~7.6s of a 38s rebuild).
+`scripts/bench_store.py` benches store ingest (files vs SQLite, chrono vs
+reverse delivery); a rebuild/output bench is still to be written.
+Ingest scans **sort source files chronologically** (by name — delivery
+files are date-named) so historical backfills hit the append path, not
+merge-rewrites [NOT YET IMPLEMENTED].
 
 ## Configuration (`config.py`)
 
-- `config.toml` (path via `-c`, default `./config.toml`), parsed into
-  pydantic-settings models: `[database]`, `[storage]` (backend selection —
-  see "Storage backends"), `[ingest]` (`reject_dir`,
-  `max_epoch_ahead_days`, plus `[[ingest.sources]]` entries), `[output]` (with `[[output.files]]`
-  entries — see the `generate` command), `[logging]`.
-  `[output]` rejects unknown keys (`extra="forbid"`), so pre-0.12 configs
-  (`dir`, `formats`, `types`) fail validation with a pointer at the key
-  instead of being silently ignored.
-- Database credentials are **never** stored in `config.toml`. Resolution order
-  (highest priority first):
+- `config.toml` (path via `-c`, default `./config.toml`; the
+  `THISTLE_DB_CONFIG` env var overrides the default — shared with thistle's
+  db fallback), parsed into pydantic-settings models: `[database]`,
+  `[storage]`, `[ingest]` (`reject_dir`, `max_epoch_ahead_days`,
+  `[[ingest.sources]]`), `[output]` with `[[output.files]]`, `[logging]`.
+  `[output]` rejects unknown keys (`extra="forbid"`) so stale configs fail
+  validation with a pointer at the key instead of being silently ignored.
+- Database credentials are **never** stored in `config.toml`. Resolution
+  order (highest first):
   1. Env vars `THISTLE_DB_DATABASE__USERNAME` / `THISTLE_DB_DATABASE__PASSWORD`
   2. User secrets file `~/.config/thistle-db.toml`
   3. System secrets file (`database.secrets_file` in config)
@@ -316,194 +380,88 @@ Any new bulk-write path must follow this pattern and work on all three dialects.
 
 ## CLI (`cli.py`)
 
-`thistle-db [-c CONFIG] [--log FILE] [--no-progress] <command>` — the
-config path defaults to the `THISTLE_DB_CONFIG` env var when set (shared
-with thistle's db fallback), else `./config.toml`. Global options:
+`thistle-db [-c CONFIG] [--log FILE] [--no-progress] <command>`. Global
+options:
 
-- `--log FILE` — add a rotating loguru file sink (10 MB rotation, last 10
-  kept) alongside console logging; the cron-friendly alternative to shell
-  redirection.
+- `--log FILE` — rotating loguru file sink (10 MB rotation, last 10 kept)
+  alongside console logging; the cron-friendly alternative to redirection.
 - `--no-progress` — force the progress bar off. The bar (rich, stderr,
-  `progress.py`) only appears when stderr is an interactive terminal, so
-  crons never see it; log lines render above the live bar via the shared
-  rich console. Command *output* (get-tle TLEs, dump messages) is stdout
-  and must never route through the progress console.
+  `progress.py`) only appears when stderr is an interactive terminal; log
+  lines render above the live bar via the shared console. Command *output*
+  (get-tle TLEs, export messages) is stdout and must never route through the
+  progress console.
 
-Commands are privilege-tiered: `init-db` is the only DDL path, `ingest` the
-only DML path, and the read commands (`get-tle`, `generate`, `dump`, plus
-thistle's `get_tles` fallback) open **read-only connections** — writes are
-rejected at the connection level (`PRAGMA query_only` / `SET SESSION
-TRANSACTION READ ONLY` / read-only transaction characteristics) as defense
-in depth on top of DB grants. Deployments can therefore give the cron
-account DML-only rights and readers SELECT-only rights:
+Commands **[NOT YET IMPLEMENTED: rebuild/verify/export as named; ingest does
+not yet maintain outputs]**:
 
 - `init` — scaffold `config.toml` and `~/.config/thistle-db.toml`.
-- `init-db [--drop] [--yes] [--defer-indexes]` — create the database
-  schema; the intended DDL entry point (run once with an admin account when
-  using MariaDB/PostgreSQL). Also recomputes `epoch_date_state` from the
-  element sets (the adoption path for an existing database and the repair
-  for rows inserted outside `ingest`), and builds any *missing* model
-  index — so a plain `init-db` is also the finalize step after a deferred
-  rebuild. Idempotent without `--drop`.
-  `--defer-indexes` (requires `--drop`) creates the schema without the
-  read-path indexes (`ix_tle_norad_cat_id_epoch`, `ix_tle_created` —
-  `api.DEFERRABLE_INDEXES`) for bulk restores; the unique dedup indexes are
-  never deferred, so ingest idempotency holds throughout. Flow:
-  `init-db --drop --defer-indexes` → ingest everything → `init-db`. `--drop` destroys and recreates all tables:
-  it prompts for confirmation, and in non-interactive use fails closed
-  unless `--yes` is passed.
-- `ingest [FILES...] [--force]` — ingest specific files (always parsed, even
-  if recorded as unchanged), or scan all configured sources when no files are
-  given; `--force` re-ingests scanned files regardless of recorded state.
-  With named files, any failure yields exit code 1 (after all files are
-  attempted) so cron wrappers can detect it; scans stay tolerant (exit 0,
-  failed files retried next scan).
-- `get-tle TARGET [--days N]` — print TLEs to stdout. `TARGET` is either an
-  8-digit date `YYYYMMDD` (→ the nearest TLE per object to 12:00 UTC on that
-  date, within ±N days, default 7) or an alpha-5-compatible NORAD ID
-  (e.g. `25544`, `00022`, `E5693` → every TLE for that object, epoch order).
-  Exits 1 if nothing matches.
-- `dump OUTPUT [--force]` — logical backup: write every element set to
-  `OUTPUT.tle` (lossless, verbatim line text) and rows with OMM metadata to
-  `OUTPUT.json` (Space-Track form, only created when metadata exists).
-  Restore = `init-db` + `ingest` both files (for large catalogs use the
-  deferred-index flow under "Schema changes"); works across dialects. Refuses
-  to overwrite existing outputs without `--force`. Physical backups of live
-  servers belong to native tools (`mariadb-dump`, `pg_dump`, SQLite file
-  copy), not this command.
-- `generate [--all] [--window-days N] [--lookback-days N] [--verify]` —
-  write output files per `[output]` config. Outputs are declared as
-  `[[output.files]]` entries; each names a `type`, a `format` (`tle` =
-  two-line text, `omm` = CSV), a destination `dir` (created if missing;
-  entries may share or split directories), and a filename scheme. At least
-  one entry is required: with none configured, `generate` prints an error
-  and exits 2 (misconfiguration, not a silent no-op); the library entry
-  point raises `ValueError`. The `init` scaffold ships the standard four
-  entries (date + object files in both formats under `./output`).
-  - `type = "date"`: one file per epoch date — latest element set per
-    satellite for that date. Filename stem from `date_format` (strftime,
-    default `"%Y%m%d"`).
-  - `type = "object"`: one file per satellite — all element sets, ordered
-    by epoch. Filename stem is the NORAD ID, rendered per
-    `object_id = "int"` (default) or `"alpha5"` (always 5 characters, e.g.
-    `00900`, `E5693`); `zero_pad = true` pads int IDs to 5 digits.
-  - `extension` overrides the `.tle`/`.omm` default suffix on any entry.
-  - `filename` is a template arranging those pieces, defaulting to
-    `"{id}{ext}"` (object) and `"{date}{ext}"` (date) — an entry that omits
-    it names files exactly as before. Placeholders are `{id}`/`{date}`
-    (rendered per `object_id`/`zero_pad` and `date_format`), `{ext}`,
-    `{format}` and `{type}`; e.g. `filename = "tle_{id}.txt"` →
-    `tle_00900.txt`. Templates are validated at **config load**, not
-    mid-generate: an unknown placeholder, a missing `{id}`/`{date}` (every
-    file would render to one name and overwrite the last), a format spec,
-    or anything containing a path separator or `..` fails there, since a
-    `KeyError` raised while naming the 40,000th file would leave a
-    half-written output tree behind. Directories come from `dir` only.
-    `OutputFile.parse_object_name`/`object_glob` derive the inverse from
-    the same template, so `--verify`'s orphan scan tracks whatever naming
-    is configured.
-  - **Incremental by default** — steady-state cost must stay O(new rows),
-    independent of catalog size, with no persistent generator state:
-    - Date files: rewritten when the database holds rows **newer than the
-      file**. Scope comes from `epoch_date_state`, a one-row-per-date
-      watermark table ingest maintains in the same transaction as the rows
-      it describes; each date's watermark is compared against that date's
-      file mtime. Because the table grows by a row a day rather than with
-      the catalog, **every** date file is checked on every run — one `stat`
-      per date per output — so there is no trailing window and no lookback
-      for dates. A generation gap of any length, a restore that resets
-      `created`, and a delivery for a date years old all self-correct on
-      the next ordinary run, with no `--all`. The tradeoffs: silent
-      corruption of a file whose watermark is older than it is caught by
-      `--verify` rather than the normal run, and the mtime comparison
-      carries the same requirement as the object pass (ingest and generate
-      must not overlap).
-    - Object files: rows created within `output.lookback_days` (default 7)
-      are streamed in keyset batches ordered by `(norad_cat_id, epoch, id)`
-      and **appended** to each object's file in every object output behind
-      a tail guard (only rows strictly newer than the file's last epoch are
-      appended; the file mtime distinguishes overlapping-lookback re-runs
-      from genuinely late rows). Each output decides independently against
-      its own file's tail and mtime.
-      The mtime watermark assumes ingest and generate never run
-      concurrently — deployments must serialize them (cron chaining with
-      `&&`, or a shared `flock`); a row committed mid-generate could
-      otherwise be misclassified as already on disk until the next
-      `--verify` sweep.
-      Any anomaly — late delivery, epoch tie, torn last line, missing or
-      inconsistent file — falls back to a full rewrite of that object's
-      file from the database, which is always authoritative (outputs
-      needing a rewrite share one fetch). An omm file may legitimately hold
-      only a subset of rows (sgp4 cannot export every elset), so its tail
-      may lag; re-appending a previously seen but unexportable row exports
-      nothing and stays harmless.
-    - `--all` rebuilds everything (first run, disaster recovery, or after a
-      generation gap longer than the lookback). `lookback_days` must exceed
-      the ingest cron cadence.
-    - `--verify` follows the normal run with a count-reconciliation sweep
-      of **both** file kinds, rewriting whatever disagrees:
-      - object files: per-object database row counts (one aggregated index
-        query) against each tle object output's line count;
-      - date files: per-date distinct object counts (one aggregated query)
-        against each tle date file's line count — the compensating control
-        for the normal run trusting watermarks rather than re-reading
-        files.
-      It catches damage the tail guard can't see (mid-file
-      truncation/edits, files deleted for quiet objects). Reads all output
-      files, so it belongs on a periodic (e.g. weekly) cron entry, not
-      every run. Requires a tle output of the kind being verified — tle
-      files hold every row verbatim and are the verification authority.
+- `init-db [--drop] [--yes] [--defer-indexes]` — database store: create the
+  schema (run once with an admin account on MariaDB/PostgreSQL); idempotent
+  without `--drop`; `--drop` prompts, and fails closed non-interactively
+  without `--yes`. `--defer-indexes` (requires `--drop`) creates the schema
+  without the read-path indexes for bulk restores — the unique dedup index
+  is never deferred, so idempotency holds throughout; a later plain
+  `init-db` builds missing indexes (the finalize step). Files store: create
+  the state cache.
+- `ingest [FILES...] [--force]` — everything: validate, store, outputs.
+  Scans stay tolerant (exit 0; failed files retried next scan); named files
+  exit 1 on any failure so cron wrappers can detect it.
+- `rebuild` — linear store scan re-deriving all outputs (first run, disaster
+  recovery, new output entry).
+- `verify` — count reconciliation of every output against the **store** (the
+  authority): per-object record counts, per-date winner counts. Catches
+  damage the tail guard can't see (mid-file truncation, deleted files for
+  quiet objects). Reads all output files → periodic cron (e.g. weekly), not
+  every run.
+- `export OUTPUT [--format tle|csv|omm-xml|omm-kvn] [--force]` — full-fidelity
+  CSV is the store-to-store migration and backup form; TLE concat for
+  legacy; CCSDS OMM XML/KVN (core keywords + extras in
+  `userDefinedParameters`) for standards-adherent interchange, emitting OMM
+  version 2.0 by default (STK's documented acceptance; Space-Track emits
+  3.0 — add a flag when someone needs it). Refuses to overwrite without
+  `--force`. Physical backups of live servers belong to native tools.
+- `get-tle TARGET [--days N]` — print TLEs to stdout. `TARGET` is an 8-digit
+  date `YYYYMMDD` (nearest TLE per object to 12:00 UTC, ±N days, default 7)
+  or an alpha-5-compatible NORAD ID (every TLE for that object, epoch
+  order). Exits 1 if nothing matches. Exact on the database store; bounded
+  approximation on files.
 
-### Generation performance
-
-Two rules keep generation from regressing:
-
-- **Rows are read as Core column tuples, never ORM entities.** Materializing
-  `TLE` objects cost ~7.6s of a 38s full rebuild and held the whole batch as
-  Python objects. `generator._elset_columns` selects exactly the columns
-  generation reads, and joins `omm_metadata` only when an omm output exists.
-- **Filesystem work runs on a thread pool** (`writer.WritePool`,
-  `output.write_workers`, default auto). Per-file `open`/close was 44% of a
-  full rebuild — pure blocked time, and the GIL is released for it. The pool
-  only ever receives pure filesystem work; the SQLAlchemy `Session` is not
-  thread-safe, so **every query stays on the calling thread** and tasks are
-  handed data already fetched. Work is submitted a chunk of objects at a
-  time, so memory stays bounded and each task owns a distinct path.
-
-`scripts/bench_generate.py` builds a synthetic catalog and times both
-shapes; on 5k objects x 40 days across four outputs, `--all` runs in ~10s
-and a steady-state incremental run in ~2.2s (from 38s and 13.5s).
-
-## Module map
-
-| Module | Responsibility |
-|---|---|
-| `cli.py` | typer CLI, subcommand dispatch, logging setup |
-| `config.py` | pydantic-settings config + layered secrets resolution |
-| `model.py` | SQLAlchemy ORM models (`TLE`, `OmmMetadata`), TLE parsing via sgp4 |
-| `reader.py` | format detection + file readers (TLE, OMM JSON/CSV/XML) |
-| `ingest.py` | shared record validation, bulk insert with dedup, source-directory scanning |
-| `filestore.py` | files backend: object-file store, buffered flush, rebuild |
-| `rejects.py` | quarantine for records that could not be ingested |
-| `generator.py` | output file generation from the database |
-| `writer.py` | thread pool for output file writes |
-| `progress.py` | shared rich console (stderr) + no-op-able progress reporter |
+Privilege tiering: `init-db` = DDL; `ingest` = DML **and output writes** (the
+ingest account owns the output tree); read commands open **read-only
+connections** (`PRAGMA query_only` / read-only transaction characteristics)
+as defense in depth on top of DB grants. **Single-writer ingest is
+universal** — output-file guards assume serialized ingest on either store
+(`flock` / cron chaining).
 
 ## Error handling philosophy
 
-Ingest is tolerant: a malformed TLE or OMM record is skipped (and
-quarantined when `reject_dir` is set) — one bad record must never abort a
-file, and one bad file must never abort a scan. A missing source directory
-is a warning, not an error.
+Ingest is tolerant: a malformed record is skipped (and quarantined when
+`reject_dir` is set) — one bad record must never abort a file, and one bad
+file must never abort a scan. A missing source directory is a warning.
 
-Logging levels: routine no-ops (unchanged files skipped on scan) and
-individual rejected records log at DEBUG; per-file actions and per-directory
-summaries at INFO; data problems at WARNING. Rejections are reported as one
-WARNING per file giving the count **over the total attempted** — the ratio
-is what separates a few bad lines in a good file from an entirely wrong
-file, and a per-record warning would emit thousands of lines for a
-persistently broken feed. The INFO log of a steady-state cron run should
-stay short.
+Logging levels: routine no-ops (unchanged files skipped) and individual
+rejected records at DEBUG; per-file actions and per-directory summaries at
+INFO; data problems at WARNING. Rejections are one WARNING per file giving
+the count **over the total attempted** — the ratio separates a few bad lines
+from an entirely wrong file. Line-less records skipped by tle outputs are
+one WARNING per run with the count. The INFO log of a steady-state cron run
+stays short.
+
+## Module map
+
+| Module | Responsibility | Status |
+|---|---|---|
+| `record.py` | canonical GP record: construction, identity, merge, CSV/STK serialization | implemented |
+| `cli.py` | typer CLI, subcommand dispatch, logging setup | legacy commands |
+| `config.py` | pydantic-settings config + layered secrets resolution | legacy `[storage] backend` |
+| `model.py` | SQLAlchemy models for the database store | needs provenance columns |
+| `reader.py` | format detection + file readers (TLE, OMM JSON/CSV/XML) | current |
+| `ingest.py` | validation, scanning, bulk insert | to become the delta engine |
+| `filestore.py` | TLE-line files backend | to become the GP-CSV store |
+| `rejects.py` | quarantine for rejected records | current |
+| `generator.py` | steady-state output generation | to be deleted (rebuild/verify remain) |
+| `writer.py` | thread pool for output file writes | current |
+| `progress.py` | shared rich console (stderr) + no-op-able progress reporter | current |
 
 ## Development
 
@@ -512,43 +470,43 @@ stay short.
 - Run tests: `uv run pytest tests/thistle_db` from the workspace root. Lint:
   `uv run ruff check`. Types: `uv run pyright`.
 - Tests cover SQLite by default; set `THISTLE_DB_TEST_MARIADB=1` /
-  `THISTLE_DB_TEST_POSTGRES=1` (requires Docker) to run the MariaDB and
-  PostgreSQL backends via testcontainers — CI runs all three. Dialect-specific
-  behavior (upserts) must be tested against all three.
-- Test fixtures live in `tests/thistle_db/data/` — real TLE text files and
-  Space-Track OMM JSON, **truncated to a few hundred records each** so the
-  suite stays fast (~8s on SQLite); realism comes from the records being
-  genuine provider output (3LE name lines, odd designators), not from
-  volume. The one deliberate exception: `20250418.txt` keeps 6,001 records
-  — above `CHUNK_SIZE` (5000) — so multi-chunk ingest and the final
-  partial chunk stay exercised. Don't re-add bulk fixtures for logic
-  tests; a test that genuinely needs volume should generate it
-  (see `scripts/bench_generate.py`).
+  `THISTLE_DB_TEST_POSTGRES=1` (requires Docker) for MariaDB/PostgreSQL via
+  testcontainers — CI runs all three. Dialect-specific behavior (upserts)
+  must be tested against all three.
+- Test fixtures live in `tests/thistle_db/data/` — real TLE text and
+  Space-Track OMM JSON, truncated to a few hundred records each (realism
+  from genuine provider output, not volume). `20250418.txt` keeps 6,001
+  records — above `CHUNK_SIZE` — so multi-chunk ingest stays exercised.
+  A test needing volume should generate it (see `scripts/bench_store.py`
+  for the synthesis pattern).
+  `one.json` is the canonical TLE/OMM cross-check fixture.
 
 ### Schema changes (no migration framework — deliberate)
 
-There is intentionally **no Alembic or other migration tooling**. The
-database is a derived store: every row reconstitutes losslessly from a
-`dump`, so schema changes ship as breaking releases migrated by
-`dump` → `init-db --drop --defer-indexes` → `ingest` → `init-db` (plus one
-`generate --all`, since a restore resets `created` timestamps and the
-incremental generator's state derives from them).
+There is intentionally **no Alembic or other migration tooling.**
 
-**Restore performance (MariaDB).** Restoring a large catalog is index-bound,
-not parse- or round-trip-bound: ingest issues ~40 server queries per 30k-row
-file (pymysql batches the chunks), but modern MariaDB has no InnoDB change
-buffer (removed in 11), so every secondary-index insert touches a real
-page. A full-catalog snapshot file scatters one `(norad_cat_id, epoch)`
-page access per row across the whole index; once that index outgrows
-`innodb_buffer_pool_size`, each becomes random storage I/O and per-file
-time is set by storage latency, not by thistle-db. Two remedies, in order:
-defer the read-path indexes during the restore (`--defer-indexes` — the
-final `CREATE INDEX` is one sorted build each), and size the buffer pool
-to hold the `tle` indexes. The unique dedup index stays cheap during
-chronological restores because a snapshot file's epochs land in one hot
-region of the epoch-first index — another reason its column order must not
-change. Do not add a migration framework without an explicit
-decision — the trigger to revisit is when restore downtime becomes
-unacceptable (roughly 100M+ rows). Purely additive changes (a new index, a
-nullable column) may instead ship with hand-written `ALTER` statements for
-all three dialects in the release notes.
+- **Files store**: header-row versioning means additive changes touch zero
+  existing files; anything non-additive is a major store-format bump with an
+  explicit upgrade path.
+- **Database store**: every record reconstitutes losslessly from a
+  full-fidelity `export`, so schema changes ship as breaking releases
+  migrated by `export` → `init-db --drop --defer-indexes` → `ingest` →
+  `init-db`. Restore performance on MariaDB is index-bound, not parse-bound:
+  modern MariaDB has no InnoDB change buffer, so every secondary-index
+  insert touches a real page — defer the read-path indexes and size the
+  buffer pool to hold the `tle` indexes. The unique dedup index stays cheap
+  during chronological restores because a snapshot's epochs land in one hot
+  region of the epoch-first index — a reason its column order must not
+  change. Purely additive changes may ship as hand-written `ALTER`
+  statements for all three dialects in the release notes.
+
+## Build order (remaining)
+
+Per `PLAN-gp-store.md` (steps 1–3 done: spec adopted, spikes run, record
+module implemented):
+
+4. Delta engine + GP-CSV files store + tle/omm-csv outputs (the serverless
+   deployment, end to end).
+5. Database store behind the same interface; exact `get-tle`.
+6. `rebuild`, `verify`, `export`; retire the legacy code paths and remove
+   the "legacy" rows from the module map above.

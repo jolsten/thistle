@@ -6,9 +6,9 @@ import json
 import math
 import pathlib
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Annotated, NoReturn, Optional
+from typing import TYPE_CHECKING, Annotated, NoReturn, Optional
 
 import numpy as np
 import typer
@@ -41,6 +41,9 @@ from thistle.cli._config import (
     is_catalog_id,
     load_config,
 )
+
+if TYPE_CHECKING:
+    from thistle.propagator import Propagator
 
 app = typer.Typer(
     name="thistle",
@@ -667,7 +670,9 @@ def groundtrack_cmd(
     ] = None,
     min_el: Annotated[
         float,
-        typer.Option("--min-el", help="Visibility ring elevation angle (deg)"),
+        typer.Option(
+            "--min-el", "--min-elevation", help="Visibility ring elevation angle (deg)"
+        ),
     ] = 0.0,
     sat_alt: Annotated[
         Optional[float],
@@ -1319,3 +1324,280 @@ def propagate(
             times_arr = np.array(chunk_times, dtype="datetime64[ns]")
             data = generate(times_arr, propagator, groups, sites=sites_dict)
             _emit_rows(data, chunk_iso)
+
+
+# ---------------------------------------------------------------------------
+# events
+# ---------------------------------------------------------------------------
+
+
+events_app = typer.Typer(
+    name="events",
+    help="Find satellite event times within a UTC time window.\n\n"
+    "Each subcommand propagates the TLEs in FILE (switching per --switch) "
+    "and prints one event or period per row. Times are ISO 8601 UTC; "
+    "periods are clipped to the requested window, so a boundary equal to "
+    "--start or --stop is not a true transition instant.",
+    no_args_is_help=True,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+app.add_typer(events_app, name="events")
+
+
+_EVENTS_FILE = Annotated[pathlib.Path, typer.Argument(help="TLE file path")]
+_EVENTS_START = Annotated[
+    str, typer.Option("--start", help="Window start (ISO 8601 UTC)")
+]
+_EVENTS_STOP = Annotated[
+    str, typer.Option("--stop", help="Window stop (ISO 8601 UTC)")
+]
+_EVENTS_SWITCH = Annotated[
+    SwitchStrategy, typer.Option("--switch", help="TLE switching strategy")
+]
+_EVENTS_WARN_DAYS = Annotated[
+    float,
+    typer.Option(
+        "--warn-days",
+        help="Warn when the window reaches more than this many days "
+        "from the nearest TLE epoch (0 disables)",
+    ),
+]
+_EVENTS_DELIMITER = Annotated[
+    Optional[str],
+    typer.Option("-d", "--delimiter", help="Output field delimiter (default: whitespace)"),
+]
+_EVENTS_PRINT_HEADER = Annotated[
+    bool,
+    typer.Option("--print-header", help="Print column names as first row"),
+]
+_EVENTS_ALIGN = Annotated[
+    bool,
+    typer.Option("--align", help="Align output columns"),
+]
+
+
+def _events_window(start: str, stop: str) -> tuple[np.datetime64, np.datetime64]:
+    """Parse and validate the --start/--stop window as naive-UTC datetime64."""
+    parsed: list[np.datetime64] = []
+    for label, value in (("--start", start), ("--stop", stop)):
+        try:
+            dt = datetime.fromisoformat(value)
+        except ValueError:
+            print(
+                f"Error: {label} expects an ISO 8601 timestamp, got: {value}",
+                file=sys.stderr,
+            )
+            raise typer.Exit(code=2)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        parsed.append(np.datetime64(dt.isoformat(), "us"))
+    if parsed[0] >= parsed[1]:
+        print("Error: --start must be before --stop", file=sys.stderr)
+        raise typer.Exit(code=2)
+    return parsed[0], parsed[1]
+
+
+def _events_propagator(
+    file: pathlib.Path, switch: SwitchStrategy, warn_days: float
+) -> "Propagator":
+    """Load FILE as a single-object Propagator. Exits with code 2 on error."""
+    from thistle import Propagator, read_tle as read_tle_file
+
+    file = _resolve_tle_path(file)
+    try:
+        tles = read_tle_file(file)
+    except FileNotFoundError:
+        print(f"Error: TLE file not found: {file}", file=sys.stderr)
+        raise typer.Exit(code=2)
+    if not tles:
+        print(f"Error: no TLEs found in {file}", file=sys.stderr)
+        raise typer.Exit(code=2)
+
+    satnums = set()
+    for line1, line2 in tles:
+        try:
+            satnums.add(Satrec.twoline2rv(line1, line2).satnum)
+        except Exception:
+            pass
+    if len(satnums) > 1:
+        print(
+            f"Error: file contains {len(satnums)} objects; "
+            "use 'thistle filter --satnum NNN' to select one object",
+            file=sys.stderr,
+        )
+        raise typer.Exit(code=2)
+
+    return Propagator(tles, method=switch.value, warn_threshold=warn_days)
+
+
+def _event_time_iso(value: np.datetime64) -> str:
+    return value.astype("datetime64[us]").item().isoformat(timespec="seconds")
+
+
+def _period_rows(periods: list[dict]) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for p in periods:
+        duration_s = (p["stop"] - p["start"]) / np.timedelta64(1, "s")
+        rows.append([
+            _event_time_iso(p["start"]),
+            _event_time_iso(p["stop"]),
+            f"{duration_s:.1f}",
+        ])
+    return rows
+
+
+def _emit_event_table(
+    header: list[str],
+    rows: list[list[str]],
+    delimiter: Optional[str],
+    print_header: bool,
+    align: bool,
+) -> None:
+    out_delim = delimiter if delimiter is not None else " "
+    table = [header] + rows if print_header else rows
+    if align:
+        writer = AlignedWriter(out_delim)
+        for row in table:
+            writer.add_row(row)
+        writer.flush()
+    else:
+        for row in table:
+            sys.stdout.write(out_delim.join(row) + "\n")
+
+
+@events_app.command("sunlight")
+def events_sunlight_cmd(
+    file: _EVENTS_FILE,
+    start: _EVENTS_START,
+    stop: _EVENTS_STOP,
+    switch: _EVENTS_SWITCH = SwitchStrategy.midpoint,
+    warn_days: _EVENTS_WARN_DAYS = 7.0,
+    delimiter: _EVENTS_DELIMITER = None,
+    print_header: _EVENTS_PRINT_HEADER = False,
+    align: _EVENTS_ALIGN = False,
+) -> None:
+    """Find periods when the satellite is in sunlight.
+
+    Prints one row per sunlit period: start, stop, duration (s). Each
+    period boundary not clipped at the window edge is an orbital
+    sunrise (start) or sunset (stop) instant.
+    """
+    t0, t1 = _events_window(start, stop)
+    propagator = _events_propagator(file, switch, warn_days)
+
+    from thistle.events import find_sunlit_periods
+
+    with report_tle_warnings():
+        periods = find_sunlit_periods(t0, t1, propagator)
+
+    _emit_event_table(
+        ["start", "stop", "duration_s"],
+        _period_rows(periods),
+        delimiter,
+        print_header,
+        align,
+    )
+
+
+@events_app.command("eclipse")
+def events_eclipse_cmd(
+    file: _EVENTS_FILE,
+    start: _EVENTS_START,
+    stop: _EVENTS_STOP,
+    switch: _EVENTS_SWITCH = SwitchStrategy.midpoint,
+    warn_days: _EVENTS_WARN_DAYS = 7.0,
+    delimiter: _EVENTS_DELIMITER = None,
+    print_header: _EVENTS_PRINT_HEADER = False,
+    align: _EVENTS_ALIGN = False,
+) -> None:
+    """Find periods when the satellite is in Earth's shadow.
+
+    Prints one row per eclipse period: start, stop, duration (s). Each
+    period boundary not clipped at the window edge is an orbital
+    sunset (start) or sunrise (stop) instant.
+    """
+    t0, t1 = _events_window(start, stop)
+    propagator = _events_propagator(file, switch, warn_days)
+
+    from thistle.events import find_eclipse_periods
+
+    with report_tle_warnings():
+        periods = find_eclipse_periods(t0, t1, propagator)
+
+    _emit_event_table(
+        ["start", "stop", "duration_s"],
+        _period_rows(periods),
+        delimiter,
+        print_header,
+        align,
+    )
+
+
+@events_app.command("passes")
+def events_passes_cmd(
+    file: _EVENTS_FILE,
+    start: _EVENTS_START,
+    stop: _EVENTS_STOP,
+    site: Annotated[
+        list[str],
+        typer.Option("--site", help="Ground site: NAME:LAT:LON[:ALT] (repeatable)"),
+    ],
+    min_elevation: Annotated[
+        float,
+        typer.Option(
+            "--min-elevation", "--min-el", help="Minimum elevation angle (deg)"
+        ),
+    ] = 0.0,
+    switch: _EVENTS_SWITCH = SwitchStrategy.midpoint,
+    warn_days: _EVENTS_WARN_DAYS = 7.0,
+    delimiter: _EVENTS_DELIMITER = None,
+    print_header: _EVENTS_PRINT_HEADER = False,
+    align: _EVENTS_ALIGN = False,
+) -> None:
+    """Find passes over one or more ground sites.
+
+    Prints one row per pass, sorted by start time: site, start, stop,
+    duration (s), peak time, peak elevation (deg).
+    """
+    sites: list[tuple[str, float, float, float]] = []
+    for spec in site:
+        try:
+            name, coords = parse_site(spec)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            raise typer.Exit(code=2)
+        alt = coords[2] if len(coords) == 3 else 0.0
+        sites.append((name, coords[0], coords[1], alt))
+
+    t0, t1 = _events_window(start, stop)
+    propagator = _events_propagator(file, switch, warn_days)
+
+    from thistle.events import find_passes
+
+    keyed_rows: list[tuple[np.datetime64, list[str]]] = []
+    with report_tle_warnings():
+        for name, lat, lon, alt in sites:
+            for p in find_passes(
+                t0, t1, propagator, lat, lon, alt=alt, min_elevation=min_elevation
+            ):
+                duration_s = (p["stop"] - p["start"]) / np.timedelta64(1, "s")
+                keyed_rows.append((
+                    p["start"],
+                    [
+                        name,
+                        _event_time_iso(p["start"]),
+                        _event_time_iso(p["stop"]),
+                        f"{duration_s:.1f}",
+                        _event_time_iso(p["peak_time"]),
+                        f"{p['peak_elevation']:.2f}",
+                    ],
+                ))
+    keyed_rows.sort(key=lambda r: r[0])
+
+    _emit_event_table(
+        ["site", "start", "stop", "duration_s", "peak_time", "peak_el_deg"],
+        [r[1] for r in keyed_rows],
+        delimiter,
+        print_header,
+        align,
+    )
