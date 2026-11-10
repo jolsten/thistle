@@ -182,3 +182,67 @@ class TestConfigPathDiscovery:
         settings = load_config(None)
         assert settings.database.drivername == "sqlite"
         assert settings.database.name == ":memory:"
+
+
+class TestSchemaV2Surface:
+    """The single-store config surface: retired keys fail, new knobs work."""
+
+    def test_retired_storage_section_fails(self, tmp_path):
+        config = tmp_path / "config.toml"
+        config.write_text('[storage]\nbackend = "files"\n')
+        with pytest.raises(Exception):
+            load_config(config)
+
+    def test_retired_ingest_keys_fail(self, tmp_path):
+        config = tmp_path / "config.toml"
+        config.write_text('[ingest]\nreject_dir = "./rejects"\n')
+        with pytest.raises(Exception):
+            load_config(config)
+
+    def test_retired_output_keys_fail(self, tmp_path):
+        config = tmp_path / "config.toml"
+        config.write_text("[output]\nlookback_days = 7\n")
+        with pytest.raises(Exception):
+            load_config(config)
+
+    def test_ingest_defaults(self, tmp_path):
+        config = tmp_path / "config.toml"
+        config.write_text("")
+        settings = load_config(config)
+        assert settings.ingest.max_epoch_ahead_days == 30
+        assert settings.ingest.verify_checksums is True
+        assert settings.ingest.flush_records == 1_000_000
+
+    def test_omm_csv_format_and_columns(self, tmp_path):
+        config = tmp_path / "config.toml"
+        config.write_text(
+            "[[output.files]]\n"
+            'type = "object"\nformat = "omm-csv"\ncolumns = "full"\n'
+        )
+        entry = load_config(config).output.files[0]
+        assert entry.ext == ".csv"
+        assert entry.columns == "full"
+
+    def test_columns_rejected_for_tle_format(self, tmp_path):
+        config = tmp_path / "config.toml"
+        config.write_text(
+            '[[output.files]]\ntype = "object"\nformat = "tle"\ncolumns = "full"\n'
+        )
+        with pytest.raises(Exception):
+            load_config(config)
+
+    def test_filename_template_validation(self, tmp_path):
+        bad_templates = [
+            "{unknown}{ext}",       # unknown placeholder
+            "fixed-name.tle",       # missing required {id}
+            "{id:>5}{ext}",         # format spec
+            "sub/{id}{ext}",        # path separator
+        ]
+        for template in bad_templates:
+            config = tmp_path / "config.toml"
+            config.write_text(
+                "[[output.files]]\n"
+                f'type = "object"\nformat = "tle"\nfilename = "{template}"\n'
+            )
+            with pytest.raises(Exception):
+                load_config(config)

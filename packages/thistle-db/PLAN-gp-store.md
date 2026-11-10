@@ -3,7 +3,20 @@
 Status: **adopted 2026-09-02** — folded into CLAUDE.md, which is now the
 normative spec (it wins every conflict with this file). This document is
 retained as the design rationale: the why behind the decisions, including
-alternatives considered and rejected. Written **clean-slate: backwards
+alternatives considered and rejected.
+
+**Amended 2026-11-09**: the files store (GP-CSV object tree) and the
+"one interface, two implementations" idea were **dropped** — the store is a
+SQL database only; every files-store section below is historical. Rationale:
+SQLite already covers the serverless case; the dual-store interface taxed
+every feature with a lowest-common-denominator spec (exact vs approximate
+`get-tle`, merge-as-UPDATE vs merge-rewrite, no natural home for DB-resident
+state tables); and the files store's ingest-throughput edge (the 12× bench
+below) only matters for rare full-catalog restores, which the deferred-index
+flow already serves. The same amendment added the `rejects` table (all input
+rows retained; validity = table membership, never a flag), TLE checksum
+validation, and `ingest_runs` run accounting — see CLAUDE.md for the
+normative versions. Written **clean-slate: backwards
 compatibility is explicitly out of scope** — no migration tooling, no
 deprecation phases; an existing deployment adopts this by re-ingesting its
 source files or a full-fidelity export.

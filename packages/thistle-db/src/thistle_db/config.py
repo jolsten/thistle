@@ -27,6 +27,12 @@ CONFIG_PATH_ENV = "THISTLE_DB_CONFIG"
 # cleanly into 2000-2056 (TLE years are two digits, 00-56 -> 20xx).
 DEFAULT_MAX_EPOCH_AHEAD_DAYS = 30
 
+# Default for [ingest] flush_records — buffered records that trigger an
+# early delta flush. Purely a memory budget (~600 B/record), never a
+# correctness knob: flushes are idempotent, so an early flush only means
+# touching hot output files more than once per run.
+DEFAULT_FLUSH_RECORDS = 1_000_000
+
 # Alpha-5 tops out at Z9999, so no real catalog number exceeds this. Lets
 # object-name parsing reject 8-digit YYYYMMDD date stems numerically.
 MAX_SATNUM = 339_999
@@ -39,6 +45,9 @@ _ALLOWED_PLACEHOLDERS = {
     "object": {"id", "ext", "format", "type"},
     "date": {"date", "ext", "format", "type"},
 }
+
+# Default file extension per output format ({ext} placeholder).
+_DEFAULT_EXTENSION = {"tle": ".tle", "omm-csv": ".csv"}
 
 _READONLY_STMTS = {
     "sqlite": "PRAGMA query_only=ON",
@@ -88,8 +97,8 @@ class Database(BaseModel):
     @cached_property
     def engine(self) -> Engine:
         # Cached: repeated access must not build a new pool each time.
-        # pool_pre_ping revalidates connections that a long generate run
-        # (or MariaDB's wait_timeout) may have silently dropped.
+        # pool_pre_ping revalidates connections that a long run (or
+        # MariaDB's wait_timeout) may have silently dropped.
         return create_engine(self.url, pool_pre_ping=True)
 
     @cached_property
@@ -108,14 +117,11 @@ class IngestSource(BaseModel):
 
 
 class IngestConfig(BaseModel):
-    sources: list[IngestSource] = []
-    reject_dir: Optional[str] = None
-    """Quarantine directory for records that could not be ingested.
+    # extra="forbid": retired keys (reject_dir) fail loudly with a pointer
+    # at the key instead of being silently ignored.
+    model_config = ConfigDict(extra="forbid")
 
-    Unset (the default) keeps the previous behavior: rejected records are
-    logged and dropped. When set, each rejected record is copied there in
-    its source file's format for later inspection — see `rejects.py` for
-    the layout and its bounded-volume guarantees."""
+    sources: list[IngestSource] = []
     max_epoch_ahead_days: int = Field(default=DEFAULT_MAX_EPOCH_AHEAD_DAYS, ge=0)
     """Reject elsets whose epoch is more than this many days in the future.
 
@@ -127,15 +133,26 @@ class IngestConfig(BaseModel):
     default (30) is generous; raise it for predicted-elset workflows, or
     set 0 to disable the guard entirely. One-sided: epochs in the past are
     never bounded, so historical archives ingest untouched. Rejected
-    records are quarantined like any other (see `reject_dir`)."""
+    records are retained in the `rejects` table and re-admitted
+    automatically once their epoch comes inside the horizon."""
+    verify_checksums: bool = True
+    """Reject TLE lines whose mod-10 checksum (column 69) does not match.
+
+    sgp4 never verifies checksums, and a single flipped digit changes an
+    element value *and* breaks the checksum — for a record whose elements
+    still parse finite, the checksum is the only corruption signal
+    validation has. Lines shorter than 69 characters skip the check (some
+    tools emit trimmed lines; historical archives contain them)."""
+    flush_records: int = Field(default=DEFAULT_FLUSH_RECORDS, ge=1)
+    """Buffered records that trigger an early delta flush (memory budget)."""
 
 
 class OutputFile(BaseModel):
-    """One generated output: a file type + format + destination + naming.
+    """One maintained output: a file type + format + destination + naming.
 
     Declared as ``[[output.files]]`` entries in config.toml. Entries may
     share a directory (extensions keep them apart) or spread across
-    directories; each is generated independently.
+    directories; each is maintained independently by the flush engine.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -143,9 +160,12 @@ class OutputFile(BaseModel):
     type: Literal["date", "object"]
     """"date": one file per epoch date (latest elset per object that day);
     "object": one file per satellite (full history, epoch order)."""
-    format: Literal["tle", "omm"]
-    """"tle": verbatim two-line text; "omm": OMM CSV."""
+    format: Literal["tle", "omm-csv"]
+    """"tle": verbatim two-line text; "omm-csv": STK-compatible OMM CSV."""
     dir: str = "./output"
+    columns: Literal["stk", "full"] = "stk"
+    """omm-csv outputs: "stk" = the 17-column CelesTrak/STK projection;
+    "full" = every store column (metadata-bearing outputs)."""
     object_id: Literal["int", "alpha5"] = "int"
     """Object files: render the NORAD ID as a plain integer or alpha-5
     (always 5 characters, e.g. 00900, E5693)."""
@@ -154,13 +174,12 @@ class OutputFile(BaseModel):
     date_format: str = "%Y%m%d"
     """Date files: strftime pattern for the `{date}` placeholder."""
     extension: Optional[str] = None
-    """The `{ext}` placeholder; defaults to ".tle"/".omm" per format."""
+    """The `{ext}` placeholder; defaults to ".tle"/".csv" per format."""
     filename: Optional[str] = None
     """Filename template, e.g. "tle_{id}.txt" or "{date}_gp{ext}".
 
     Defaults to "{id}{ext}" for object outputs and "{date}{ext}" for date
-    outputs, so an entry that doesn't set this behaves exactly as before.
-    The template only arranges the pieces — `object_id`/`zero_pad`,
+    outputs. The template only arranges the pieces — `object_id`/`zero_pad`,
     `date_format` and `extension` still decide how each renders.
 
     Placeholders: `{id}` (object outputs, required there), `{date}` (date
@@ -174,8 +193,17 @@ class OutputFile(BaseModel):
         return v
 
     @model_validator(mode="after")
+    def _check_columns(self) -> "OutputFile":
+        if self.format == "tle" and self.columns != "stk":
+            raise ValueError(
+                "columns applies to omm-csv outputs only — tle outputs are "
+                "verbatim two-line text"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _check_filename(self) -> "OutputFile":
-        """Reject a bad template at config load, not mid-generate.
+        """Reject a bad template at config load, not mid-run.
 
         A KeyError raised while naming the 40,000th file would leave a
         half-written output tree behind, so unknown placeholders, a missing
@@ -218,7 +246,9 @@ class OutputFile(BaseModel):
 
     @property
     def ext(self) -> str:
-        return self.extension if self.extension is not None else f".{self.format}"
+        if self.extension is not None:
+            return self.extension
+        return _DEFAULT_EXTENSION[self.format]
 
     @property
     def template(self) -> str:
@@ -232,10 +262,16 @@ class OutputFile(BaseModel):
         return {"ext": self.ext, "format": self.format, "type": self.type}[field]
 
     def object_stem(self, norad_id: int) -> str:
-        """The `{id}` placeholder's value for `norad_id`."""
-        if self.object_id == "alpha5":
+        """The `{id}` placeholder's value for `norad_id`.
+
+        An alpha5 output meeting an ID beyond alpha-5's range (> MAX_SATNUM)
+        falls back to the plain integer stem — ingest never fails or drops
+        valid data over an output naming choice; the caller warns once per
+        run.
+        """
+        if self.object_id == "alpha5" and norad_id <= MAX_SATNUM:
             return to_alpha5(norad_id)
-        if self.zero_pad:
+        if self.object_id == "int" and self.zero_pad:
             return f"{norad_id:05d}"
         return str(norad_id)
 
@@ -263,14 +299,16 @@ class OutputFile(BaseModel):
 
         Built from the template so the inverse always tracks the forward
         rendering: literals escaped, `{id}` captured, the fixed placeholders
-        substituted.
+        substituted. Alpha-5 outputs also accept a bare integer stem — the
+        overflow fallback names files that way.
         """
         # zero_pad only pads; a 6-digit ID stays 6 digits, and an unpadded
         # leftover file should still be recognizable. So both int modes
         # accept a bare run of digits, bounded below by MAX_SATNUM.
         id_pattern = (
-            # 5 chars, leading digit or alpha-5 letter (I and O are invalid).
-            r"[0-9A-HJ-NP-Z][0-9]{4}"
+            # 5 chars, leading digit or alpha-5 letter (I and O are
+            # invalid), OR the integer fallback stem.
+            r"(?:[0-9A-HJ-NP-Z][0-9]{4}|[0-9]+)"
             if self.object_id == "alpha5"
             else r"[0-9]+"
         )
@@ -279,7 +317,9 @@ class OutputFile(BaseModel):
             parts.append(re.escape(literal))
             if field is None:
                 continue
-            parts.append(f"({id_pattern})" if field == "id" else re.escape(self._fixed(field)))
+            parts.append(
+                f"({id_pattern})" if field == "id" else re.escape(self._fixed(field))
+            )
         return re.compile("".join(parts))
 
     def object_glob(self) -> str:
@@ -302,58 +342,31 @@ class OutputFile(BaseModel):
             return None
         raw = match.group(1)
         if self.object_id == "alpha5":
-            return from_alpha5(raw)
+            if not raw.isdigit():
+                return from_alpha5(raw)
+            # All-digit stem: either a numeric alpha-5 (≤ MAX_SATNUM) or the
+            # integer overflow-fallback stem. 8-digit stems are excluded —
+            # they are YYYYMMDD date files sharing the directory.
+            return int(raw) if len(raw) != 8 else None
         norad_id = int(raw)
         return norad_id if norad_id <= MAX_SATNUM else None
 
 
 class OutputConfig(BaseModel):
-    # extra="forbid": pre-0.12 keys (dir, formats, types) fail loudly with a
+    # extra="forbid": retired keys (lookback_days) fail loudly with a
     # pointer at the key instead of being silently ignored.
     model_config = ConfigDict(extra="forbid")
 
     files: list[OutputFile] = []
-    """Outputs to generate. Empty is valid config (ingest-only deployments),
-    but `generate` refuses to run with nothing to produce."""
-    lookback_days: int = 7
-    """Object files: rows created within this many days are (re)considered.
-
-    Must comfortably exceed the ingest/generate cron cadence; after an outage
-    longer than this, run `generate --all`."""
+    """Outputs to maintain. Empty is valid config for query-only use, but
+    `ingest` and `rebuild` refuse to run with nothing to produce."""
     write_workers: int = 0
     """Threads used for output file writes. 0 = auto (CPU count x 4, capped).
 
-    Generation is dominated by per-file syscall latency, which releases the
-    GIL, so a pool recovers most of it. Set to 1 to write serially — for
-    debugging, or a network filesystem that dislikes concurrent writes."""
-
-
-class StorageConfig(BaseModel):
-    """Where element sets live: a SQL database, or the output files themselves.
-
-    With ``backend = "files"`` there is no element-set database. The first
-    ``type="object", format="tle"`` entry in ``[[output.files]]`` is the
-    canonical store (one epoch-ordered, deduplicated file of verbatim TLE
-    text per satellite), and every other output is derived from the same
-    in-memory delta during ingest — see ``filestore.py``. The dedup key
-    (exact line text) encodes both the NORAD ID and the epoch, so per-file
-    dedup is globally equivalent to the database's unique index.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    backend: Literal["database", "files"] = "database"
-    state: str = "./thistle-state.sqlite"
-    """Files backend: SQLite file holding ingest file-tracking state.
-
-    A cache, not a store — created automatically, and losing it only costs
-    re-reading source files (absorbed by dedup)."""
-    flush_records: int = Field(default=1_000_000, ge=1)
-    """Files backend: buffered records that trigger an early flush.
-
-    Purely a memory budget, never a correctness knob: flushes are
-    idempotent, so an early flush only means touching hot files more than
-    once per run. ~300-400 bytes per buffered record."""
+    Output maintenance is dominated by per-file syscall latency, which
+    releases the GIL, so a pool recovers most of it. Set to 1 to write
+    serially — for debugging, or a network filesystem that dislikes
+    concurrent writes."""
 
 
 class LoggingConfig(BaseModel):
@@ -369,43 +382,7 @@ class Settings(BaseSettings):
     database: Database = Database()
     ingest: IngestConfig = IngestConfig()
     output: OutputConfig = OutputConfig()
-    storage: StorageConfig = StorageConfig()
     logging: LoggingConfig = LoggingConfig()
-
-    @model_validator(mode="after")
-    def _check_files_backend(self) -> "Settings":
-        """Reject configurations the files backend cannot honor — at config
-        load, not mid-run (the same rule as filename-template validation).
-
-        - OMM outputs need the ``omm_metadata`` sidecar (object names), which
-          only the database backend has; an entry that silently produced
-          nameless CSV would look like data loss.
-        - The store must exist: without a ``type="object", format="tle"``
-          entry there is nowhere lossless to put the records.
-
-        OMM *input* files remain ingestable (their TLE lines are real data);
-        only their metadata is discarded, with a warning — see
-        ``ingest.ingest_file``.
-        """
-        if self.storage.backend != "files":
-            return self
-        for i, entry in enumerate(self.output.files):
-            if entry.format == "omm":
-                raise ValueError(
-                    f"[[output.files]] entry {i + 1} has format='omm', which "
-                    "the files backend does not support (OMM metadata needs "
-                    "the database backend) — remove the entry or use "
-                    "storage.backend='database'"
-                )
-        if not any(
-            f.type == "object" and f.format == "tle" for f in self.output.files
-        ):
-            raise ValueError(
-                "storage.backend='files' requires a [[output.files]] entry "
-                "with type='object' and format='tle' — that entry is the "
-                "canonical store the backend keeps every record in"
-            )
-        return self
 
     @classmethod
     def settings_customise_sources(

@@ -6,34 +6,34 @@ from typing import Annotated, Optional
 
 import typer
 from loguru import logger
+from pydantic import ValidationError
 from sgp4.alpha5 import from_alpha5
 
 from thistle_db.api import (
     DatabaseNotInitializedError,
-    dump_db,
     init_db,
     nearest_tles_for_date,
     open_session,
     tles_for_object,
 )
-from thistle_db.config import load_config
-from thistle_db.filestore import (
-    FileStore,
-    dump_store,
-    open_state_session,
-    read_object_tles,
-    rebuild_derived,
+from thistle_db.config import Settings, load_config
+from thistle_db.export import EXPORT_FORMATS, export as export_store
+from thistle_db.ingest import (
+    DeltaEngine,
+    ingest_paths,
+    ingest_sources,
+    readmit_matured_rejects,
 )
-from thistle_db.filestore import (
-    nearest_tles_for_date as nearest_tles_for_date_files,
-)
-from thistle_db.generator import generate as generate_outputs
-from thistle_db.ingest import FileStatus, ingest_source_file, ingest_sources
+from thistle_db.lock import LockHeldError, SingleWriterLock, lock_path_for
+from thistle_db.outputs import rebuild_outputs
 from thistle_db.progress import ProgressReporter, console
+from thistle_db.rejects import export_unresolved, unresolved_summary
+from thistle_db.runs import recent_runs, run_context, stuck_runs
+from thistle_db.verify import verify_outputs
 
 app = typer.Typer(
     name="thistle-db",
-    help="TLE database management tool",
+    help="Orbital element database manager",
     no_args_is_help=True,
 )
 
@@ -78,6 +78,14 @@ def _progress(ctx_obj: CliContext) -> ProgressReporter:
     return ProgressReporter(enabled=not ctx_obj.no_progress and console.is_terminal)
 
 
+def _load_config_or_exit(ctx_obj: CliContext) -> Settings:
+    try:
+        return load_config(ctx_obj.config_path)
+    except ValidationError as err:
+        print(f"Error: invalid configuration: {err}", file=sys.stderr)
+        raise typer.Exit(code=2) from None
+
+
 def _open_session_or_exit(config, *, readonly: bool = False):
     try:
         return open_session(config, readonly=readonly)
@@ -86,17 +94,31 @@ def _open_session_or_exit(config, *, readonly: bool = False):
         raise typer.Exit(code=3) from None
 
 
+def _require_outputs(config: Settings) -> None:
+    if not config.output.files:
+        print(
+            "Error: no outputs configured — add at least one "
+            "[[output.files]] entry to the config",
+            file=sys.stderr,
+        )
+        raise typer.Exit(code=2)
+
+
+def _writer_lock(ctx_obj: CliContext) -> SingleWriterLock:
+    return SingleWriterLock(lock_path_for(ctx_obj.config_path))
+
+
 CONFIG_TEMPLATE = """\
 # thistle-db configuration
 # See: https://github.com/jolsten/thistle
 
 # ----------------------------------------------
-# Database connection
+# Database connection — the canonical store
 # ----------------------------------------------
 [database]
 # SQLAlchemy driver string. Examples:
-#   "sqlite"          - local SQLite file (default)
-#   "mysql+pymysql"   - MariaDB/MySQL via PyMySQL (install with: pip install thistle-db[mysql])
+#   "sqlite"          - local SQLite file (default; serverless)
+#   "mysql+pymysql"   - MariaDB/MySQL via PyMySQL (pip install thistle-db[mysql])
 drivername = "sqlite"
 
 # For SQLite: path to the database file (relative or absolute)
@@ -116,47 +138,35 @@ name = "thistle-db.db"
 # secrets_file = "/etc/thistle-db/secrets.toml"
 
 # ----------------------------------------------
-# Storage backend
-# ----------------------------------------------
-# Where element sets live. The default ("database") keeps everything in the
-# SQL database above and derives output files with `generate`. With
-# backend = "files" there is no element-set database: ingest writes the
-# output files directly — the first type="object", format="tle" entry under
-# [[output.files]] is the canonical store, and date files are updated in
-# the same pass. `generate` is then only needed as `generate --all` to
-# rebuild derived outputs. The files backend does not support omm outputs.
-#
-# [storage]
-# backend = "files"
-# state = "./thistle-state.sqlite"  # ingest file-tracking cache (auto-created)
-# flush_records = 1000000           # memory budget: records buffered per flush
-
-# ----------------------------------------------
-# Ingest sources
+# Ingest
 # ----------------------------------------------
 # Each [[ingest.sources]] entry defines a directory to scan for TLE/OMM files.
-# You can have multiple entries. File format is auto-detected by extension:
+# File format is auto-detected by extension:
 #   .tle / .txt / .3le  ->  Two-Line Element format
 #   .json               ->  Space-Track OMM JSON
 #   .csv                ->  OMM CSV
 #   .xml                ->  OMM XML
+#
+# Records that cannot be stored are retained in the database `rejects`
+# table with a reason code — inspect them with `thistle-db rejects`.
 
 [ingest]
-# Records that cannot be stored (unparseable text, elsets whose mandatory
-# elements are not finite numbers, rows the database refuses) are copied
-# here in their source format for later inspection, mirroring the source
-# tree: ./incoming/20260824.tle -> ./rejects/incoming/20260824.tle (+ .log).
-# Artifacts are overwritten each run and removed once a file ingests
-# cleanly, so the directory always shows only what is currently broken and
-# needs no retention policy. Comment out to drop rejects after logging.
-reject_dir = "./rejects"
-
 # Reject element sets whose epoch is more than this many days in the future
 # (0 disables). A corrupted epoch field parses cleanly into 2000-2056 and,
 # once stored, permanently degrades that object's incremental output. Real
 # feeds run at most ~1 day ahead; raise this if you ingest predicted
 # element sets. Past epochs are never bounded (archives ingest untouched).
+# Rejected records re-admit automatically once inside the horizon.
 # max_epoch_ahead_days = 30
+
+# Reject TLE lines whose mod-10 checksum (column 69) does not match — the
+# only corruption signal for records whose elements still parse. Lines
+# shorter than 69 characters skip the check.
+# verify_checksums = true
+
+# Buffered records that trigger an early delta flush (memory budget,
+# ~600 bytes per record; never a correctness knob).
+# flush_records = 1000000
 
 [[ingest.sources]]
 path = "./incoming"
@@ -168,42 +178,31 @@ pattern = "*.tle"    # glob pattern for matching files
 # pattern = "*.json"
 
 # ----------------------------------------------
-# Output generation
+# Outputs — maintained incrementally by ingest
 # ----------------------------------------------
-[output]
-# Generation is incremental: date files are rewritten when their rows are
-# newer than the file, and new rows are appended to object files. Late
-# deliveries are handled automatically.
-lookback_days = 7    # object files: newly created rows considered per run
-                     # (must exceed the ingest cron cadence)
-# write_workers = 0  # threads used for output file writes; 0 = auto
-                     # (CPU count x 4, capped), 1 = write serially
-
-# Each [[output.files]] entry defines one generated output; `generate`
-# requires at least one entry:
-#   type   = "date"    -> one file per date (latest TLE per satellite)
-#          = "object"  -> one file per satellite (all TLEs, epoch order)
-#   format = "tle"     -> two-line element text
-#          = "omm"     -> OMM CSV
+# Each [[output.files]] entry defines one output; `ingest` requires at
+# least one entry and maintains all of them in the same pass (there is no
+# separate generate step — `rebuild` re-derives everything after a config
+# change or for disaster recovery):
+#   type   = "date"     -> one file per date (latest record per satellite)
+#          = "object"   -> one file per satellite (all records, epoch order)
+#   format = "tle"      -> verbatim two-line element text
+#          = "omm-csv"  -> STK-compatible OMM CSV
 #   dir    = destination directory (created if missing)
-# Filename options:
+# Options:
+#   omm-csv:      columns = "stk" (17-column STK projection, default)
+#                 or "full" (every store column)
 #   object files: object_id = "int" (default) or "alpha5" (always 5 chars,
 #                 e.g. E5693); zero_pad = true pads int IDs to 5 digits
 #   date files:   date_format = strftime stem pattern (default "%Y%m%d")
-#   any:          extension = override the ".tle"/".omm" default suffix
+#   any:          extension = override the ".tle"/".csv" default suffix
 #                 filename = template arranging the pieces, default
 #                   "{id}{ext}" / "{date}{ext}" — e.g. "tle_{id}.txt".
 #                   Placeholders: {id} or {date}, {ext}, {format}, {type}.
-# Entries may share a directory or use separate ones.
 
 [[output.files]]
 type = "date"
 format = "tle"
-dir = "./output"
-
-[[output.files]]
-type = "date"
-format = "omm"
 dir = "./output"
 
 [[output.files]]
@@ -213,10 +212,9 @@ dir = "./output"
 # object_id = "alpha5"   # name files E5693.tle instead of 145693.tle
 # zero_pad = true        # 00900.tle instead of 900.tle (with object_id = "int")
 
-[[output.files]]
-type = "object"
-format = "omm"
-dir = "./output"
+[output]
+# write_workers = 0  # threads for output file writes; 0 = auto
+                     # (CPU count x 4, capped), 1 = write serially
 
 # ----------------------------------------------
 # Logging
@@ -337,27 +335,16 @@ def init_db_cmd(
 ) -> None:
     """Create the database schema in the configured database.
 
-    Idempotent: existing tables are left untouched and any missing model
-    index is built (the finalize step after a --defer-indexes restore).
-    With --drop, all tables are dropped and recreated (asks for
-    confirmation unless --yes).
+    The only DDL path — on MariaDB/PostgreSQL, run it with an admin
+    account and give the day-to-day account only DML grants. Idempotent:
+    existing tables are left untouched and any missing model index is
+    built (the finalize step after a --defer-indexes restore). With
+    --drop, all tables are dropped and recreated (asks for confirmation
+    unless --yes).
     """
-    config = load_config(ctx.obj.config_path)
+    config = _load_config_or_exit(ctx.obj)
     _setup_logging(config.logging.level, ctx.obj.log_file)
     url = config.database.url.render_as_string(hide_password=True)
-
-    if config.storage.backend == "files":
-        # No element-set database to create. The state DB is a cache and
-        # would be created on first ingest anyway; creating it here just
-        # lets `init-db` remain the "set up a new deployment" step.
-        session, engine = open_state_session(config)
-        session.close()
-        engine.dispose()
-        print(
-            f"Files backend: no database schema needed. "
-            f"State database ready: {config.storage.state}"
-        )
-        return
 
     if defer_indexes and not drop:
         print(
@@ -414,217 +401,172 @@ def ingest(
         ),
     ] = False,
 ) -> None:
-    """Ingest TLE/OMM files into the database (or the file store)."""
-    config = load_config(ctx.obj.config_path)
+    """Ingest TLE/OMM files: validate, store, maintain every output.
+
+    One pass does everything — there is no separate generate step. Scans
+    are tolerant (exit 0; failed files retried next scan); explicitly
+    named files exit 1 on any failure so cron wrappers can detect it.
+    """
+    config = _load_config_or_exit(ctx.obj)
     _setup_logging(config.logging.level, ctx.obj.log_file)
+    _require_outputs(config)
 
-    reject_dir = (
-        Path(config.ingest.reject_dir) if config.ingest.reject_dir else None
-    )
+    command = f"ingest {len(files)} file(s)" if files else "ingest"
+    try:
+        with _writer_lock(ctx.obj):
+            session, engine_db = _open_session_or_exit(config)
+            try:
+                with _progress(ctx.obj) as progress:
+                    with run_context(session, command) as (run, report):
+                        with DeltaEngine(
+                            session, config, report, run_id=run.id
+                        ) as engine:
+                            readmit_matured_rejects(session, engine)
+                            if files:
+                                ingest_paths(
+                                    session, engine, files, progress=progress
+                                )
+                            else:
+                                ingest_sources(
+                                    session,
+                                    engine,
+                                    config.ingest.sources,
+                                    force=force,
+                                    progress=progress,
+                                )
+                logger.info(report.summary())
+            finally:
+                session.close()
+                engine_db.dispose()
+    except LockHeldError as err:
+        print(f"Error: {err}", file=sys.stderr)
+        raise typer.Exit(code=1) from None
 
-    with _progress(ctx.obj) as progress:
-        if config.storage.backend == "files":
-            # State DB (ingest_files only) — a cache, created on first use.
-            session, engine = open_state_session(config)
-            store = FileStore(
-                session,
-                config.output,
-                flush_records=config.storage.flush_records,
-                progress=progress,
-            )
-        else:
-            session, engine = _open_session_or_exit(config)
-            store = None
-        try:
-            if files:
-                task = progress.task("Ingesting files", total=len(files))
-                total = 0
-                failed = 0
-                for file in files:
-                    # Explicitly named files always parse; state is still recorded.
-                    # No source root, so their rejects land flat under reject_dir.
-                    status, count = ingest_source_file(
-                        session,
-                        file,
-                        store=store,
-                        force=True,
-                        reject_dir=reject_dir,
-                        max_epoch_ahead_days=config.ingest.max_epoch_ahead_days,
-                    )
-                    if status == FileStatus.FAILED:
-                        failed += 1
-                    total += count
-                    progress.advance(task)
-                if store is not None:
-                    store.close()
-                logger.info(
-                    f"Ingested {total} new records from {len(files)} files"
-                    + (f" ({failed} failed)" if failed else "")
-                )
-                if failed:
-                    # Explicitly named files failing is an error the caller
-                    # (cron included) must be able to detect. Directory
-                    # scans stay tolerant: failed files there are retried
-                    # on the next scan by design.
-                    raise typer.Exit(code=1)
-            else:
-                total = ingest_sources(
-                    session,
-                    config.ingest.sources,
-                    store=store,
-                    force=force,
-                    reject_dir=reject_dir,
-                    max_epoch_ahead_days=config.ingest.max_epoch_ahead_days,
-                    progress=progress,
-                )
-                if store is not None:
-                    store.close()
-                logger.info(f"Ingested {total} new records from configured sources")
-        finally:
-            session.close()
-            engine.dispose()
+    if files and report.files_failed:
+        # Explicitly named files failing is an error the caller (cron
+        # included) must be able to detect. Directory scans stay tolerant:
+        # failed files there are retried on the next scan by design.
+        raise typer.Exit(code=1)
 
 
 @app.command()
-def generate(
+def rebuild(ctx: typer.Context) -> None:
+    """Re-derive every output file from a linear store scan.
+
+    First run, disaster recovery, or after adding/changing an
+    [[output.files]] entry.
+    """
+    config = _load_config_or_exit(ctx.obj)
+    _setup_logging(config.logging.level, ctx.obj.log_file)
+    _require_outputs(config)
+
+    try:
+        with _writer_lock(ctx.obj):
+            session, engine_db = _open_session_or_exit(config)
+            try:
+                with _progress(ctx.obj) as progress:
+                    with run_context(session, "rebuild") as (run, report):
+                        written = rebuild_outputs(
+                            session, config.output, progress=progress
+                        )
+                        report.output_writes.update(written)
+                total = sum(written.values())
+                logger.info(
+                    f"Rebuilt {total} file(s) across {len(config.output.files)} "
+                    "output(s)"
+                )
+            finally:
+                session.close()
+                engine_db.dispose()
+    except LockHeldError as err:
+        print(f"Error: {err}", file=sys.stderr)
+        raise typer.Exit(code=1) from None
+
+
+@app.command()
+def verify(ctx: typer.Context) -> None:
+    """Reconcile every output against the store (the authority).
+
+    Per-object record counts, per-date winner counts, orphan files; also
+    stamps rejects whose payload now exists in the store. Reads all
+    output files — intended for a periodic (e.g. weekly) cron run, not
+    every run. Exits 1 when mismatches are found.
+    """
+    config = _load_config_or_exit(ctx.obj)
+    _setup_logging(config.logging.level, ctx.obj.log_file)
+    _require_outputs(config)
+
+    session, engine_db = _open_session_or_exit(config)
+    try:
+        report = verify_outputs(session, config.output)
+    finally:
+        session.close()
+        engine_db.dispose()
+
+    if report.rejects_resolved:
+        print(f"Stamped {report.rejects_resolved} reject(s) as resolved")
+    if not report.ok:
+        print(
+            f"verify: {len(report.issues)} issue(s) found — see warnings "
+            "above; run `thistle-db rebuild` to re-derive outputs",
+            file=sys.stderr,
+        )
+        raise typer.Exit(code=1)
+    print(f"verify: {report.outputs_checked} output(s) consistent with the store")
+
+
+@app.command()
+def export(
     ctx: typer.Context,
-    rebuild_all: Annotated[
+    output: Annotated[
+        Path,
+        typer.Argument(help="Destination file path", show_default=False),
+    ],
+    fmt: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help=f"Export format: {', '.join(EXPORT_FORMATS)}",
+        ),
+    ] = "csv",
+    force: Annotated[
         bool,
-        typer.Option(
-            "--all",
-            help="Rebuild every output file from scratch (first run, disaster "
-            "recovery, or after a generation gap longer than the lookback)",
-        ),
-    ] = False,
-    lookback_days: Annotated[
-        Optional[int],
-        typer.Option(
-            "--lookback-days",
-            help="Override output.lookback_days: how many days of newly created "
-            "rows to (re)consider for object files",
-        ),
-    ] = None,
-    verify: Annotated[
-        bool,
-        typer.Option(
-            "--verify",
-            help="After generating, reconcile every object file's line count "
-            "against the database and rewrite mismatches (reads all output "
-            "files — intended for a periodic, e.g. weekly, cron run)",
-        ),
+        typer.Option("--force", help="Overwrite an existing output file"),
     ] = False,
 ) -> None:
-    """Generate output TLE/OMM files from the database.
+    """Export the whole store to one file.
 
-    Incremental by default: date files are rewritten when the database has
-    rows newer than the file, and object files are appended to. Cost scales
-    with new data, not database size.
+    csv is the full-fidelity backup/interchange form (re-ingestable into
+    any dialect: `init-db` then `ingest FILE`); tle is a verbatim two-line
+    concat for legacy consumers; omm-xml/omm-kvn are CCSDS OMM 2.0. For
+    physical backups of a live server, prefer the native tools.
     """
-    config = load_config(ctx.obj.config_path)
-    _setup_logging(config.logging.level, ctx.obj.log_file)
-
-    if not config.output.files:
+    if fmt not in EXPORT_FORMATS:
         print(
-            "Error: no outputs configured — add at least one "
-            "[[output.files]] entry to the config",
+            f"Error: unknown format {fmt!r} (choose from "
+            f"{', '.join(EXPORT_FORMATS)})",
             file=sys.stderr,
         )
         raise typer.Exit(code=2)
 
-    if config.storage.backend == "files":
-        # Outputs are maintained by ingest itself on this backend; there is
-        # no incremental generate step and nothing to look back over.
-        if verify:
-            logger.warning(
-                "--verify is not yet implemented for the files backend; "
-                "use `generate --all` to rebuild derived outputs"
-            )
-        if rebuild_all:
-            with _progress(ctx.obj) as progress:
-                rebuild_derived(
-                    config.output,
-                    flush_records=config.storage.flush_records,
-                    progress=progress,
-                )
-        elif not verify:
-            logger.info(
-                "Files backend: outputs are maintained by ingest; "
-                "run `generate --all` to rebuild derived outputs "
-                "(after adding an output entry, or for disaster recovery)"
-            )
-        return
-
-    session, engine = _open_session_or_exit(config, readonly=True)
-    try:
-        with _progress(ctx.obj) as progress:
-            generate_outputs(
-                session,
-                config.output,
-                rebuild_all=rebuild_all,
-                lookback_days=lookback_days,
-                verify=verify,
-                progress=progress,
-            )
-    finally:
-        session.close()
-        engine.dispose()
-
-
-@app.command()
-def dump(
-    ctx: typer.Context,
-    output: Annotated[
-        Path,
-        typer.Argument(
-            help="Base path for the export; writes OUTPUT.tle and (when OMM "
-            "metadata exists) OUTPUT.json",
-            show_default=False,
-        ),
-    ],
-    force: Annotated[
-        bool,
-        typer.Option("--force", help="Overwrite existing output files"),
-    ] = False,
-) -> None:
-    """Export the entire database as re-ingestable TLE/OMM files.
-
-    A logical backup: restore into any (empty, init-db'd) database with
-    `thistle-db ingest OUTPUT.tle OUTPUT.json` — also works across dialects
-    (e.g. SQLite to MariaDB). For physical backups of a live server, prefer
-    the native tools (sqlite file copy / mariadb-dump / pg_dump).
-    """
-    config = load_config(ctx.obj.config_path)
+    config = _load_config_or_exit(ctx.obj)
     _setup_logging(config.logging.level, ctx.obj.log_file)
 
-    tle_path = Path(f"{output}.tle")
-    omm_path = Path(f"{output}.json")
-    existing = [p for p in (tle_path, omm_path) if p.exists()]
-    if existing and not force:
+    if output.exists() and not force:
         print(
-            f"Error: output file(s) already exist: "
-            f"{', '.join(str(p) for p in existing)} (use --force to overwrite)",
+            f"Error: {output} already exists (use --force to overwrite)",
             file=sys.stderr,
         )
         raise typer.Exit(code=1)
 
-    if config.storage.backend == "files":
-        tle_count = dump_store(config.output, tle_path)
-        print(f"Wrote {tle_path} ({tle_count} TLEs)")
-        print(f"Files backend holds no OMM metadata; {omm_path} not written")
-        return
-
-    session, engine = _open_session_or_exit(config, readonly=True)
+    session, engine_db = _open_session_or_exit(config, readonly=True)
     try:
-        tle_count, omm_count = dump_db(session, tle_path, omm_path)
+        count = export_store(session, fmt, output)
     finally:
         session.close()
-        engine.dispose()
-
-    print(f"Wrote {tle_path} ({tle_count} TLEs)")
-    if omm_count:
-        print(f"Wrote {omm_path} ({omm_count} OMM records)")
-    else:
-        print(f"No OMM metadata in the database; {omm_path} not written")
+        engine_db.dispose()
+    print(f"Wrote {output} ({count} records, format: {fmt})")
 
 
 def _parse_target(value: str) -> int | datetime.date:
@@ -667,47 +609,128 @@ def get_tle(
 
     With a NORAD ID (alpha-5): all TLEs for that object, ordered by epoch.
     With a YYYYMMDD date: the nearest TLE per object to 12:00 UTC on that
-    date, within +/- DAYS days.
+    date, within +/- DAYS days. Always exact — it queries the store.
     """
     parsed = _parse_target(target)
 
-    config = load_config(ctx.obj.config_path)
+    config = _load_config_or_exit(ctx.obj)
     _setup_logging(config.logging.level, ctx.obj.log_file)
 
-    if config.storage.backend == "files":
-        try:
-            if isinstance(parsed, int):
-                pairs = read_object_tles(config.output, parsed)
-            else:
-                pairs = nearest_tles_for_date_files(config.output, parsed, days)
-        except ValueError as err:  # date query without a date output
-            print(f"Error: {err}", file=sys.stderr)
-            raise typer.Exit(code=2) from None
-        for line1, line2 in pairs:
-            print(line1)
-            print(line2)
-        if not pairs:
-            logger.warning(f"No TLEs found for {target}")
-            raise typer.Exit(code=1)
-        return
-
-    session, engine = _open_session_or_exit(config, readonly=True)
+    session, engine_db = _open_session_or_exit(config, readonly=True)
     try:
         if isinstance(parsed, int):
             tles = tles_for_object(session, parsed)
         else:
             tles = nearest_tles_for_date(session, parsed, days)
 
+        printed = 0
         for tle in tles:
-            print(tle.line1)
-            print(tle.line2)
+            if tle.line1 and tle.line2:
+                print(tle.line1)
+                print(tle.line2)
+                printed += 1
     finally:
         session.close()
-        engine.dispose()
+        engine_db.dispose()
 
-    if not tles:
+    if not printed:
         logger.warning(f"No TLEs found for {target}")
         raise typer.Exit(code=1)
+
+
+@app.command()
+def status(
+    ctx: typer.Context,
+    runs: Annotated[
+        int,
+        typer.Option("--runs", "-n", help="How many recent runs to show"),
+    ] = 10,
+) -> None:
+    """Show recent runs, reject trends, and stuck runs."""
+    config = _load_config_or_exit(ctx.obj)
+    _setup_logging(config.logging.level, ctx.obj.log_file)
+
+    session, engine_db = _open_session_or_exit(config, readonly=True)
+    try:
+        run_rows = recent_runs(session, limit=runs)
+        stuck = stuck_runs(session)
+        reject_rows = unresolved_summary(session)
+    finally:
+        session.close()
+        engine_db.dispose()
+
+    if not run_rows:
+        print("No runs recorded yet.")
+    else:
+        print("Recent runs:")
+        for run in run_rows:
+            if run.finished is not None:
+                duration = (run.finished - run.started).total_seconds()
+                timing = f"{duration:8.1f}s"
+            else:
+                timing = "  running"
+            started = run.started.strftime("%Y-%m-%d %H:%M:%S")
+            print(
+                f"  #{run.id:<5} {started}  {timing}  {run.status:<9} "
+                f"{run.command:<20} "
+                f"+{run.records_inserted} rows, {run.records_rejected} rejected"
+                + (f"  [{run.error}]" if run.error else "")
+            )
+
+    if stuck:
+        print(
+            f"\nWARNING: {len(stuck)} run(s) stuck in 'running' "
+            "(crashed? the advisory lock has already been released):"
+        )
+        for run in stuck:
+            print(f"  #{run.id} {run.command} started {run.started}")
+
+    if reject_rows:
+        print("\nUnresolved rejects by reason:")
+        for code, count, last_seen in reject_rows:
+            print(f"  {code:<20} {count:>8}  (last seen {last_seen})")
+    else:
+        print("\nNo unresolved rejects.")
+
+
+@app.command()
+def rejects(
+    ctx: typer.Context,
+    export_dir: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--export",
+            help="Write unresolved payloads to this directory as "
+            "re-ingestable files (rejects.tle / rejects.json)",
+        ),
+    ] = None,
+) -> None:
+    """Summarize the rejects table; optionally export payloads for repair.
+
+    The repair workflow: `rejects --export DIR`, fix the records, then
+    `ingest DIR/rejects.tle` — `verify` stamps the repaired ones resolved.
+    """
+    config = _load_config_or_exit(ctx.obj)
+    _setup_logging(config.logging.level, ctx.obj.log_file)
+
+    session, engine_db = _open_session_or_exit(config, readonly=True)
+    try:
+        rows = unresolved_summary(session)
+        if not rows:
+            print("No unresolved rejects.")
+        else:
+            print("Unresolved rejects by reason:")
+            for code, count, last_seen in rows:
+                print(f"  {code:<20} {count:>8}  (last seen {last_seen})")
+        if export_dir is not None:
+            tle_count, omm_count = export_unresolved(session, export_dir)
+            print(
+                f"Exported {tle_count} TLE and {omm_count} OMM payload(s) "
+                f"to {export_dir}"
+            )
+    finally:
+        session.close()
+        engine_db.dispose()
 
 
 def main() -> None:

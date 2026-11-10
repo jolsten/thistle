@@ -1,46 +1,62 @@
-"""Quarantine for element sets that could not be ingested.
+"""Retained invalid input — the database-backed reject sink.
 
-A rejected record is one that never reaches the database: text sgp4 cannot
-parse, an elset whose mandatory elements are not finite numbers (see
-``model.MalformedElsetError``), or a row the database itself refuses. Its
-raw text would otherwise survive only in a log line that rotates away, so
-with ``[ingest] reject_dir`` configured each such record is copied to a
-quarantine directory for later inspection.
+A rejected record is one that never reaches the ``tle`` table: text sgp4
+cannot parse, an elset whose mandatory elements are not finite numbers, a
+checksum mismatch, a future epoch beyond the horizon, a record with no
+NORAD ID, or a row the database itself refuses. Each distinct rejected
+payload is retained as a row in the ``rejects`` table (see
+``model.Reject``), so nothing is silently lost and "what is broken, and
+since when" is one query. Validity is table membership — ``tle`` ∪
+``rejects`` is all input rows.
 
-The layout mirrors the source tree, so provenance is visible in the path
-and a repaired file is directly re-ingestable::
+Two load-bearing properties:
 
-    /data/spacetrack/daily/2006/20060101.tle   (source)
-    rejects/daily/2006/20060101.tle            (rejected records, verbatim)
-    rejects/daily/2006/20060101.tle.log        (one reason per record)
+- **Bounded by what is broken, not by time.** Re-rejection of a known
+  payload upserts ``last_seen``/``times_seen`` instead of inserting.
+- **Fused per file.** Past ``REJECT_MAX_RECORDS`` rejections from one
+  source file in one run, no payloads are stored at all — only counters
+  and a WARNING with a reason histogram. Beyond the cap a file is not a
+  good feed with bad lines but a wrong file (mis-encoded, still gzipped,
+  truncated), and even deduplicated rows would be unbounded garbage.
 
-Artifacts are written in the source file's own format, so
-``thistle-db ingest rejects/daily/2006/20060101.tle`` works once the
-records are fixed. OMM sources quarantine as JSON (``<name>.json``), which
-``detect_format`` reads back as Space-Track OMM.
-
-The directory is a **live view of what is currently broken**, not an
-append-only archive: each ingest of a source file overwrites that file's
-artifacts, and a run with no rejects deletes them. Total volume is
-therefore bounded by the set of currently-broken records rather than
-growing with time, so no retention policy is needed.
+A reject-write failure is logged and never propagates: it must not turn a
+working ingest into a failed one.
 """
 
 import datetime
+import enum
 import hashlib
 import json
 import pathlib
-from typing import Iterable, Optional, Protocol
+from typing import Iterable, Optional, Protocol, cast
 
 from loguru import logger
+from sqlalchemy import Table, func, select
+from sqlalchemy.orm import Session
 
-# Copy at most this many records from one source file. Beyond it, a file is
-# not "a good feed with some bad lines" but a wrong file (mis-encoded, still
-# gzipped, truncated), and copying it would duplicate the whole delivery
-# into the quarantine directory. A TLE record is ~142 bytes, so this caps
-# one file's quarantine at ~1.4 MB; past the cap only a marker is written.
-# Deliberately a constant, not config: it is a fuse, not a tuning knob.
+from thistle_db.model import Reject, utcnow
+
+# Copy at most this many records from one source file per run. Deliberately
+# a constant, not config: it is a fuse, not a tuning knob.
 REJECT_MAX_RECORDS = 10_000
+
+# Verbatim payload cap per reject row. Garbage "lines" from mis-encoded
+# files can be arbitrarily long; 4 KB keeps the row bounded while holding
+# any legitimate TLE pair or OMM record whole.
+PAYLOAD_CAP = 4096
+
+_REJECTS_TABLE = cast(Table, Reject.__table__)
+
+
+class ReasonCode(enum.StrEnum):
+    """Closed vocabulary for ``rejects.reason_code``."""
+
+    UNPARSEABLE = "unparseable"
+    MALFORMED_ELEMENT = "malformed_element"
+    FUTURE_EPOCH = "future_epoch"
+    NO_NORAD_ID = "no_norad_id"
+    CHECKSUM = "checksum"
+    DB_REFUSED = "db_refused"
 
 
 class RejectSink(Protocol):
@@ -56,6 +72,7 @@ class RejectSink(Protocol):
 
     def reject(
         self,
+        code: ReasonCode,
         reason: str,
         *,
         line1: Optional[str] = None,
@@ -65,88 +82,116 @@ class RejectSink(Protocol):
 
 
 class _NullSink:
-    """Inert sink — the default for library callers and unconfigured runs."""
+    """Inert sink — the default for library callers."""
 
     def seen(self, n: int = 1) -> None:
         pass
 
-    def reject(self, reason: str, **kwargs) -> None:
+    def reject(self, code: ReasonCode, reason: str, **kwargs) -> None:
         pass
 
 
 NO_REJECTS: RejectSink = _NullSink()
-"""Shared inert sink: quarantine disabled, rejects are only logged."""
+"""Shared inert sink: rejects are only logged."""
 
 
-def reject_path(
-    source: pathlib.Path,
-    reject_dir: pathlib.Path,
-    *,
-    root: Optional[pathlib.Path] = None,
-    namespace: Optional[str] = None,
-) -> pathlib.Path:
-    """Where `source`'s quarantine artifacts live under `reject_dir`.
+# --- payload construction ---------------------------------------------------
 
-    Files under a configured source directory mirror their path below a
-    namespace directory (the source root's name, or `namespace` when two
-    configured roots share a basename). Files named directly on the command
-    line have no root and land flat, under their own name.
+
+def payload_for_lines(line1: Optional[str], line2: Optional[str]) -> str:
+    return f"{line1 or ''}\n{line2 or ''}"
+
+
+def payload_for_record(record: dict) -> str:
+    """Canonical JSON for an OMM record — deterministic, so the same
+    delivered record always hashes identically."""
+    return json.dumps(record, sort_keys=True, default=str)
+
+
+def payload_hash(payload: str) -> bytes:
+    return hashlib.sha256(payload.encode("utf-8")).digest()
+
+
+def _norad_from_line1(line1: str) -> Optional[int]:
+    """Best-effort NORAD ID from line 1 (convenience column only)."""
+    try:
+        from sgp4.alpha5 import from_alpha5
+
+        return from_alpha5(line1[2:7].replace(" ", "0"))
+    except Exception:
+        return None
+
+
+def _epoch_from_line1(line1: str) -> Optional[datetime.datetime]:
+    """Best-effort epoch from line 1's YYDDD.ffff field.
+
+    Convenience-column precision (drives the future-epoch re-admission
+    horizon, which is measured in days) — not the exact stored epoch.
     """
-    if root is not None:
+    try:
+        raw = float(line1[18:32].replace(" ", "0"))
+        year2, doy = divmod(raw, 1000.0)
+        year = int(year2) + (2000 if year2 < 57 else 1900)
+        return datetime.datetime(year, 1, 1) + datetime.timedelta(days=doy - 1)
+    except Exception:
+        return None
+
+
+def _convenience_fields(
+    line1: Optional[str], record: Optional[dict]
+) -> tuple[Optional[int], Optional[datetime.datetime]]:
+    if record is not None:
         try:
-            relative = source.resolve().relative_to(root.resolve())
+            norad = int(str(record.get("NORAD_CAT_ID", "")).strip() or "x")
         except ValueError:
-            relative = pathlib.Path(source.name)
-        return reject_dir / (namespace or root.name) / relative
-    return reject_dir / source.name
+            norad = None
+        epoch = None
+        raw_epoch = str(record.get("EPOCH", "")).strip()
+        if raw_epoch:
+            try:
+                epoch = datetime.datetime.fromisoformat(raw_epoch.rstrip("Z"))
+                if epoch.tzinfo is not None:
+                    epoch = epoch.astimezone(datetime.timezone.utc).replace(
+                        tzinfo=None
+                    )
+            except ValueError:
+                epoch = None
+        if norad is not None or epoch is not None:
+            return norad, epoch
+    if line1:
+        return _norad_from_line1(line1), _epoch_from_line1(line1)
+    return None, None
 
 
-def namespaces(roots: Iterable[pathlib.Path]) -> dict[str, str]:
-    """Namespace directory name per configured source root, keyed by path str.
-
-    The root's basename, except where two configured roots share one — those
-    get an 8-hex suffix of the resolved path so their rejects cannot collide
-    in the quarantine tree.
-    """
-    roots = list(roots)
-    counts: dict[str, int] = {}
-    for root in roots:
-        counts[root.name] = counts.get(root.name, 0) + 1
-    result: dict[str, str] = {}
-    for root in roots:
-        if counts[root.name] > 1:
-            digest = hashlib.sha256(str(root.resolve()).encode("utf-8")).hexdigest()
-            result[str(root)] = f"{root.name}-{digest[:8]}"
-        else:
-            result[str(root)] = root.name
-    return result
+# --- the sink ----------------------------------------------------------------
 
 
-class RejectWriter:
-    """Collects one source file's rejected records and writes its artifacts.
+class DbRejectWriter:
+    """Collects one source file's rejections and upserts them at close.
 
-    Use as a context manager: artifacts are written — or removed, when the
-    file now ingests cleanly — on exit. Filesystem errors are contained: a
-    quarantine failure is logged and never propagates, since it must not
-    turn an otherwise working ingest into a failed one.
+    Use as a context manager; the flush happens on exit. Shares the
+    caller's session but contains its own failures: a quarantine failure
+    rolls back and logs, never propagates.
     """
 
-    def __init__(self, source: pathlib.Path, target: pathlib.Path, *, omm: bool):
-        self.source = source
-        # The artifact must carry an extension matching its *content* so
-        # detect_format reads it back correctly on re-ingest.
-        self.target = target.with_name(target.name + ".json") if omm else target
-        self.log_path = self.target.with_name(self.target.name + ".log")
-        self.marker_path = target.with_name(target.name + ".truncated")
-        self.omm = omm
+    def __init__(
+        self,
+        session: Session,
+        *,
+        source_path: Optional[pathlib.Path] = None,
+        fmt: str = "tle",
+    ):
+        self.session = session
+        self.source_path = str(source_path) if source_path is not None else None
+        self.fmt = "omm" if fmt.startswith("omm") else "tle"
         self.total = 0
         self.rejected = 0
         self.reasons: dict[str, int] = {}
-        self._buffer: list[
-            tuple[str, Optional[str], Optional[str], Optional[dict]]
-        ] = []
+        # record_hash -> row dict; within-file duplicates fold into
+        # times_seen so the upsert sees each payload once.
+        self._rows: dict[bytes, dict] = {}
 
-    def __enter__(self) -> "RejectWriter":
+    def __enter__(self) -> "DbRejectWriter":
         return self
 
     def __exit__(self, *exc_info) -> None:
@@ -159,6 +204,7 @@ class RejectWriter:
 
     def reject(
         self,
+        code: ReasonCode,
         reason: str,
         *,
         line1: Optional[str] = None,
@@ -166,78 +212,86 @@ class RejectWriter:
         record: Optional[dict] = None,
     ) -> None:
         self.rejected += 1
-        self.reasons[reason] = self.reasons.get(reason, 0) + 1
-        # Past the cap, keep counting (the marker reports totals) but stop
-        # buffering, so a wholly corrupt file cannot be held in memory.
-        if self.rejected <= REJECT_MAX_RECORDS:
-            self._buffer.append((reason, line1, line2, record))
+        self.reasons[str(code)] = self.reasons.get(str(code), 0) + 1
+        if self.rejected > REJECT_MAX_RECORDS:
+            # Past the fuse: keep counting (the WARNING reports totals and
+            # the histogram), stop buffering — a wholly corrupt file must
+            # not be held in memory or written to the table.
+            return
+
+        if record is not None:
+            payload = payload_for_record(record)
+            fmt = "omm"
+        else:
+            payload = payload_for_lines(line1, line2)
+            fmt = self.fmt
+        digest = payload_hash(payload)
+        truncated = len(payload.encode("utf-8")) > PAYLOAD_CAP
+        if truncated:
+            payload = payload.encode("utf-8")[:PAYLOAD_CAP].decode(
+                "utf-8", errors="replace"
+            )
+        norad, epoch = _convenience_fields(line1, record)
+
+        existing = self._rows.get(digest)
+        if existing is not None:
+            existing["times_seen"] += 1
+            existing["reason_code"] = str(code)
+            existing["reason"] = reason
+            return
+        self._rows[digest] = {
+            "record_hash": digest,
+            "format": fmt,
+            "payload": payload,
+            "truncated": truncated,
+            "reason_code": str(code),
+            "reason": reason,
+            "source_path": self.source_path,
+            "times_seen": 1,
+            "norad_cat_id": norad,
+            "epoch": epoch,
+        }
 
     # -- output ----------------------------------------------------------
 
     def close(self) -> None:
         try:
-            self._write()
-        except OSError as exc:
-            logger.warning(f"Could not write quarantine for {self.source}: {exc}")
+            self._flush()
+        except Exception as exc:
+            self.session.rollback()
+            logger.warning(
+                f"Could not record rejects for {self.source_path}: {exc}"
+            )
+        finally:
+            self._rows = {}
 
-    def _write(self) -> None:
+    def _flush(self) -> None:
         if self.rejected == 0:
-            # A previously broken file that now ingests cleanly: drop stale
-            # artifacts so the directory shows only what is currently broken.
-            self._unlink(self.target, self.log_path, self.marker_path)
             return
-
-        self.target.parent.mkdir(parents=True, exist_ok=True)
         if self.rejected > REJECT_MAX_RECORDS:
-            self._unlink(self.target, self.log_path)
-            self._write_marker()
-            return
-
-        self._unlink(self.marker_path)
-        if self.omm:
-            records = [rec for _, _, _, rec in self._buffer if rec is not None]
-            with open(self.target, "w", encoding="utf-8") as f:
-                json.dump(records, f, indent=1)
-        else:
-            with open(self.target, "w", encoding="utf-8") as f:
-                f.write(
-                    "".join(
-                        f"{line1}\n{line2}\n"
-                        for _, line1, line2, _ in self._buffer
-                        if line1 is not None and line2 is not None
+            # The fuse blew: the file is wrong, not a feed with bad lines.
+            # No payload rows — the WARNING below carries the histogram,
+            # and the run row carries the counters.
+            logger.warning(
+                f"{self.source_path or 'input'}: {self.rejected} of "
+                f"{self.total} records rejected — over the "
+                f"{REJECT_MAX_RECORDS}-record fuse, payloads not stored; "
+                f"inspect the source file itself. Reasons: "
+                + ", ".join(
+                    f"{count}× {reason}"
+                    for reason, count in sorted(
+                        self.reasons.items(), key=lambda kv: -kv[1]
                     )
                 )
-        self._write_log()
-
-    def _write_log(self) -> None:
-        stamp = datetime.datetime.now().isoformat(timespec="seconds")
-        with open(self.log_path, "w", encoding="utf-8") as f:
-            f.write(f"# source: {self.source}\n")
-            f.write(f"# written: {stamp}\n")
-            f.write(f"# rejected {self.rejected} of {self.total} records\n")
-            for reason, line1, _, record in self._buffer:
-                ident = line1 if line1 is not None else _record_label(record)
-                f.write(f"{reason}\t{ident}\n")
-
-    def _write_marker(self) -> None:
-        with open(self.marker_path, "w", encoding="utf-8") as f:
-            f.write(f"source: {self.source}\n")
-            f.write(f"records attempted: {self.total}\n")
-            f.write(f"records rejected: {self.rejected}\n")
-            f.write(
-                f"not quarantined: over the {REJECT_MAX_RECORDS}-record cap "
-                "- inspect the source file itself\n"
             )
-            f.write("reasons:\n")
-            for reason, count in sorted(
-                self.reasons.items(), key=lambda item: item[1], reverse=True
-            ):
-                f.write(f"  {count}\t{reason}\n")
+            return
 
-    @staticmethod
-    def _unlink(*paths: pathlib.Path) -> None:
-        for path in paths:
-            path.unlink(missing_ok=True)
+        now = utcnow()
+        rows = []
+        for row in self._rows.values():
+            rows.append({**row, "first_seen": now, "last_seen": now})
+        upsert_rejects(self.session, rows)
+        self.session.commit()
 
     # -- reporting -------------------------------------------------------
 
@@ -245,13 +299,121 @@ class RejectWriter:
         """One-line report of what was rejected, or None when nothing was."""
         if self.rejected == 0:
             return None
-        capped = self.rejected > REJECT_MAX_RECORDS
-        where = self.marker_path if capped else self.target
-        return f"{self.rejected} of {self.total} records rejected -> {where}"
+        return (
+            f"{self.rejected} of {self.total} records rejected "
+            f"-> rejects table"
+        )
 
 
-def _record_label(record: Optional[dict]) -> str:
-    """Short identifier for an OMM record with no usable TLE lines."""
-    if not record:
-        return "<unknown record>"
-    return str(record.get("OBJECT_NAME") or record.get("NORAD_CAT_ID") or record)
+def upsert_rejects(session: Session, rows: list[dict]) -> None:
+    """Dialect-aware upsert on rejects.record_hash.
+
+    New payloads insert; known payloads bump last_seen and add the batch's
+    times_seen, and take the latest reason/source. resolved_at is left
+    alone — resolution is stamped by re-admission and verify, not here.
+    """
+    if not rows:
+        return
+    table = _REJECTS_TABLE
+    dialect = session.bind.dialect.name  # type: ignore[union-attr]
+
+    if dialect in ("sqlite", "postgresql"):
+        if dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as dialect_insert
+        else:
+            from sqlalchemy.dialects.postgresql import insert as dialect_insert
+
+        stmt = dialect_insert(table)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["record_hash"],
+            set_={
+                "last_seen": stmt.excluded.last_seen,
+                "times_seen": table.c.times_seen + stmt.excluded.times_seen,
+                "reason_code": stmt.excluded.reason_code,
+                "reason": stmt.excluded.reason,
+                "source_path": stmt.excluded.source_path,
+            },
+        )
+    else:
+        from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+        my_stmt = mysql_insert(table)
+        stmt = my_stmt.on_duplicate_key_update(
+            last_seen=my_stmt.inserted.last_seen,
+            times_seen=table.c.times_seen + my_stmt.inserted.times_seen,
+            reason_code=my_stmt.inserted.reason_code,
+            reason=my_stmt.inserted.reason,
+            source_path=my_stmt.inserted.source_path,
+        )
+    session.execute(stmt, rows)
+
+
+# --- queries (status / rejects CLI) ------------------------------------------
+
+
+def unresolved_summary(session: Session) -> list[tuple[str, int, datetime.datetime]]:
+    """(reason_code, count, newest last_seen) per reason, unresolved only."""
+    stmt = (
+        select(
+            Reject.reason_code,
+            func.count(Reject.id),
+            func.max(Reject.last_seen),
+        )
+        .where(Reject.resolved_at.is_(None))
+        .group_by(Reject.reason_code)
+        .order_by(func.count(Reject.id).desc())
+    )
+    return [(code, count, last) for code, count, last in session.execute(stmt)]
+
+
+def export_unresolved(
+    session: Session, directory: pathlib.Path
+) -> tuple[int, int]:
+    """Write unresolved, untruncated payloads as re-ingestable files.
+
+    The repair workflow: export, fix, ingest. TLE payloads concatenate
+    into ``rejects.tle``; OMM payloads into ``rejects.json`` (an array of
+    the original records). Returns (tle_count, omm_count).
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    stmt = (
+        select(Reject.format, Reject.payload)
+        .where(Reject.resolved_at.is_(None), Reject.truncated.is_(False))
+        .order_by(Reject.id)
+    )
+    tle_lines: list[str] = []
+    omm_records: list = []
+    for fmt, payload in session.execute(stmt):
+        if fmt == "tle":
+            tle_lines.append(payload.rstrip("\n"))
+        else:
+            try:
+                omm_records.append(json.loads(payload))
+            except json.JSONDecodeError:
+                continue
+    tle_count = 0
+    if tle_lines:
+        path = directory / "rejects.tle"
+        path.write_text("\n".join(tle_lines) + "\n", encoding="utf-8")
+        tle_count = len(tle_lines)
+    if omm_records:
+        path = directory / "rejects.json"
+        path.write_text(json.dumps(omm_records, indent=1), encoding="utf-8")
+    return tle_count, len(omm_records)
+
+
+def iter_readmission_candidates(
+    session: Session, horizon: datetime.datetime
+) -> Iterable[Reject]:
+    """Unresolved future-epoch rejects whose epoch has come inside the
+    horizon — eligible for re-admission (their source file will never be
+    re-read, so this is the only path back in). Truncated payloads cannot
+    be reconstructed and are skipped."""
+    stmt = select(Reject).where(
+        Reject.resolved_at.is_(None),
+        Reject.reason_code == str(ReasonCode.FUTURE_EPOCH),
+        Reject.truncated.is_(False),
+        Reject.epoch.is_not(None),
+        Reject.epoch <= horizon,
+    )
+    return session.execute(stmt).scalars().all()

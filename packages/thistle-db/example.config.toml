@@ -1,5 +1,9 @@
+# thistle-db example configuration.
+# `thistle-db init` scaffolds a fully commented starter config; this file
+# shows a complete operational layout.
+
 [database]
-# Operational: MariaDB. Testing: SQLite.
+# Operational: MariaDB. Testing/serverless: SQLite.
 # drivername = "mysql+pymysql"
 # host = "localhost"
 # port = 3306
@@ -14,69 +18,49 @@
 drivername = "sqlite"
 name = "tle.db"
 
-# Alternative: no element-set database at all. Ingest writes the output
-# files directly; the first type="object", format="tle" entry below is the
-# canonical store. The [database] section is then ignored, and omm outputs
-# are not supported. See CLAUDE.md "Storage backends".
-# [storage]
-# backend = "files"
-# state = "./thistle-state.sqlite"  # ingest file-tracking cache (auto-created)
-# flush_records = 1000000           # memory budget per flush
-
 [ingest]
-# Records that cannot be stored (unparseable text, elsets whose mandatory
-# elements are not finite numbers, rows the database refuses) are copied
-# here in their source format for inspection, mirroring the source tree:
-#   /data/incoming/2006/x.tle  ->  rejects/incoming/2006/x.tle  (+ .log)
-# The directory is a live view of what is currently broken — artifacts are
-# overwritten each run and removed once a file ingests cleanly — so it needs
-# no retention policy. Unset (the default) drops rejects after logging them.
-# reject_dir = "./rejects"
-# Reject elsets whose epoch is more than this many days ahead of now
-# (0 disables; past epochs are never bounded). Corrupted epoch fields parse
-# into 2000-2056 and would permanently degrade that object's incremental
-# output. Raise for predicted-elset workflows.
-# max_epoch_ahead_days = 30
+# Reject elsets whose epoch is more than this many days ahead (0 disables).
+# Rejected records are retained in the `rejects` table and re-admitted
+# automatically once their epoch comes inside the horizon.
+max_epoch_ahead_days = 30
+# Reject TLE lines whose mod-10 checksum (column 69) does not match.
+verify_checksums = true
+# Delta-buffer memory budget (records per flush; ~600 B each).
+flush_records = 1000000
 
 [[ingest.sources]]
-path = "/data/incoming"
-pattern = "*.tle"
+path = "/data/spacetrack/daily"
+pattern = "*.txt"
+
+[[ingest.sources]]
+path = "/data/spacetrack/gp"
+pattern = "*.json"
+
+# Outputs are maintained incrementally by `ingest` itself; `rebuild`
+# re-derives them all from the store after a config change.
+
+[[output.files]]
+type = "object"          # one file per satellite, full history, epoch order
+format = "tle"
+dir = "/data/tle/objects"
+# object_id = "alpha5"   # E5693.tle instead of 145693.tle
+# zero_pad = true        # 00900.tle instead of 900.tle (object_id = "int")
+# filename = "tle_{id}{ext}"
+
+[[output.files]]
+type = "date"            # one file per epoch date, latest record per object
+format = "tle"
+dir = "/data/tle/daily"
+# date_format = "%Y%m%d"
+
+[[output.files]]
+type = "date"            # STK-compatible OMM CSV
+format = "omm-csv"
+dir = "/data/omm/daily"
+# columns = "stk"        # 17-column STK projection (default), or "full"
 
 [output]
-# Incremental generation tuning (see README):
-# lookback_days = 7    # object files: newly created rows considered each run
-#                      # (must exceed the ingest cron cadence)
-# write_workers = 0    # threads for output writes; 0 = auto, 1 = serial
-
-# One [[output.files]] entry per generated output. type: "date" | "object";
-# format: "tle" | "omm". Object filenames: object_id = "int" | "alpha5",
-# zero_pad = true pads int IDs to 5 digits. Date filenames: date_format
-# (strftime, default "%Y%m%d"). extension overrides ".tle"/".omm".
-# filename is a template arranging those pieces, default "{id}{ext}" for
-# object outputs and "{date}{ext}" for date outputs; e.g. "tle_{id}.txt" or
-# "{date}_gp{ext}". Placeholders: {id} or {date}, {ext}, {format}, {type}.
-
-[[output.files]]
-type = "date"
-format = "tle"
-dir = "./output"
-
-[[output.files]]
-type = "date"
-format = "omm"
-dir = "./output"
-
-[[output.files]]
-type = "object"
-format = "tle"
-dir = "./output"
-# object_id = "alpha5"   # E5693.tle instead of 145693.tle
-# zero_pad = true        # 00900.tle instead of 900.tle
-
-[[output.files]]
-type = "object"
-format = "omm"
-dir = "./output"
+# write_workers = 0      # 0 = auto (CPU count x 4, capped); 1 = serial
 
 [logging]
 level = "INFO"

@@ -15,7 +15,7 @@ import dataclasses
 import datetime
 import hashlib
 from math import degrees, isfinite, pi
-from typing import Optional
+from typing import Optional, TypeGuard
 
 from sgp4.api import Satrec
 from sgp4.conveniences import sat_epoch_datetime
@@ -24,11 +24,15 @@ __all__ = [
     "GPRecord",
     "MalformedRecordError",
     "STORE_COLUMNS",
+    "checksum_ok",
+    "epoch_from_lines",
     "from_tle",
     "from_omm",
+    "implicit_semantics",
     "merge",
     "line_hash",
     "semantic_hash",
+    "tle_checksum",
 ]
 
 # sgp4 stores mean-motion derivatives in radians/minute^n; the TLE text (and
@@ -218,13 +222,59 @@ def _clean_floats(fields: dict) -> dict:
 # --- Construction ---------------------------------------------------------
 
 
-def _implicit_semantics(ephemeris_type: int) -> dict:
+def implicit_semantics(ephemeris_type: int) -> dict:
+    """Implicit semantics for a TLE-only delivery of this ephemeris type.
+
+    Also the fallback the database store compares delivered OMM semantics
+    against: values equal to these store as NULL overrides.
+    """
     return dict(
         mean_element_theory=_THEORY_BY_EPHTYPE.get(ephemeris_type, "SGP4"),
         ref_frame=_IMPLICIT_REF_FRAME,
         time_system=_IMPLICIT_TIME_SYSTEM,
         center_name=_IMPLICIT_CENTER_NAME,
     )
+
+
+_implicit_semantics = implicit_semantics  # internal alias
+
+
+def epoch_from_lines(line1: str, line2: str) -> datetime.datetime:
+    """Epoch of a TLE exactly as stored (naive UTC, microseconds).
+
+    Byte-identical to the `epoch` column / GPRecord.epoch for the same
+    lines — used to compare on-disk output files against records without
+    risking a microsecond of parse skew.
+    """
+    sat = Satrec.twoline2rv(line1, line2)
+    return sat_epoch_datetime(sat).replace(tzinfo=None)
+
+
+def tle_checksum(line: str) -> int:
+    """Mod-10 TLE checksum over columns 1-68: digits summed, '-' counts 1."""
+    total = 0
+    for char in line[:68]:
+        if char.isdigit():
+            total += int(char)
+        elif char == "-":
+            total += 1
+    return total % 10
+
+
+def checksum_ok(line: str) -> bool:
+    """Verify column 69 against the computed checksum.
+
+    Lenient where the digit is absent: lines shorter than 69 characters
+    pass (some tools emit trimmed lines; historical archives contain
+    them). A full-length line whose 69th column is not a digit fails —
+    that column can hold nothing else.
+    """
+    if len(line) < 69:
+        return True
+    check = line[68]
+    if not check.isdigit():
+        return False
+    return int(check) == tle_checksum(line)
 
 
 def _object_id_from_intldesg(intldesg: str) -> Optional[str]:
@@ -320,6 +370,13 @@ def _opt_str(value) -> Optional[str]:
     return text or None
 
 
+def _is_hash(text: Optional[str]) -> "TypeGuard[str]":
+    """A well-formed lowercase-hex sha256, as line_hash/semantic_hash emit."""
+    if text is None or len(text) != 64:
+        return False
+    return all(c in "0123456789abcdef" for c in text)
+
+
 def _opt_int(value) -> Optional[int]:
     text = _opt_str(value)
     if text is None:
@@ -381,6 +438,15 @@ def from_omm(fields: dict) -> GPRecord:
     ]
     if line1 and line2:
         record_hash = line_hash(line1, line2)
+    elif _is_hash(delivered := _opt_str(fields.get("RECORD_HASH"))):
+        # A line-less record re-ingested from thistle's own export: the
+        # delivered identity wins, so export → restore round-trips exactly
+        # even though single-precision element columns re-serialize with
+        # fewer bits than the doubles the original semantic hash saw.
+        # Line-present records never take this path — their identity is
+        # always the line text.
+        line1 = line2 = None
+        record_hash = delivered  # type: ignore[assignment]
     else:
         line1 = line2 = None
         record_hash = semantic_hash(

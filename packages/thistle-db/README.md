@@ -1,6 +1,13 @@
 # thistle-db
 
-Orbital element database manager. Ingests TLE (Two-Line Element) and OMM (Orbit Mean-Elements Message) files into a database and generates organized output files by date and satellite.
+Orbital element database manager. Ingests TLE (Two-Line Element) and OMM
+(Orbit Mean-Elements Message) files into a SQL database — the canonical,
+full-fidelity store — and maintains organized output files (TLE by object
+and by date; STK-compatible OMM CSV) in the same pass.
+
+Nothing is silently lost: records that fail validation are retained in a
+queryable `rejects` table with a reason code, and every run is recorded in
+an `ingest_runs` table (`thistle-db status` is the dashboard).
 
 ## Installation
 
@@ -27,7 +34,7 @@ thistle-db init
 
 This creates two files:
 
-- `./config.toml` -- main configuration (database, ingest sources, output settings)
+- `./config.toml` -- main configuration (database, ingest sources, outputs)
 - `~/.config/thistle-db.toml` -- user-local database credentials
 
 Use `-c` to specify a different config path:
@@ -38,9 +45,11 @@ thistle-db -c /etc/thistle-db/config.toml init
 
 ### 2. Configure
 
-Edit `config.toml` to set your database and ingest sources. The generated file is fully commented -- see below for a summary.
+Edit `config.toml` to set your database, ingest sources, and outputs. The
+generated file is fully commented — see `example.config.toml` for a
+complete operational layout.
 
-**SQLite (default):**
+**SQLite (default; serverless):**
 
 ```toml
 [database]
@@ -66,6 +75,10 @@ username = "myuser"
 password = "mypassword"
 ```
 
+Credentials never live in `config.toml`. Resolution order (highest
+priority first): `THISTLE_DB_DATABASE__USERNAME`/`__PASSWORD` env vars,
+the user secrets file, the system secrets file, config values.
+
 ### 3. Create the database schema
 
 ```bash
@@ -76,333 +89,99 @@ Run once per database (idempotent — safe to re-run). Commands never create
 schema implicitly, so on MariaDB/PostgreSQL you can run `init-db` with an
 admin account and give the day-to-day account only read/write privileges.
 `init-db --drop` destroys and recreates everything (asks for confirmation
-unless `--yes`).
+unless `--yes`). For bulk restores, `init-db --drop --defer-indexes`
+creates the schema without the read-path indexes; a later plain `init-db`
+builds them in one fast sorted pass each.
 
-### 4. Ingest TLE/OMM files
-
-Scan configured source directories:
-
-```bash
-thistle-db ingest
-```
-
-Or ingest specific files:
+### 4. Ingest
 
 ```bash
-thistle-db ingest /path/to/20260327.tle /path/to/20260327.json
+thistle-db ingest                      # scan configured source directories
+thistle-db ingest 20260327.tle gp.json # or ingest specific files
 ```
+
+One pass does everything: validate, store, and update every configured
+output. There is no separate generate step — the steady-state cron entry
+is just `thistle-db ingest`.
 
 File format is auto-detected by extension:
 
-| Extension          | Format              |
-| ------------------ | ------------------- |
-| `.tle`, `.txt`, `.3le` | Two-Line Element |
-| `.json`            | Space-Track OMM JSON |
-| `.csv`             | OMM CSV              |
-| `.xml`             | OMM XML              |
+| Extension              | Format               |
+| ---------------------- | -------------------- |
+| `.tle`, `.txt`, `.3le` | Two-Line Element     |
+| `.json`                | Space-Track OMM JSON |
+| `.csv`                 | OMM CSV              |
+| `.xml`                 | OMM XML              |
 
-Ingestion is idempotent -- duplicate records are silently skipped.
+Ingestion is **idempotent** (duplicates are silently absorbed — the dedup
+key is the verbatim record text) and **incremental** (unchanged files are
+skipped without being opened). Validation is tolerant: one bad record
+never aborts a file, one bad file never aborts a scan.
 
-### 5. Generate output files
+Records that cannot be stored — unparseable text, non-finite mandatory
+elements, TLE checksum mismatches, epochs beyond the configurable future
+horizon, records with no NORAD ID — are **retained in the `rejects`
+table** with a reason code and provenance. Future-epoch rejects are
+re-admitted automatically once their epoch comes inside the horizon.
 
-```bash
-thistle-db generate
-```
+### 5. Outputs
 
-This produces the outputs declared as `[[output.files]]` entries in the
-config. Each entry is one output — a file type, a format (`tle` or `omm`
-CSV), a destination directory, and a filename scheme — so different formats
-can go to different directories, or several naming conventions can be
-generated side by side:
+Declared as `[[output.files]]` entries; `ingest` maintains all of them
+incrementally, and `rebuild` re-derives everything from the store (first
+run, disaster recovery, or after adding an entry):
 
-- **Date files** (`type = "date"`) -- one file per date with the latest TLE
-  per satellite (filename from `date_format`, default `YYYYMMDD`)
-- **Object files** (`type = "object"`) -- all TLEs for a single satellite,
-  ordered by epoch, named by NORAD ID: plain integer (`25544.tle`),
-  zero-padded (`00900.tle`), or alpha-5 (`E5693.tle`)
+- **Object files** (`type = "object"`) — all records for one satellite,
+  epoch order. NORAD IDs render as integers (optionally zero-padded) or
+  alpha-5; filenames are templatable (`filename = "tle_{id}{ext}"`).
+- **Date files** (`type = "date"`) — the latest record per satellite per
+  epoch date.
+- **Formats**: `tle` (verbatim two-line passthrough — never a byte
+  thistle synthesized) or `omm-csv` (the 17-column CelesTrak/STK
+  projection, or `columns = "full"` for every store column).
 
-Generation is **incremental**: each run rewrites date files for a trailing
-epoch window and appends newly ingested rows to object files, so cost
-scales with new data rather than database size. Late-arriving TLEs are
-placed correctly automatically. Run `generate --all` once after ingesting
-pre-existing/historical data (or restoring a backup); routine cron runs
-need no flags.
-
-## Automating with Cron
-
-thistle-db is designed to run via cron rather than as a long-running service. Both `ingest` and `generate` are idempotent and safe to re-run.
-
-One rule: **ingest and generate must not run concurrently.** The incremental
-generator uses output-file mtimes to decide what is already on disk, and a
-row committed mid-generate can be misclassified until the next `--verify`
-sweep. Chaining with `&&` (one cron entry) serializes them naturally;
-separate cron entries should share a `flock`.
-
-**Ingest and generate every 4 hours:**
-
-```cron
-0 */4 * * * thistle-db -c /etc/thistle-db/config.toml ingest && thistle-db -c /etc/thistle-db/config.toml generate
-```
-
-**Ingest hourly, generate once daily at 03:00 UTC** (the shared lock keeps
-the 03:00 ingest and generate from overlapping):
-
-```cron
-0 * * * * flock /run/lock/thistle-db.lock thistle-db -c /etc/thistle-db/config.toml ingest
-0 3 * * * flock /run/lock/thistle-db.lock thistle-db -c /etc/thistle-db/config.toml generate
-```
-
-**With logging to a rotating file** (`--log` caps disk usage at ~10 MB × 10
-rotations — no shell redirection or logrotate needed):
-
-```cron
-0 */4 * * * thistle-db -c /etc/thistle-db/config.toml --log /var/log/thistle-db.log ingest && thistle-db -c /etc/thistle-db/config.toml --log /var/log/thistle-db.log generate
-```
-
-**Weekly integrity sweep** (reconciles every object file against the
-database and repairs any damage the incremental runs can't see). It runs
-alongside the 4-hourly chain above, so both entries take the shared lock
-to keep the 04:00 Sunday firings from overlapping:
-
-```cron
-0 */4 * * * flock /run/lock/thistle-db.lock sh -c 'thistle-db -c /etc/thistle-db/config.toml --log /var/log/thistle-db.log ingest && thistle-db -c /etc/thistle-db/config.toml --log /var/log/thistle-db.log generate'
-0 4 * * 0 flock /run/lock/thistle-db.lock thistle-db -c /etc/thistle-db/config.toml --log /var/log/thistle-db.log generate --verify
-```
-
-The interactive progress bar disables itself automatically when stderr is
-not a terminal, so no extra flags are needed under cron (`--no-progress`
-exists to force it off in an interactive shell). Routine "skipped
-(unchanged file)" lines log at DEBUG; set `[logging] level = "DEBUG"` to
-see them.
-
-## MariaDB Deployment Tuning
-
-The schema is designed so the hot working set (the dedup and per-object
-indexes) stays small, but server configuration still decides whether inserts
-run at memory speed or disk speed. In rough priority order:
-
-### Must-have
-
-- **`innodb_buffer_pool_size`** — the single setting that matters. The
-  default (128 MB) is far too small for a growing catalog and is the classic
-  cause of ingest performance "falling off a cliff" as the table grows.
-  Size it to comfortably hold the `tle` indexes — roughly 1–2 GB of buffer
-  pool per 10M rows — or simply give it 25–50% of the machine's RAM on a
-  dedicated host. Check the current value with:
-
-  ```sql
-  SHOW VARIABLES LIKE 'innodb_buffer_pool_size';
-  ```
-
-### Nice-to-have
-
-- **`innodb_flush_log_at_trx_commit = 2`** — one log flush per second
-  instead of one per commit. Ingest commits every 5000-row chunk, so this
-  meaningfully speeds bulk loads. The trade: a server crash (not a client
-  crash) can lose up to ~1 second of committed rows — acceptable here
-  because ingest is idempotent and re-running it restores anything lost.
-  Keep the default (`1`) if the database also serves data you cannot
-  re-derive.
-- **`innodb_log_file_size`** (redo log; `innodb_redo_log_capacity` on
-  newer MariaDB) — raise to 1–4 GB if large restores or backfills
-  checkpoint-stall (visible as periodic throughput collapses during bulk
-  ingest). Irrelevant for routine daily deliveries.
-- **`wait_timeout` / `net_write_timeout`** — the defaults are fine for the
-  normal cron cadence; only relevant if you script very long-running custom
-  reads over the same connection.
-
-## Credential Resolution
-
-Database credentials are resolved in priority order:
-
-1. **Environment variables** -- `THISTLE_DB_DATABASE__USERNAME` / `THISTLE_DB_DATABASE__PASSWORD`
-2. **User secrets file** -- `~/.config/thistle-db.toml`
-3. **System secrets file** -- path set via `secrets_file` in `config.toml`
-4. **config.toml values** -- not recommended for credentials
-
-For cron jobs, either use the user secrets file or export environment variables in the crontab:
-
-```cron
-THISTLE_DB_DATABASE__USERNAME=myuser
-THISTLE_DB_DATABASE__PASSWORD=mypassword
-0 */4 * * * thistle-db -c /etc/thistle-db/config.toml ingest && thistle-db -c /etc/thistle-db/config.toml generate
-```
-
-## CLI Reference
-
-```
-thistle-db [-c CONFIG] COMMAND
-
-Commands:
-  init       Scaffold config.toml and ~/.config/thistle-db.toml
-  init-db    Create the database schema (idempotent; --drop recreates from
-             scratch, destroying all data — asks unless --yes)
-  ingest     Ingest TLE/OMM files into the database
-  generate   Generate output TLE/OMM files from the database
-  get-tle    Print TLEs from the database to stdout
-  dump       Export the entire database as re-ingestable TLE/OMM files
-
-Options:
-  -c, --config PATH   Path to config.toml
-                      (default: $THISTLE_DB_CONFIG if set, else ./config.toml)
-  --log PATH          Also write logs to this file, rotated at 10 MB with
-                      the last 10 rotations kept (for cron use)
-  --no-progress       Disable the interactive progress bar (auto-disabled
-                      when stderr is not a terminal)
-```
-
-`ingest` and `generate` show a progress bar on stderr when run
-interactively; command output (`get-tle`, `dump`) always goes to stdout and
-is never mixed with progress rendering.
-
-### `generate`
-
-Incremental by default (see *Generate output files* above). Flags:
+## Operations
 
 ```bash
-thistle-db generate                    # routine incremental run
-thistle-db generate --all              # full rebuild of every output file
-thistle-db generate --verify           # incremental run + integrity sweep
-thistle-db generate --window-days 90   # override output.window_days
-thistle-db generate --lookback-days 14 # override output.lookback_days
+thistle-db status            # recent runs, reject trends, stuck runs
+thistle-db verify            # reconcile outputs against the store (weekly cron)
+thistle-db rejects           # summarize rejected input by reason
+thistle-db rejects --export repair/   # write payloads out for repair + re-ingest
+thistle-db get-tle 25544     # all TLEs for an object (alpha-5 IDs work too)
+thistle-db get-tle 20260327  # nearest TLE per object to that date's noon
+thistle-db export backup.csv # full-fidelity, re-ingestable backup
 ```
 
-Use `--all` for the first run over historical data, after restoring a
-backup, or after `generate` hasn't run for longer than the lookback.
-`--verify` reconciles every object file against the database and rewrites
-any that disagree (it reads all output files — schedule it weekly rather
-than every run; requires a tle object output).
+- **Runs are data**: every `ingest`/`rebuild` writes an `ingest_runs` row
+  with per-run counters; `status` reads it back. Scans exit 0 even when
+  individual files fail (they retry next scan); explicitly named files
+  exit 1 on failure so cron wrappers can alert.
+- **Single-writer**: `ingest` and `rebuild` take an advisory lock beside
+  the config file; a second writer exits immediately.
+- **Backup/migration**: `export` writes a full-fidelity CSV that
+  re-ingests into any supported dialect (`init-db` + `ingest backup.csv`
+  — also the schema-migration path; there is deliberately no migration
+  framework). `--format tle|omm-xml|omm-kvn` cover legacy consumers and
+  CCSDS OMM 2.0 interchange. Physical backups of a live server belong to
+  the native tools.
+- **Exit codes**: 0 success; 1 runtime failure / no match; 2 invalid
+  config or usage; 3 database not initialized.
 
-Exits with status 2 if the config declares no `[[output.files]]` entries.
+## Library use
 
-### `get-tle`
+```python
+from thistle_db import get_tles
 
-Query the database directly and print TLEs to stdout. The positional argument
-is either a NORAD ID (alpha-5 compatible, e.g. `25544`, `00022`, `E5693`) or
-an 8-digit date (`YYYYMMDD`):
-
-```bash
-# All TLEs for one satellite, ordered by epoch
-thistle-db get-tle 25544
-thistle-db get-tle E5693   # alpha-5 IDs work too (= 145693)
-
-# Nearest TLE per satellite to 12:00 UTC on a date, within +/- 7 days
-thistle-db get-tle 20260717
-
-# Widen (or narrow) the search window
-thistle-db get-tle 20260717 --days 3
+pairs = get_tles(25544)   # [(line1, line2), ...] from the configured DB
 ```
 
-Exits with status 1 if no TLEs match.
+`thistle` (the propagation package) uses this as its catalog fallback.
 
-### `dump` — backups and migration
+## Supported databases
 
-Export the whole database as re-ingestable files (a *logical* backup):
+SQLite (default — dev, small and serverless deployments), MariaDB/MySQL
+(operational), PostgreSQL. Dialect-specific behavior is tested against all
+three in CI.
 
-```bash
-thistle-db dump /backups/tles-20260722
-# -> writes /backups/tles-20260722.tle
-#    and    /backups/tles-20260722.json  (only if OMM metadata exists)
-```
+## License
 
-Restore into any empty database — including a different dialect (SQLite →
-MariaDB, etc.):
-
-```bash
-thistle-db -c new-config.toml init-db
-thistle-db -c new-config.toml ingest /backups/tles-20260722.tle /backups/tles-20260722.json
-thistle-db -c new-config.toml generate --all
-```
-
-The export is lossless for element sets (rows store the TLE line text
-verbatim, and dedup is by that exact text), and the JSON carries the OMM
-metadata in Space-Track form so `ingest` reattaches it to the same rows.
-The `ingest_files` change-detection state is deliberately not exported —
-it is a cache; the next scan rebuilds it.
-
-The final `generate --all` matters: a restore resets every row's `created`
-timestamp, which is what incremental generation keys off, so output files
-must be rebuilt once from scratch. This dump/restore cycle is also the
-supported schema-migration path — thistle-db deliberately has no migration
-framework; schema-changing releases document this procedure in their
-release notes.
-
-For *physical* backups of a live server, prefer the native tools: a file
-copy or `VACUUM INTO` for SQLite, `mariadb-dump` / `pg_dump` for the
-server dialects.
-
-## Configuration Reference
-
-### `[database]`
-
-| Field          | Default      | Description                                |
-| -------------- | ------------ | ------------------------------------------ |
-| `drivername`   | `"sqlite"`   | SQLAlchemy driver (`sqlite`, `mysql+pymysql`) |
-| `name`         | `":memory:"` | Database name or file path                 |
-| `host`         |              | Database host                              |
-| `port`         |              | Database port                              |
-| `username`     |              | Database username (prefer secrets file)    |
-| `password`     |              | Database password (prefer secrets file)    |
-| `secrets_file` |              | Path to a TOML file with username/password |
-
-### `[[ingest.sources]]`
-
-| Field     | Default   | Description                        |
-| --------- | --------- | ---------------------------------- |
-| `path`    |           | Directory to scan for files        |
-| `pattern` | `"*.tle"` | Glob pattern for matching files    |
-
-### `[output]`
-
-| Field           | Default      | Description                                      |
-| --------------- | ------------ | ------------------------------------------------ |
-| `files`         | (none)       | Outputs to generate, one `[[output.files]]` entry each; `generate` errors (exit 2) when no entries are configured |
-| `window_days`   | `60`         | Date files: trailing epoch window rewritten each run |
-| `lookback_days` | `7`          | Object files: newly created rows considered each run (must exceed the ingest cron cadence) |
-
-### `[[output.files]]`
-
-One entry per generated output. Entries may share a directory (extensions
-keep them apart) or use separate ones.
-
-| Field         | Default            | Description                                        |
-| ------------- | ------------------ | -------------------------------------------------- |
-| `type`        | (required)         | `"date"` — one file per date, latest TLE per satellite; `"object"` — one file per satellite, all TLEs by epoch |
-| `format`      | (required)         | `"tle"` — two-line text; `"omm"` — OMM CSV         |
-| `dir`         | `"./output"`       | Destination directory (created if missing)          |
-| `object_id`   | `"int"`            | Object files: NORAD ID as `"int"` or `"alpha5"` (always 5 chars, e.g. `00900`, `E5693`) |
-| `zero_pad`    | `false`            | Object files with `object_id = "int"`: pad the ID to 5 digits |
-| `date_format` | `"%Y%m%d"`         | Date files: strftime pattern for the filename stem  |
-| `extension`   | `".tle"`/`".omm"`  | Filename suffix override                            |
-
-### `[logging]`
-
-| Field   | Default  | Description                                    |
-| ------- | -------- | ---------------------------------------------- |
-| `level` | `"INFO"` | Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL |
-
-## Development
-
-### Running tests
-
-Tests live at the workspace root under `tests/thistle_db/` and are
-parametrized to run against SQLite, MariaDB, and PostgreSQL. SQLite runs
-unconditionally; the MariaDB and PostgreSQL backends are opt-in and managed
-automatically by [testcontainers](https://testcontainers-python.readthedocs.io/)
-— one container per test session, one throwaway database per test. No manual
-`docker run` needed, just a running Docker daemon.
-
-SQLite only:
-
-```bash
-uv run pytest tests/thistle_db
-```
-
-All backends (requires Docker):
-
-```bash
-THISTLE_DB_TEST_MARIADB=1 THISTLE_DB_TEST_POSTGRES=1 uv run pytest tests/thistle_db
-```
-
-The images default to `mariadb:11` and `postgres:16`; override with
-`THISTLE_DB_MARIADB_IMAGE` / `THISTLE_DB_POSTGRES_IMAGE`.
+MIT

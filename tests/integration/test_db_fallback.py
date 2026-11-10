@@ -21,7 +21,8 @@ from typer.testing import CliRunner  # noqa: E402
 
 from thistle.cli import _db  # noqa: E402
 from thistle.cli._app import app  # noqa: E402
-from thistle_db.model import TLE, Base  # noqa: E402
+from thistle_db.model import Base, TLE, tle_row_from_record, utcnow  # noqa: E402
+from thistle_db.record import from_tle  # noqa: E402
 
 ISS_TLE = """\
 1 25544U 98067A   24001.50000000  .00016717  00000-0  10270-3 0  9005
@@ -55,7 +56,8 @@ def db_env(tmp_path, monkeypatch):
     Base.metadata.create_all(engine)
     session = sessionmaker(bind=engine)()
     for line1, line2 in _tle_pairs(ISS_TLE):
-        session.add(TLE.from_twoline(line1, line2))
+        row = tle_row_from_record(from_tle(line1, line2), utcnow())
+        session.add(TLE(**row))
     session.commit()
     session.close()
     engine.dispose()

@@ -1,5 +1,72 @@
 # Changelog
 
+## [0.16.0] - 2026-11-09
+
+**Breaking: the single-store architecture (PLAN.md).** No backwards
+compatibility, no migration tooling — adopt by re-ingesting source files,
+or `dump` from 0.15 and `ingest` the result after `init-db --drop`.
+
+### Changed
+
+- **One store: the SQL database.** The `[storage] backend = "files"`
+  alternative, the TLE-line file store, and the dual-backend split are
+  gone. SQLite covers the serverless case; outputs remain files, the
+  *store* is the database.
+- **Ingest maintains outputs; `generate` is gone.** The delta engine
+  validates, buffers by object, and flushes to every sink in order
+  (store → outputs → source-file state), each sink idempotent against
+  replay — that one rule is the whole crash-safety story. The watermark
+  machinery (`epoch_date_state`, `lookback_days`, the `(created)` index)
+  is deleted. `rebuild` re-derives all outputs from a linear store scan.
+- **Schema v2** (`tle`): `record_hash` replaces `line_hash` (line hash
+  when lines exist, the frozen `thistle-gp1` semantic hash for line-less
+  OMM-native records, which now store); verbatim `line0/line1/line2` are
+  nullable; `norad_cat_id` is NOT NULL (no-ID records are rejected);
+  `mean_element_theory` is stored per row; `classification_type` renames
+  `classification`. `omm_metadata` carries provenance (`gp_id`,
+  `file_id`, `creation_date`, `originator`) and nullable semantics
+  overrides (`ref_frame`/`time_system`/`center_name`; null = implicit per
+  ephemeris type) — the enrichment merge UPDATE is the one sanctioned
+  mutation. `format = "omm"` outputs rename to `omm-csv` (with
+  `columns = "stk" | "full"`); `dump` is subsumed by `export`
+  (`csv | tle | omm-xml | omm-kvn`, CCSDS OMM 2.0).
+
+### Added
+
+- **The `rejects` table — all input rows are retained.** Validity is
+  table membership (`tle` ∪ `rejects` = everything delivered), never a
+  flag column. One row per distinct rejected payload with a reason code
+  (`unparseable`, `malformed_element`, `future_epoch`, `no_norad_id`,
+  `checksum`, `db_refused`), verbatim payload (4 KB cap), provenance,
+  `first_seen`/`last_seen`/`times_seen`, and `resolved_at`. The
+  10k-per-file fuse survives: past it, only counters and a reason
+  histogram are kept. Future-epoch rejects **re-admit automatically**
+  once inside the horizon; `verify` stamps rejects whose payload later
+  reached the store. `thistle-db rejects [--export DIR]` summarizes and
+  round-trips payloads for repair.
+- **TLE checksum verification** (`[ingest] verify_checksums`, default
+  on): a flipped digit changes an element *and* breaks the mod-10
+  checksum — the only corruption signal for records that otherwise parse
+  finite. Lenient for lines shorter than 69 characters.
+- **Runs are data**: `ingest_runs` records every run's counters and
+  outcome; `thistle-db status` shows recent runs, reject trends, and
+  crashed (`running`-stuck) rows. The library returns structured
+  `IngestReport` objects instead of bare counts.
+- **Single-writer enforcement**: an advisory OS lock beside the config
+  file (`<config>.lock`); a second concurrent writer exits 1.
+- **`verify`** now also catches orphan object files and exits 1 on any
+  mismatch so cron can alert.
+
+### Removed
+
+- `generate`, `epoch_date_state`, `lookback_days`, the `(created)` index.
+- `[storage]` (backend/state/flush_records — the flush budget moved to
+  `[ingest] flush_records`), `[ingest] reject_dir` and the filesystem
+  quarantine tree.
+- `dump` (use `export`), `filestore.py`, `generator.py`,
+  `TLE.from_twoline` (construct `GPRecord`s via `record.from_tle` /
+  `from_omm` and `model.tle_row_from_record`).
+
 ## [0.15.0] - 2026-08-29
 
 ### Added

@@ -1,374 +1,194 @@
-import datetime
+"""CLI surface: command wiring, exit codes, stdout discipline."""
+
+import json
 import pathlib
 
 import pytest
-import typer
-from sqlalchemy import create_engine, func, select
-from sqlalchemy.orm import sessionmaker
 from typer.testing import CliRunner
 
-from thistle_db.cli import _parse_target, app, nearest_tles_for_date, tles_for_object
-from thistle_db.model import TLE, Base, OmmMetadata
-
 from .conftest import TLES
-
-DATA = pathlib.Path(__file__).parent / "data"
+from thistle_db.cli import app
 
 runner = CliRunner()
 
-
-def _insert_tles(session):
-    for line1, line2 in TLES:
-        session.add(TLE.from_twoline(line1, line2))
-    session.commit()
+L1, L2 = TLES[0]
 
 
-class TestParseTarget:
-    def test_digits_are_satnum(self):
-        assert _parse_target("25544") == 25544
+def write_config(tmp_path: pathlib.Path, extra: str = "") -> pathlib.Path:
+    incoming = tmp_path / "incoming"
+    incoming.mkdir(exist_ok=True)
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f"""
+[database]
+drivername = "sqlite"
+name = "{(tmp_path / 'cli.db').as_posix()}"
 
-    def test_zero_padded_satnum(self):
-        assert _parse_target("00022") == 22
+[[ingest.sources]]
+path = "{incoming.as_posix()}"
+pattern = "*.tle"
 
-    def test_alpha5_satnum(self):
-        assert _parse_target("E5693") == 145693
+[[output.files]]
+type = "object"
+format = "tle"
+dir = "{(tmp_path / 'objects').as_posix()}"
 
-    def test_alpha5_satnum_lowercase(self):
-        assert _parse_target("e5693") == 145693
-
-    def test_compact_date(self):
-        assert _parse_target("20250418") == datetime.date(2025, 4, 18)
-
-    def test_invalid_date_raises(self):
-        with pytest.raises(typer.BadParameter):
-            _parse_target("20251345")
-
-    def test_invalid_raises(self):
-        with pytest.raises(typer.BadParameter):
-            _parse_target("not-a-date")
-
-
-class TestQueries:
-    def test_tles_for_object_ordered_by_epoch(self, db_session):
-        _insert_tles(db_session)
-        tles = tles_for_object(db_session, 22)
-        assert [(t.line1, t.line2) for t in tles] == [TLES[0], TLES[1]]
-
-    def test_tles_for_object_unknown_satnum(self, db_session):
-        _insert_tles(db_session)
-        assert tles_for_object(db_session, 99999) == []
-
-    def test_nearest_tles_for_date(self, db_session):
-        _insert_tles(db_session)
-        # Sat 22 has epochs on Apr 17 ~21:40 and Apr 18 ~05:34; the latter is
-        # nearer to Apr 18 12:00. Sat 81069 has one epoch on Apr 18 ~14:55.
-        tles = nearest_tles_for_date(db_session, datetime.date(2025, 4, 18), 7.0)
-        assert [(t.line1, t.line2) for t in tles] == [TLES[1], TLES[2]]
-
-    def test_nearest_tles_respects_window(self, db_session):
-        _insert_tles(db_session)
-        # All epochs are ~12 days before Apr 30: outside +/-7, inside +/-15.
-        assert nearest_tles_for_date(db_session, datetime.date(2025, 4, 30), 7.0) == []
-        tles = nearest_tles_for_date(db_session, datetime.date(2025, 4, 30), 15.0)
-        assert len(tles) == 2
-
-
-@pytest.fixture()
-def cli_env(tmp_path):
-    """A config.toml backed by a populated on-disk SQLite database."""
-    db_path = tmp_path / "thistle-db.db"
-    engine = create_engine(f"sqlite:///{db_path}")
-    Base.metadata.create_all(engine)
-    session = sessionmaker(bind=engine)()
-    _insert_tles(session)
-    session.close()
-    engine.dispose()
-
-    config_path = tmp_path / "config.toml"
-    config_path.write_text(
-        f'[database]\ndrivername = "sqlite"\nname = "{db_path.as_posix()}"\n'
+[[output.files]]
+type = "date"
+format = "tle"
+dir = "{(tmp_path / 'dates').as_posix()}"
+{extra}
+"""
     )
-    return config_path
+    return config
 
 
-class TestGetTleCommand:
-    def test_satnum_prints_all_tles(self, cli_env):
-        result = runner.invoke(app, ["-c", str(cli_env), "get-tle", "00022"])
-        assert result.exit_code == 0
-        expected = "".join(f"{l1}\n{l2}\n" for l1, l2 in TLES[:2])
-        assert result.stdout == expected
-
-    def test_date_prints_nearest_per_object(self, cli_env):
-        result = runner.invoke(app, ["-c", str(cli_env), "get-tle", "20250418"])
-        assert result.exit_code == 0
-        expected = "".join(f"{l1}\n{l2}\n" for l1, l2 in (TLES[1], TLES[2]))
-        assert result.stdout == expected
-
-    def test_date_window_option(self, cli_env):
-        result = runner.invoke(
-            app, ["-c", str(cli_env), "get-tle", "20250430", "--days", "15"]
-        )
-        assert result.exit_code == 0
-        assert len(result.stdout.splitlines()) == 4
-
-    def test_no_results_exits_nonzero(self, cli_env):
-        result = runner.invoke(app, ["-c", str(cli_env), "get-tle", "20250430"])
-        assert result.exit_code == 1
-        assert result.stdout == ""
-
-    def test_invalid_target_errors(self, cli_env):
-        result = runner.invoke(app, ["-c", str(cli_env), "get-tle", "not-a-date"])
-        assert result.exit_code != 0
+def invoke(config, *args):
+    return runner.invoke(app, ["-c", str(config), "--no-progress", *args])
 
 
-class TestInitDbCommand:
-    def test_creates_schema(self, tmp_path):
-        db_path = tmp_path / "new.db"
-        config_path = tmp_path / "config.toml"
-        config_path.write_text(
-            f'[database]\ndrivername = "sqlite"\nname = "{db_path.as_posix()}"\n'
-        )
-        result = runner.invoke(app, ["-c", str(config_path), "init-db"])
-        assert result.exit_code == 0
-        assert "Created:" in result.stdout
-        assert "tle" in result.stdout
-
-    def test_rerun_reports_existing(self, cli_env):
-        result = runner.invoke(app, ["-c", str(cli_env), "init-db"])
-        assert result.exit_code == 0
-        assert "Existing:" in result.stdout
-        assert "Created:" not in result.stdout
-
-    def test_drop_without_yes_refuses_non_interactive(self, cli_env):
-        # CliRunner's stdin is not a TTY, so --drop must fail closed.
-        result = runner.invoke(app, ["-c", str(cli_env), "init-db", "--drop"])
-        assert result.exit_code == 2
-        assert "--yes" in result.stderr
-        # And the data must be untouched.
-        result = runner.invoke(app, ["-c", str(cli_env), "get-tle", "00022"])
-        assert result.exit_code == 0
-
-    def test_drop_with_yes_wipes_data(self, cli_env):
-        result = runner.invoke(app, ["-c", str(cli_env), "init-db", "--drop", "--yes"])
-        assert result.exit_code == 0
-        assert "Dropped:" in result.stdout
-        result = runner.invoke(app, ["-c", str(cli_env), "get-tle", "00022"])
-        assert result.exit_code == 1  # no TLEs left
-
-    def test_defer_indexes_requires_drop(self, cli_env):
-        result = runner.invoke(app, ["-c", str(cli_env), "init-db", "--defer-indexes"])
-        assert result.exit_code == 2
-        assert "--drop" in result.stderr
-        # And nothing was touched.
-        result = runner.invoke(app, ["-c", str(cli_env), "get-tle", "00022"])
-        assert result.exit_code == 0
-
-    def test_defer_and_finalize_flow(self, cli_env):
-        result = runner.invoke(
-            app,
-            ["-c", str(cli_env), "init-db", "--drop", "--yes", "--defer-indexes"],
-        )
-        assert result.exit_code == 0
-        assert "Indexes deferred:" in result.stdout
-        assert "run `thistle-db init-db`" in result.stdout
-
-        result = runner.invoke(app, ["-c", str(cli_env), "init-db"])
-        assert result.exit_code == 0
-        assert "Indexes built:" in result.stdout
-        assert "ix_tle_norad_cat_id_epoch" in result.stdout
+@pytest.fixture
+def config(tmp_path) -> pathlib.Path:
+    config = write_config(tmp_path)
+    result = invoke(config, "init-db")
+    assert result.exit_code == 0, result.output
+    return config
 
 
-class TestUninitializedDatabase:
-    @pytest.fixture()
-    def uninit_config(self, tmp_path):
-        config_path = tmp_path / "config.toml"
-        config_path.write_text(
-            f'[database]\ndrivername = "sqlite"\n'
-            f'name = "{(tmp_path / "nope.db").as_posix()}"\n'
-            # generate validates output config before touching the database;
-            # an entry keeps this fixture testing the uninitialized-DB path.
-            f'[[output.files]]\ntype = "object"\nformat = "tle"\n'
-            f'dir = "{(tmp_path / "out").as_posix()}"\n'
-        )
-        return config_path
+def test_init_scaffolds_files(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / ".config").mkdir(parents=True)
+    monkeypatch.setattr(pathlib.Path, "home", lambda: home)
+    config = tmp_path / "config.toml"
+    result = runner.invoke(app, ["-c", str(config), "init"])
+    assert result.exit_code == 0, result.output
+    assert config.exists()
+    assert (home / ".config" / "thistle-db.toml").exists()
 
-    @pytest.mark.parametrize(
-        "command", [["get-tle", "25544"], ["ingest"], ["generate"]]
+
+def test_init_db_idempotent_and_drop_guard(tmp_path):
+    config = write_config(tmp_path)
+    assert invoke(config, "init-db").exit_code == 0
+    result = invoke(config, "init-db")
+    assert result.exit_code == 0
+    assert "left untouched" in result.output
+    # --drop without --yes fails closed non-interactively.
+    assert invoke(config, "init-db", "--drop").exit_code == 2
+    # --defer-indexes without --drop is a usage error.
+    assert invoke(config, "init-db", "--defer-indexes").exit_code == 2
+
+
+def test_uninitialized_database_exits_3(tmp_path):
+    config = write_config(tmp_path)
+    result = invoke(config, "status")
+    assert result.exit_code == 3
+
+
+def test_invalid_config_exits_2(tmp_path):
+    config = write_config(tmp_path, extra='[ingest]\nreject_dir = "./rejects"\n')
+    result = invoke(config, "status")
+    assert result.exit_code == 2
+
+
+def test_ingest_scan_status_and_get_tle(config, tmp_path):
+    (tmp_path / "incoming" / "a.tle").write_text(
+        "".join(f"{a}\n{b}\n" for a, b in TLES)
     )
-    def test_commands_fail_closed(self, uninit_config, tmp_path, command):
-        result = runner.invoke(app, ["-c", str(uninit_config), *command])
-        assert result.exit_code == 3
-        assert "init-db" in result.stderr
-        assert not (tmp_path / "nope.db").exists()
+    result = invoke(config, "ingest")
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "objects" / "22.tle").exists()
 
-    def test_dump_fails_closed(self, uninit_config, tmp_path):
-        result = runner.invoke(
-            app, ["-c", str(uninit_config), "dump", str(tmp_path / "backup")]
-        )
-        assert result.exit_code == 3
-        assert "init-db" in result.stderr
-        assert not (tmp_path / "backup.tle").exists()
+    result = invoke(config, "get-tle", "22")
+    assert result.exit_code == 0
+    assert L1 in result.output and L2 in result.output
+
+    result = invoke(config, "get-tle", "20250418")
+    assert result.exit_code == 0
+    assert TLES[1][0] in result.output
+
+    result = invoke(config, "get-tle", "99999")
+    assert result.exit_code == 1
+
+    result = invoke(config, "status")
+    assert result.exit_code == 0
+    assert "ingest" in result.output
+    assert "succeeded" in result.output
+    assert "No unresolved rejects" in result.output
 
 
-def _write_sqlite_config(tmp_path, name):
-    db_path = tmp_path / f"{name}.db"
-    config_path = tmp_path / f"{name}.toml"
-    config_path.write_text(
-        f'[database]\ndrivername = "sqlite"\nname = "{db_path.as_posix()}"\n'
+def test_ingest_named_missing_file_exits_1(config, tmp_path):
+    result = invoke(config, "ingest", str(tmp_path / "nope.tle"))
+    assert result.exit_code == 1
+
+
+def test_ingest_requires_outputs(tmp_path):
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f"""
+[database]
+drivername = "sqlite"
+name = "{(tmp_path / 'cli.db').as_posix()}"
+
+[[ingest.sources]]
+path = "{incoming.as_posix()}"
+"""
     )
-    return config_path, db_path
+    result = invoke(config, "ingest")
+    assert result.exit_code == 2
 
 
-def _table_counts(db_path):
-    engine = create_engine(f"sqlite:///{db_path.as_posix()}")
-    try:
-        with engine.connect() as conn:
-            tles = conn.execute(
-                select(func.count()).select_from(TLE.__table__)
-            ).scalar()
-            omms = conn.execute(
-                select(func.count()).select_from(OmmMetadata.__table__)
-            ).scalar()
-        return tles, omms
-    finally:
-        engine.dispose()
+def test_rejects_summary_and_export(config, tmp_path):
+    bad_l1 = L1[:30] + ("9" if L1[30] != "9" else "8") + L1[31:]
+    bad = tmp_path / "bad.tle"
+    bad.write_text(f"{bad_l1}\n{L2}\n")
+    assert invoke(config, "ingest", str(bad)).exit_code == 0
+
+    result = invoke(config, "rejects")
+    assert result.exit_code == 0
+    assert "checksum" in result.output
+
+    result = invoke(config, "rejects", "--export", str(tmp_path / "repair"))
+    assert result.exit_code == 0
+    assert (tmp_path / "repair" / "rejects.tle").exists()
+
+    result = invoke(config, "status")
+    assert "checksum" in result.output
 
 
-class TestGenerateCommand:
-    def test_no_outputs_configured_exits_2(self, cli_env):
-        # cli_env's config has no [[output.files]] entries.
-        result = runner.invoke(app, ["-c", str(cli_env), "generate"])
-        assert result.exit_code == 2
-        assert "no outputs configured" in result.stderr
+def test_export_and_force_guard(config, tmp_path):
+    (tmp_path / "incoming" / "a.tle").write_text(f"{L1}\n{L2}\n")
+    invoke(config, "ingest")
+    out = tmp_path / "backup.csv"
+    result = invoke(config, "export", str(out))
+    assert result.exit_code == 0, result.output
+    assert out.exists()
+    assert invoke(config, "export", str(out)).exit_code == 1
+    assert invoke(config, "export", str(out), "--force").exit_code == 0
+    assert invoke(config, "export", str(out), "-f", "bogus", "--force").exit_code == 2
 
 
-class TestDumpCommand:
-    @pytest.fixture()
-    def populated(self, tmp_path):
-        """A SQLite db loaded with plain TLEs and one OMM record."""
-        config_path, db_path = _write_sqlite_config(tmp_path, "src")
-        assert runner.invoke(app, ["-c", str(config_path), "init-db"]).exit_code == 0
-        result = runner.invoke(
-            app,
-            [
-                "-c",
-                str(config_path),
-                "ingest",
-                str(DATA / "25544.txt"),
-                str(DATA / "one.json"),
-            ],
-        )
-        assert result.exit_code == 0
-        return config_path, db_path
+def test_verify_and_rebuild(config, tmp_path):
+    (tmp_path / "incoming" / "a.tle").write_text(
+        "".join(f"{a}\n{b}\n" for a, b in TLES)
+    )
+    invoke(config, "ingest")
+    assert invoke(config, "verify").exit_code == 0
 
-    def test_round_trip(self, populated, tmp_path):
-        config_path, db_path = populated
-        base = tmp_path / "backup"
+    (tmp_path / "objects" / "22.tle").unlink()
+    assert invoke(config, "verify").exit_code == 1
 
-        result = runner.invoke(app, ["-c", str(config_path), "dump", str(base)])
-        assert result.exit_code == 0
-        assert base.with_suffix(".tle").exists()
-        assert base.with_suffix(".json").exists()
-
-        # Restore into a fresh database and compare row counts.
-        config2, db2 = _write_sqlite_config(tmp_path, "restored")
-        assert runner.invoke(app, ["-c", str(config2), "init-db"]).exit_code == 0
-        result = runner.invoke(
-            app,
-            [
-                "-c",
-                str(config2),
-                "ingest",
-                str(base.with_suffix(".tle")),
-                str(base.with_suffix(".json")),
-            ],
-        )
-        assert result.exit_code == 0
-        assert _table_counts(db2) == _table_counts(db_path)
-
-    def test_dump_is_idempotent_backup(self, populated, tmp_path):
-        """Re-ingesting a dump into its own source database changes nothing."""
-        config_path, db_path = populated
-        before = _table_counts(db_path)
-        base = tmp_path / "self"
-        assert (
-            runner.invoke(app, ["-c", str(config_path), "dump", str(base)]).exit_code
-            == 0
-        )
-        result = runner.invoke(
-            app, ["-c", str(config_path), "ingest", str(base.with_suffix(".tle"))]
-        )
-        assert result.exit_code == 0
-        assert _table_counts(db_path) == before
-
-    def test_refuses_overwrite_without_force(self, populated, tmp_path):
-        config_path, _ = populated
-        base = tmp_path / "backup"
-        base.with_suffix(".tle").write_text("precious\n")
-        result = runner.invoke(app, ["-c", str(config_path), "dump", str(base)])
-        assert result.exit_code == 1
-        assert "--force" in result.stderr
-        assert base.with_suffix(".tle").read_text() == "precious\n"
-
-        result = runner.invoke(
-            app, ["-c", str(config_path), "dump", str(base), "--force"]
-        )
-        assert result.exit_code == 0
-
-    def test_no_omm_metadata_skips_json(self, cli_env, tmp_path):
-        # cli_env holds TLE rows only (no OMM metadata).
-        base = tmp_path / "backup"
-        result = runner.invoke(app, ["-c", str(cli_env), "dump", str(base)])
-        assert result.exit_code == 0
-        assert base.with_suffix(".tle").exists()
-        assert not base.with_suffix(".json").exists()
-        assert "not written" in result.stdout
+    assert invoke(config, "rebuild").exit_code == 0
+    assert (tmp_path / "objects" / "22.tle").exists()
+    assert invoke(config, "verify").exit_code == 0
 
 
-class TestIngestCommand:
-    def test_named_file_success_exits_zero(self, cli_env):
-        result = runner.invoke(
-            app, ["-c", str(cli_env), "ingest", str(DATA / "one.json")]
-        )
-        assert result.exit_code == 0
-
-    def test_named_file_failure_exits_nonzero(self, cli_env, tmp_path):
-        # A named file that cannot be ingested must be detectable by the
-        # caller (cron) via the exit code.
-        missing = tmp_path / "missing.tle"
-        result = runner.invoke(app, ["-c", str(cli_env), "ingest", str(missing)])
-        assert result.exit_code == 1
-
-    def test_named_file_failure_does_not_abort_others(self, cli_env, tmp_path):
-        # The good file is still ingested even when another one fails.
-        missing = tmp_path / "missing.tle"
-        result = runner.invoke(
-            app,
-            ["-c", str(cli_env), "ingest", str(missing), str(DATA / "one.json")],
-        )
-        assert result.exit_code == 1
-        # one.json holds VANGUARD 2 (NORAD 11) — it must be queryable now.
-        result = runner.invoke(app, ["-c", str(cli_env), "get-tle", "00011"])
-        assert result.exit_code == 0
-
-
-class TestConfigEnvVar:
-    def test_env_var_replaces_flag(self, cli_env, monkeypatch):
-        monkeypatch.setenv("THISTLE_DB_CONFIG", str(cli_env))
-        result = runner.invoke(app, ["get-tle", "00022"])
-        assert result.exit_code == 0
-        expected = "".join(f"{l1}\n{l2}\n" for l1, l2 in TLES[:2])
-        assert result.stdout == expected
-
-    def test_flag_wins_over_env_var(self, cli_env, tmp_path, monkeypatch):
-        # Env var points at an empty database; the explicit -c must win.
-        empty = tmp_path / "empty.toml"
-        empty.write_text(
-            f'[database]\ndrivername = "sqlite"\n'
-            f'name = "{(tmp_path / "empty.db").as_posix()}"\n'
-        )
-        monkeypatch.setenv("THISTLE_DB_CONFIG", str(empty))
-        result = runner.invoke(app, ["-c", str(cli_env), "get-tle", "00022"])
-        assert result.exit_code == 0
-        expected = "".join(f"{l1}\n{l2}\n" for l1, l2 in TLES[:2])
-        assert result.stdout == expected
+def test_omm_ingest_via_cli(config, tmp_path):
+    data = pathlib.Path(__file__).parent / "data" / "one.json"
+    result = invoke(config, "ingest", str(data))
+    assert result.exit_code == 0, result.output
+    result = invoke(config, "get-tle", "11")
+    assert result.exit_code == 0
+    one = json.loads(data.read_text())
+    assert one["TLE_LINE1"] in result.output

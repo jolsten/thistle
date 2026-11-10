@@ -11,7 +11,48 @@ pytest.importorskip(
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+from thistle_db.config import IngestConfig, OutputConfig, OutputFile, Settings
+from thistle_db.ingest import (
+    DeltaEngine,
+    ingest_paths,
+    ingest_sources,
+    readmit_matured_rejects,
+)
 from thistle_db.model import Base
+from thistle_db.record import tle_checksum
+from thistle_db.runs import IngestReport
+
+
+def make_settings(tmp_path, *, outputs=None, **ingest_kw) -> Settings:
+    """Settings with tmp-dir outputs; write_workers=1 keeps tests inline."""
+    if outputs is None:
+        outputs = [
+            OutputFile(type="object", format="tle", dir=str(tmp_path / "objects")),
+            OutputFile(type="date", format="tle", dir=str(tmp_path / "dates")),
+        ]
+    return Settings(
+        ingest=IngestConfig(**ingest_kw),
+        output=OutputConfig(files=outputs, write_workers=1),
+    )
+
+
+def engine_ingest(
+    session, settings, files=None, sources=None, force=False
+) -> IngestReport:
+    """One full engine run (re-admission pass included), like the CLI does."""
+    report = IngestReport()
+    with DeltaEngine(session, settings, report) as engine:
+        readmit_matured_rejects(session, engine)
+        if files:
+            ingest_paths(session, engine, [pathlib.Path(f) for f in files])
+        if sources:
+            ingest_sources(session, engine, sources, force=force)
+    return report
+
+
+def with_checksum(line: str) -> str:
+    """Rewrite column 69 so the line's checksum is valid."""
+    return line[:68] + str(tle_checksum(line))
 
 TLE_FILES = list((pathlib.Path(__file__).parent / "data").glob("*.txt"))
 
