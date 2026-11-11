@@ -226,6 +226,47 @@ def test_unparseable_and_no_norad_rejects(db_session: Session, tmp_path):
     assert "no_norad_id" in {r.reason_code for r in rows}
 
 
+def test_blank_fields_reject_despite_lenient_parser(db_session: Session, tmp_path):
+    """twoline2rv is strtod-lenient: blanked columns parse as 0.0. The
+    structural pre-check must reject them instead of storing inclination
+    0° / mean motion 0."""
+    l1, l2 = TLES[0]
+    blanked = with_checksum(l2[:8] + " " * 8 + l2[16:52] + " " * 11 + l2[63:])
+    bad = tmp_path / "blank.tle"
+    bad.write_text(f"{l1}\n{blanked}\n")
+    report = engine_ingest(db_session, make_settings(tmp_path), files=[bad])
+    assert report.records_rejected == 1
+    assert _tle_count(db_session) == 0
+    reject = db_session.execute(select(Reject)).scalar_one()
+    assert reject.reason_code == "malformed_element"
+    assert "inclination" in reject.reason
+    assert "mean_motion" in reject.reason
+
+
+def test_truncated_line_rejects(db_session: Session, tmp_path):
+    """A line cut short of the mean-motion columns is structurally
+    malformed, even though it is short enough to dodge the checksum gate."""
+    l1, l2 = TLES[0]
+    bad = tmp_path / "truncated.tle"
+    bad.write_text(f"{l1}\n{l2[:44]}\n")
+    report = engine_ingest(db_session, make_settings(tmp_path), files=[bad])
+    assert report.records_rejected == 1
+    reject = db_session.execute(select(Reject)).scalar_one()
+    assert reject.reason_code == "malformed_element"
+    assert "mean_motion" in reject.reason
+
+
+def test_blank_satnum_rejects_as_no_norad(db_session: Session, tmp_path):
+    l1, l2 = TLES[0]
+    blanked = with_checksum("1 " + " " * 5 + l1[7:])
+    bad = tmp_path / "nosatnum.tle"
+    bad.write_text(f"{blanked}\n{l2}\n")
+    report = engine_ingest(db_session, make_settings(tmp_path), files=[bad])
+    assert report.records_rejected == 1
+    reject = db_session.execute(select(Reject)).scalar_one()
+    assert reject.reason_code == "no_norad_id"
+
+
 def test_replay_after_lost_state_converges(db_session: Session, tmp_path):
     """Crash-safety: replaying a file whose state never committed changes
     nothing — every sink absorbs the duplicates."""

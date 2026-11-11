@@ -203,6 +203,13 @@ the database rows):
   argument of pericenter, mean anomaly) → `MalformedRecordError`, and the
   record is rejected. There is no orbit to store, and such a record would
   displace the object's good elset in date outputs.
+- the same mandatory elements, plus epoch and satellite number, are
+  **structurally checked on the verbatim lines before parsing**
+  (`record._check_required_fields`): their fixed column spans must be
+  present and numeric. `twoline2rv` is C `strtod` over fixed columns —
+  blank or truncated fields parse as `0.0`, so without this gate a damaged
+  line "succeeds" and stores a fictitious finite element (inclination 0°,
+  mean motion 0, epoch at the day-number baseline).
 - a record with **no NORAD ID** has no home in a per-object output and is
   rejected.
 - **checksum mismatch** → rejected (`verify_checksums = true`, the default).

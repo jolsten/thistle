@@ -174,6 +174,8 @@ constructors):
 |---|---|---|
 | Text sgp4 cannot parse / OMM record with no epoch | reject | `unparseable` |
 | Non-finite **mandatory** element (eccentricity, inclination, RAAN, arg of pericenter, mean anomaly) | reject — there is no orbit to store, and the row would displace good elsets in date outputs | `malformed_element` |
+| Blank/non-numeric mandatory column span on the verbatim lines (same elements + epoch; `twoline2rv` is strtod-lenient, so a blank or truncated field would otherwise parse as a fictitious finite `0.0`) | reject | `malformed_element` |
+| Blank satellite-number columns on line 1 | reject | `no_norad_id` |
 | Non-finite **nullable** field (bstar, derivatives, derived values) | store with `NULL` — the verbatim lines remain the lossless truth | — |
 | No NORAD catalog number | reject — no home in per-object outputs | `no_norad_id` |
 | TLE checksum mismatch (either line) | reject | `checksum` |

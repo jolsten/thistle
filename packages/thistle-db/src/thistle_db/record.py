@@ -51,11 +51,12 @@ _IMPLICIT_CENTER_NAME = "EARTH"
 
 
 class MalformedRecordError(ValueError):
-    """A record parsed, but cannot be stored.
+    """A record parsed (or would have), but cannot be stored.
 
-    Either a mandatory element is not a finite number (there is no orbit to
-    store) or the record has no NORAD ID (no home in a per-object store).
-    Callers catch this per record so one bad record never costs a file.
+    A mandatory element is not a finite number or its TLE column span is
+    blank/non-numeric (there is no orbit to store), or the record has no
+    NORAD ID (no home in a per-object store). Callers catch this per
+    record so one bad record never costs a file.
     """
 
 
@@ -324,6 +325,45 @@ def _name_from_line0(line0: str) -> Optional[str]:
     return name or None
 
 
+# twoline2rv is lenient by construction — C strtod over fixed columns — so
+# a blank or truncated field parses as 0.0 and a damaged line can "succeed",
+# silently storing a fictitious element (inclination 0°, mean motion 0,
+# epoch at the day-number baseline). Require the identity- and element-
+# bearing columns to be present and numeric before parsing. Spans are
+# Python slices of the 1-indexed TLE column spec.
+_REQUIRED_FIELDS: tuple[tuple[int, int, int, str], ...] = (
+    (1, 18, 32, "epoch"),
+    (2, 8, 16, "inclination"),
+    (2, 17, 25, "ra_of_asc_node"),
+    (2, 26, 33, "eccentricity"),  # digits only — decimal point implied
+    (2, 34, 42, "arg_of_pericenter"),
+    (2, 43, 51, "mean_anomaly"),
+    (2, 52, 63, "mean_motion"),
+)
+
+
+def _finite_text(text: str) -> bool:
+    try:
+        return isfinite(float(text))
+    except ValueError:
+        return False
+
+
+def _check_required_fields(line1: str, line2: str) -> None:
+    if not line1[2:7].strip():
+        raise MalformedRecordError("no NORAD ID (blank satellite number)")
+    bad = []
+    for line_no, start, stop, field in _REQUIRED_FIELDS:
+        text = (line1 if line_no == 1 else line2)[start:stop].strip()
+        ok = text.isdigit() if field == "eccentricity" else _finite_text(text)
+        if not ok:
+            bad.append(field)
+    if bad:
+        raise MalformedRecordError(
+            f"blank or malformed mandatory field(s): {', '.join(bad)}"
+        )
+
+
 def from_tle(*lines: str) -> GPRecord:
     """Build a record from a delivered TLE (2 or 3 lines, verbatim).
 
@@ -338,6 +378,7 @@ def from_tle(*lines: str) -> GPRecord:
     else:
         raise ValueError("Must provide 2 or 3 lines")
 
+    _check_required_fields(line1, line2)
     sat = Satrec.twoline2rv(line1, line2)
     fields = _clean_floats(_elements_from_satrec(sat))
     return GPRecord(
