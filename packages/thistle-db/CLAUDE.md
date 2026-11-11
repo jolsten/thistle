@@ -474,7 +474,9 @@ Commands:
   missing indexes (the finalize step).
 - `ingest [FILES...] [--force]` — everything: validate, store, outputs, run
   accounting. Scans stay tolerant (exit 0; failed files retried next scan);
-  named files exit 1 on any failure so cron wrappers can detect it.
+  named files exit 1 on any failure so cron wrappers can detect it. No
+  `[[output.files]]` configured → store-only, a valid deployment (e.g. the
+  thistle catalog-fallback DB); only `rebuild`/`verify` require outputs.
 - `rebuild` — linear store scan re-deriving all outputs (first run, disaster
   recovery, new output entry).
 - `verify` — count reconciliation of every output against the **store** (the

@@ -121,7 +121,8 @@ def test_ingest_named_missing_file_exits_1(config, tmp_path):
     assert result.exit_code == 1
 
 
-def test_ingest_requires_outputs(tmp_path):
+def test_ingest_without_outputs_is_store_only(tmp_path):
+    """No [[output.files]] is a valid deployment: store + query only."""
     incoming = tmp_path / "incoming"
     incoming.mkdir()
     config = tmp_path / "config.toml"
@@ -135,8 +136,16 @@ name = "{(tmp_path / 'cli.db').as_posix()}"
 path = "{incoming.as_posix()}"
 """
     )
-    result = invoke(config, "ingest")
-    assert result.exit_code == 2
+    assert invoke(config, "init-db").exit_code == 0
+    tle = tmp_path / "a.tle"
+    tle.write_text(f"{L1}\n{L2}\n")
+    result = invoke(config, "ingest", str(tle))
+    assert result.exit_code == 0, result.output
+    assert invoke(config, "get-tle", "22").exit_code == 0
+
+    # The output-centric commands still require outputs.
+    assert invoke(config, "rebuild").exit_code == 2
+    assert invoke(config, "verify").exit_code == 2
 
 
 def test_rejects_summary_and_export(config, tmp_path):

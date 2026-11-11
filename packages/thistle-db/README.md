@@ -102,7 +102,9 @@ thistle-db ingest 20260327.tle gp.json # or ingest specific files
 
 One pass does everything: validate, store, and update every configured
 output. There is no separate generate step — the steady-state cron entry
-is just `thistle-db ingest`.
+is just `thistle-db ingest`. Outputs are optional: with no
+`[[output.files]]` entries, ingest is store-only (useful when the
+database is queried directly, e.g. as `thistle`'s catalog fallback).
 
 File format is auto-detected by extension:
 

@@ -78,9 +78,9 @@ class _Float32(TypeDecorator[float]):
         super().__init__(24)
 
     def column_expression(
-        self, colexpr: ColumnElement[float]
+        self, column: ColumnElement[float]
     ) -> ColumnElement[float]:
-        return cast(colexpr, Double())
+        return cast(column, Double())
 
 
 Float32 = _Float32()

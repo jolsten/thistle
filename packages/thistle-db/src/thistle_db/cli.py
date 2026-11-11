@@ -406,10 +406,10 @@ def ingest(
     One pass does everything — there is no separate generate step. Scans
     are tolerant (exit 0; failed files retried next scan); explicitly
     named files exit 1 on any failure so cron wrappers can detect it.
+    With no [[output.files]] configured, ingest is store-only.
     """
     config = _load_config_or_exit(ctx.obj)
     _setup_logging(config.logging.level, ctx.obj.log_file)
-    _require_outputs(config)
 
     command = f"ingest {len(files)} file(s)" if files else "ingest"
     try:
