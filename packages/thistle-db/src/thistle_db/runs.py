@@ -73,8 +73,13 @@ def run_context(session: Session, command: str) -> Iterator[tuple[IngestRun, Ing
     """Insert the run row (status 'running'), finalize on exit.
 
     On an exception the row finishes 'failed' with the error recorded and
-    the exception propagates. The session is rolled back first so a
-    mid-transaction failure cannot block the bookkeeping write.
+    the exception propagates; an operator interrupt (KeyboardInterrupt /
+    SystemExit) finishes 'cancelled' instead — progress up to the
+    interrupt is already durable, and `status` should not report it as a
+    failure. The session is rolled back first so a mid-transaction
+    failure cannot block the bookkeeping write. Finalization never
+    depends on these handlers for safety — a hard kill just leaves the
+    row 'running', which `status` reports as a crashed run.
     """
     report = IngestReport()
     run = IngestRun(command=command[:255], started=utcnow(), status="running")
@@ -82,6 +87,10 @@ def run_context(session: Session, command: str) -> Iterator[tuple[IngestRun, Ing
     session.commit()
     try:
         yield run, report
+    except (KeyboardInterrupt, SystemExit) as exc:
+        session.rollback()
+        _finalize(session, run, report, status="cancelled", error=repr(exc))
+        raise
     except BaseException as exc:
         session.rollback()
         _finalize(session, run, report, status="failed", error=repr(exc))

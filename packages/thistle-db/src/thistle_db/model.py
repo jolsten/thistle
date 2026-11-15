@@ -1,10 +1,11 @@
-"""SQLAlchemy models — the SQL store (schema v2, single-store architecture).
+"""SQLAlchemy models — the SQL store.
 
-Five tables: ``tle`` (one immutable row per element set), ``omm_metadata``
+Six tables: ``tle`` (one immutable row per element set), ``omm_metadata``
 (sparse enrichment sidecar — the one sanctioned UPDATE), ``ingest_files``
-(source-file state), ``rejects`` (retained invalid input) and
-``ingest_runs`` (run accounting). See PLAN.md §5 for the normative schema
-and its conventions.
+(source-file state), ``rejects`` (retained invalid input),
+``ingest_runs`` (run accounting) and ``output_cursor`` (how far each
+output has caught up to the store). See CLAUDE.md ("The store") for the
+normative schema conventions.
 """
 
 import datetime
@@ -131,7 +132,7 @@ class TLE(Base, Mixin):
 
     __tablename__ = "tle"
 
-    # Index budget (3 B-trees total — exhaustive, see PLAN.md §5.1):
+    # Index budget (3 B-trees total — exhaustive, see CLAUDE.md "The store"):
     #   PK(id)                          — clustered
     #   UNIQUE(epoch, record_hash)      — dedup, probed on every insert.
     #     Epoch-first: normal ingest only carries recent elsets, so probes
@@ -276,7 +277,8 @@ class Reject(Base):
     (`resolved_at` carries the lifecycle), and the table is bounded by
     what is broken, not by time (re-rejection upserts `last_seen` /
     `times_seen`). Validity is table membership: this table and `tle`
-    together are "all input rows". See PLAN.md §4/§5.3.
+    together are "all input rows". See CLAUDE.md ("Validation and the
+    rejects table").
     """
 
     __tablename__ = "rejects"
@@ -309,6 +311,30 @@ class Reject(Base):
     reconciliation in `verify`)."""
 
 
+class OutputCursor(Base, Mixin):
+    """How far one ``[[output.files]]`` entry has caught up to the store.
+
+    ``last_tle_id`` means: every ``tle`` row with ``id <= last_tle_id`` is
+    reflected in this output. ``update-outputs`` re-renders the files
+    dirtied by rows past the cursor and advances it only after every dirty
+    file is rendered; ``rebuild`` initializes/resets it to the store's max
+    id. Keyed by the entry's ``output_key`` (``type:format:dir``), so a
+    new or renamed entry starts cursorless and must be rebuilt first.
+    Index budget: PK + UNIQUE(key_hash). Single-writer ingest serializes
+    all access, so plain select-then-write suffices (no dialect upsert).
+    """
+
+    __tablename__ = "output_cursor"
+
+    output_key: Mapped[str] = mapped_column(String(1024))
+    """The entry's output_key string (for humans; not the unique key)."""
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    """sha256 of `output_key` — bounded unique key (keys embed paths)."""
+    last_tle_id: Mapped[int] = mapped_column(BigInteger)
+    """Highest tle.id reflected in this output's files."""
+    updated: Mapped[datetime.datetime] = mapped_column(default=utcnow)
+
+
 class IngestRun(Base):
     """One row per run — written at start, finalized at completion.
 
@@ -324,7 +350,7 @@ class IngestRun(Base):
     started: Mapped[datetime.datetime] = mapped_column(default=utcnow)
     finished: Mapped[Optional[datetime.datetime]]
     status: Mapped[str] = mapped_column(String(10), default="running")
-    """'running' | 'succeeded' | 'failed'"""
+    """'running' | 'succeeded' | 'failed' | 'cancelled'"""
 
     files_scanned: Mapped[int] = mapped_column(Integer, default=0)
     files_ingested: Mapped[int] = mapped_column(Integer, default=0)

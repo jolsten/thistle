@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from .conftest import TLES, engine_ingest, make_settings
 from thistle_db.model import Reject
+from thistle_db.outputs import rebuild_outputs
 from thistle_db.verify import stamp_resolved_rejects, verify_outputs
 
 L1, L2 = TLES[0]
@@ -17,6 +18,7 @@ def _ingested(db_session, tmp_path):
     path = tmp_path / "in.tle"
     path.write_text("".join(f"{a}\n{b}\n" for a, b in TLES))
     engine_ingest(db_session, settings, files=[path])
+    rebuild_outputs(db_session, settings.output)
     return settings
 
 

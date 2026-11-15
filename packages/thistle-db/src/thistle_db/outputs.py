@@ -1,27 +1,32 @@
-"""Output maintenance — the second sink of the delta flush, plus rebuild.
+"""Output rendering — cursor-scoped updates and full rebuilds, one write path.
 
 Outputs are lossy projections of the store (TLE text has no metadata; the
-STK CSV has no provenance), always rebuildable (`rebuild`), never the
-reverse. A damaged output is an inconvenience, not data loss — the
-incremental machinery here (tail-epoch append guard, merge-dedup rewrite,
-date upsert, atomic tmp+rename) is an efficiency layer on top of that
-guarantee, and every path is idempotent against replay of the same delta.
+STK CSV has no provenance), always rebuildable, never the reverse. They
+are not written during ingest: ``update_outputs`` runs afterwards
+(``thistle-db update-outputs``, or ``ingest --update-outputs``) and
+``rebuild_outputs`` re-derives everything.
 
-Per flush, each ``[[output.files]]`` entry consumes the *validated,
-pre-dedup* delta (grouped by object) — outputs never ask the store which
-rows were new:
+**One write path.** A file is always rendered *whole* from the store and
+replaced atomically (sibling ``.tmp`` + ``os.replace``) — there are no
+appends, no merges with on-disk content, and therefore no torn tails and
+no half-written files at any kill point. Every file either path touches
+is byte-identical to what a full rebuild would produce, so touching is
+healing. Stray ``.tmp`` files from a killed render are swept at the start
+of the next run (safe under the writer lock).
 
-- **object** files: append when every buffered epoch for the object is
-  strictly newer than the file's tail; anything else (late delivery, tie,
-  re-delivery, torn tail) merges: read, dedup, stable-sort by epoch with
-  existing records before new, rewrite atomically.
-- **date** files: upsert the delta's winners ("latest per object that
-  day" can only change when a newer-epoch record for that (object, date)
-  arrives); replace on ``epoch >=`` so newest-ingested wins ties.
+**Scoping.** Each ``[[output.files]]`` entry records the highest
+``tle.id`` it reflects (``output_cursor``). ``update_outputs`` takes one
+PK-range scan over the rows past the cursor to find the dirty object ids
+and dirty epoch dates, re-renders only those files, and advances every
+cursor — only after *all* dirty files rendered, so a cancelled run
+re-renders the same dirty set next time, idempotently. ``rebuild``
+initializes/resets the cursors; a new or renamed entry has none and must
+be rebuilt first.
 
-TLE outputs are verbatim passthrough: line-less records are always
-skipped and counted (one WARNING per run, emitted by the engine) — a TLE
-output never contains a byte thistle synthesized.
+Enrichment caveat: an UPDATE of ``omm_metadata`` creates no new ``tle``
+row, so a redelivery with identical lines but richer metadata dirties
+nothing — the refresh lands when that object/day next dirties, or at the
+next rebuild.
 
 All filesystem work runs on the write pool; each task owns a distinct
 path and receives plain data. Sessions and queries stay on the calling
@@ -31,39 +36,61 @@ thread.
 import csv
 import dataclasses
 import datetime
+import hashlib
 import io
 import os
 import pathlib
 import struct
 from typing import Iterable, Optional, Sequence
 
+from loguru import logger
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from thistle_db.config import MAX_SATNUM, OutputConfig, OutputFile
-from thistle_db.model import OmmMetadata, TLE, record_from_row
-from thistle_db.reader import OMM_CSV_FIELDS
-from thistle_db.record import (
-    GPRecord,
-    STORE_COLUMNS,
-    epoch_from_lines,
-    to_csv_dict,
-    to_omm_dict,
+from thistle_db.model import (
+    OmmMetadata,
+    OutputCursor,
+    TLE,
+    date_from_sql,
+    record_from_row,
+    utcnow,
 )
-from thistle_db.runs import IngestReport
+from thistle_db.progress import NO_PROGRESS
+from thistle_db.reader import OMM_CSV_FIELDS
+from thistle_db.record import GPRecord, STORE_COLUMNS, to_csv_dict, to_omm_dict
 from thistle_db.writer import WritePool
 
-__all__ = ["OutputApplier", "rebuild_outputs", "output_key"]
+__all__ = [
+    "MissingCursorError",
+    "OutputRun",
+    "output_key",
+    "output_lag",
+    "rebuild_outputs",
+    "update_outputs",
+]
 
-# How much of a file's tail to read when probing the last record. A TLE
-# pair is ~142 bytes and a store-CSV row ~600; 8 KB comfortably holds the
-# last record of either, and a probe that finds nothing parseable simply
-# falls back to the merge path (which reads the whole file and heals it).
-_TAIL_PROBE_BYTES = 8192
+
+class MissingCursorError(RuntimeError):
+    """An output entry has no cursor row — `rebuild` initializes them.
+
+    Raised by ``update_outputs``: an entry without a cursor has never been
+    rendered (new, or renamed — the key embeds the directory), and its
+    catch-up set is the whole store, which is exactly what ``rebuild``
+    does with better streaming (and it sets the cursor when done).
+    """
+
+    def __init__(self, keys: Sequence[str]):
+        self.keys = list(keys)
+        super().__init__(
+            "no output cursor for: "
+            + ", ".join(self.keys)
+            + " — run `thistle-db rebuild` to initialize new or renamed outputs"
+        )
 
 
 def output_key(entry: OutputFile) -> str:
-    """Stable identifier for an output entry in reports/logs."""
+    """Stable identifier for an output entry in reports/logs/cursors."""
     return f"{entry.type}:{entry.format}:{entry.dir}"
 
 
@@ -72,8 +99,8 @@ def _fieldnames(entry: OutputFile) -> list[str]:
 
 
 # Element fields stored as single precision (model.Float32). CSV outputs
-# render at *stored* precision so an incremental write and a later rebuild
-# (which reads the rounded columns back) produce byte-identical files.
+# render at *stored* precision so every render of the same store rows is
+# byte-identical, whichever command produced it.
 _F32_FIELDS = (
     "eccentricity",
     "inclination",
@@ -106,13 +133,6 @@ def _row_for(entry: OutputFile, record: GPRecord) -> dict:
     return to_csv_dict(record) if entry.columns == "full" else to_omm_dict(record)
 
 
-def _parse_iso(text: str) -> Optional[datetime.datetime]:
-    try:
-        return datetime.datetime.fromisoformat(text)
-    except ValueError:
-        return None
-
-
 def _atomic_write(path: pathlib.Path, text: str) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text, encoding="utf-8", newline="")
@@ -133,12 +153,11 @@ def _render_tle(pairs: Iterable[tuple[str, str]]) -> str:
     return "".join(f"{line1}\n{line2}\n" for line1, line2 in pairs)
 
 
-# --- existing-file readers ---------------------------------------------------
+# --- output-file readers (verify's counting half) -----------------------------
 
 
-def _read_tle_pairs(path: pathlib.Path) -> list[tuple[str, str]]:
-    """All (line1, line2) pairs in an output file. A torn tail (crash mid
-    append) simply yields no pair for the torn record — healed on rewrite."""
+def read_tle_pairs(path: pathlib.Path) -> list[tuple[str, str]]:
+    """All (line1, line2) pairs in an output file."""
     pairs: list[tuple[str, str]] = []
     line1: Optional[str] = None
     with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -152,375 +171,182 @@ def _read_tle_pairs(path: pathlib.Path) -> list[tuple[str, str]]:
     return pairs
 
 
-def _read_csv_rows(path: pathlib.Path) -> list[dict]:
+def read_csv_rows(path: pathlib.Path) -> list[dict]:
     with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
         return [dict(row) for row in csv.DictReader(f)]
 
 
-def _tail_epoch_tle(path: pathlib.Path) -> Optional[datetime.datetime]:
-    """Exact epoch of the file's last complete record, or None (merge)."""
-    try:
-        size = path.stat().st_size
-        with open(path, "rb") as f:
-            f.seek(max(0, size - _TAIL_PROBE_BYTES))
-            tail = f.read().decode("utf-8", errors="replace")
-    except OSError:
-        return None
-    lines = [ln.rstrip("\r") for ln in tail.split("\n") if ln.strip()]
-    for i in range(len(lines) - 1, 0, -1):
-        if lines[i].startswith("2 ") and lines[i - 1].startswith("1 "):
-            try:
-                return epoch_from_lines(lines[i - 1], lines[i])
-            except Exception:
-                return None
-    return None
+# --- cursors -------------------------------------------------------------------
 
 
-def _tail_epoch_csv(path: pathlib.Path, entry: OutputFile) -> Optional[datetime.datetime]:
-    """Epoch of the last complete CSV row, parsed from a comma split that
-    only touches comma-free fields (hash/ids before EPOCH in full columns;
-    the trailing numeric fields in the STK projection). Any doubt returns
-    None — the merge path is always safe."""
-    try:
-        size = path.stat().st_size
-        with open(path, "rb") as f:
-            f.seek(max(0, size - _TAIL_PROBE_BYTES))
-            tail = f.read().decode("utf-8", errors="replace")
-    except OSError:
-        return None
-    lines = [ln for ln in tail.split("\n") if ln.strip()]
-    if len(lines) < 1:
-        return None
-    last = lines[-1]
-    parts = last.split(",")
-    try:
-        if entry.columns == "full":
-            # RECORD_HASH, NORAD_CAT_ID, OBJECT_ID, EPOCH, ... — nothing
-            # before EPOCH can contain a comma.
-            return _parse_iso(parts[3])
-        # STK: OBJECT_NAME may contain commas, but the 15 fields from EPOCH
-        # to the end (numbers, one letter, an ISO date) cannot — count from
-        # the end.
-        return _parse_iso(parts[-15])
-    except IndexError:
-        return None
+def _key_hash(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
-def _norad_from_line1(line1: str) -> Optional[int]:
-    try:
-        from sgp4.alpha5 import from_alpha5
-
-        return from_alpha5(line1[2:7].replace(" ", "0"))
-    except Exception:
-        return None
-
-
-# --- the applier --------------------------------------------------------------
-
-
-class OutputApplier:
-    """Applies validated deltas to every configured output."""
-
-    def __init__(
-        self,
-        outputs: list[OutputFile],
-        pool: WritePool,
-        report: IngestReport,
-    ):
-        self.outputs = outputs
-        self.pool = pool
-        self.report = report
-        self.alpha5_overflow: set[int] = set()
-        for entry in outputs:
-            pathlib.Path(entry.dir).mkdir(parents=True, exist_ok=True)
-
-    def apply(self, delta: dict[int, list[GPRecord]]) -> None:
-        """Hand the flush's delta to every output entry.
-
-        `delta` maps norad_cat_id -> records, already deduplicated by
-        record_hash, in ingest order.
-        """
-        if not delta:
-            return
-        for entry in self.outputs:
-            if entry.type == "object":
-                self._apply_object(entry, delta)
-            else:
-                self._apply_date(entry, delta)
-
-    # -- object outputs ---------------------------------------------------
-
-    def _apply_object(self, entry: OutputFile, delta: dict[int, list[GPRecord]]) -> None:
-        key = output_key(entry)
-        tasks = []
-        for norad, records in delta.items():
-            if entry.object_id == "alpha5" and norad > MAX_SATNUM:
-                self.alpha5_overflow.add(norad)
-            path = entry.object_path(norad)
-            tasks.append((path, records))
-
-        def task(item: tuple[pathlib.Path, list[GPRecord]]) -> tuple[int, int]:
-            path, records = item
-            return _apply_object_file(entry, path, records)
-
-        written = 0
-        for wrote, lineless in self.pool.map(task, tasks):
-            written += wrote
-            self.report.lineless_skipped += lineless
-        self.report.output_writes[key] = (
-            self.report.output_writes.get(key, 0) + written
-        )
-
-    # -- date outputs -------------------------------------------------------
-
-    def _apply_date(self, entry: OutputFile, delta: dict[int, list[GPRecord]]) -> None:
-        key = output_key(entry)
-        # Winners per (date, object) within this delta; later records win
-        # ties (newest-ingested, matching the on-disk replace rule).
-        winners: dict[datetime.date, dict[int, GPRecord]] = {}
-        for norad, records in delta.items():
-            for record in records:
-                day = record.epoch.date()
-                best = winners.setdefault(day, {}).get(norad)
-                if best is None or record.epoch >= best.epoch:
-                    winners[day][norad] = record
-
-        items = [
-            (entry.date_path(day), day_winners)
-            for day, day_winners in sorted(winners.items())
-        ]
-
-        def task(item: tuple[pathlib.Path, dict[int, GPRecord]]) -> tuple[int, int]:
-            path, day_winners = item
-            return _apply_date_file(entry, path, day_winners)
-
-        written = 0
-        for wrote, lineless in self.pool.map(task, items):
-            written += wrote
-            self.report.lineless_skipped += lineless
-        self.report.output_writes[key] = (
-            self.report.output_writes.get(key, 0) + written
-        )
+def load_cursors(
+    session: Session, entries: Sequence[OutputFile]
+) -> dict[str, Optional[int]]:
+    """Each entry's last_tle_id, keyed by output_key; None = no cursor yet."""
+    keys = {output_key(entry): _key_hash(output_key(entry)) for entry in entries}
+    rows = session.execute(
+        select(OutputCursor).where(OutputCursor.key_hash.in_(list(keys.values())))
+    ).scalars()
+    by_hash = {row.key_hash: row.last_tle_id for row in rows}
+    return {key: by_hash.get(digest) for key, digest in keys.items()}
 
 
-# --- object-file application (pure filesystem; runs on the pool) -------------
-
-
-def _apply_object_file(
-    entry: OutputFile, path: pathlib.Path, records: list[GPRecord]
-) -> tuple[int, int]:
-    """Returns (files_written, lineless_skipped)."""
-    records = sorted(records, key=lambda r: r.epoch)
-    if entry.format == "tle":
-        lineless = sum(1 for r in records if not (r.tle_line1 and r.tle_line2))
-        usable = [r for r in records if r.tle_line1 and r.tle_line2]
-        if not usable:
-            return (0, lineless)
-        if not path.exists():
-            _atomic_write(
-                path, _render_tle((r.tle_line1, r.tle_line2) for r in usable)  # type: ignore[arg-type]
-            )
-            return (1, lineless)
-        tail = _tail_epoch_tle(path)
-        if tail is not None and usable[0].epoch > tail:
-            with open(path, "a", encoding="utf-8", newline="") as f:
-                f.write(_render_tle((r.tle_line1, r.tle_line2) for r in usable))  # type: ignore[arg-type]
-            return (1, lineless)
-        _merge_object_tle(path, usable)
-        return (1, lineless)
-
-    # omm-csv
-    rows = [(r.epoch, r.record_hash, _row_for(entry, r)) for r in records]
-    if not path.exists():
-        _atomic_write(
-            path, _render_csv(_fieldnames(entry), [row for _, _, row in rows])
-        )
-        return (1, 0)
-    tail = _tail_epoch_csv(path, entry)
-    if tail is not None and rows[0][0] > tail:
-        text = _render_csv(_fieldnames(entry), [row for _, _, row in rows])
-        body = text.split("\n", 1)[1]  # drop the header for the append
-        with open(path, "a", encoding="utf-8", newline="") as f:
-            f.write(body)
-        return (1, 0)
-    _merge_object_csv(entry, path, rows)
-    return (1, 0)
-
-
-def _merge_object_tle(path: pathlib.Path, records: list[GPRecord]) -> None:
-    """Merge-rewrite: dedup on the exact line text, stable epoch order with
-    existing records before new, tmp + atomic rename."""
-    existing = _read_tle_pairs(path)
-    seen = set(existing)
-    merged: list[tuple[datetime.datetime, int, tuple[str, str]]] = []
-    for order, (line1, line2) in enumerate(existing):
-        try:
-            epoch = epoch_from_lines(line1, line2)
-        except Exception:
-            continue  # torn/corrupt record: dropped, healed by this rewrite
-        merged.append((epoch, order, (line1, line2)))
-    base = len(merged)
-    for i, record in enumerate(records):
-        pair = (record.tle_line1, record.tle_line2)
-        if pair in seen:
-            continue
-        seen.add(pair)  # type: ignore[arg-type]
-        merged.append((record.epoch, base + i, pair))  # type: ignore[arg-type]
-    merged.sort(key=lambda item: (item[0], item[1]))
-    _atomic_write(path, _render_tle(pair for _, _, pair in merged))
-
-
-def _merge_object_csv(
-    entry: OutputFile,
-    path: pathlib.Path,
-    rows: list[tuple[datetime.datetime, str, dict]],
+def set_cursors(
+    session: Session, entries: Sequence[OutputFile], target: int
 ) -> None:
-    """Merge-rewrite for CSV object files. Dedup: RECORD_HASH for full
-    columns; the entire rendered row for the STK projection (it carries no
-    hash). An enrichment that changes a projected field can therefore
-    leave both renderings of one record in an STK object file until the
-    next `rebuild` — accepted; rebuild is the heal-all."""
-    fieldnames = _fieldnames(entry)
-    existing = _read_csv_rows(path)
-    merged: list[tuple[datetime.datetime, int, dict]] = []
-    seen_keys: set[object]
-    if entry.columns == "full":
-        seen_keys = {row.get("RECORD_HASH", "") for row in existing}
-    else:
-        seen_keys = {
-            tuple(row.get(f, "") for f in fieldnames) for row in existing
-        }
-    for order, row in enumerate(existing):
-        epoch = _parse_iso(row.get("EPOCH", "") or "")
-        if epoch is None:
-            continue  # torn tail row: dropped, healed by this rewrite
-        merged.append((epoch, order, row))
-    base = len(merged)
-    for i, (epoch, hash_hex, row) in enumerate(rows):
-        key = (
-            hash_hex
-            if entry.columns == "full"
-            else tuple(row.get(f, "") for f in fieldnames)
-        )
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-        merged.append((epoch, base + i, row))
-    merged.sort(key=lambda item: (item[0], item[1]))
-    _atomic_write(path, _render_csv(fieldnames, (row for _, _, row in merged)))
+    """Upsert every entry's cursor to `target` and commit.
 
-
-# --- date-file application (pure filesystem; runs on the pool) ---------------
-
-
-def _apply_date_file(
-    entry: OutputFile, path: pathlib.Path, winners: dict[int, GPRecord]
-) -> tuple[int, int]:
-    """Upsert the delta's winners into one date file.
-
-    Replace on ``epoch >=`` so newest-ingested wins ties. Returns
-    (files_written, lineless_skipped).
+    Plain select-then-write: the single-writer lock serializes all access,
+    so no dialect upsert is needed (same pattern as ingest_files).
     """
-    lineless = 0
-    if entry.format == "tle":
-        current: dict[int, tuple[datetime.datetime, tuple[str, str]]] = {}
-        if path.exists():
-            for line1, line2 in _read_tle_pairs(path):
-                norad = _norad_from_line1(line1)
-                if norad is None:
-                    continue
-                try:
-                    epoch = epoch_from_lines(line1, line2)
-                except Exception:
-                    continue
-                best = current.get(norad)
-                if best is None or epoch >= best[0]:
-                    current[norad] = (epoch, (line1, line2))
-        changed = not path.exists()
-        for norad, record in winners.items():
-            if not (record.tle_line1 and record.tle_line2):
-                lineless += 1
-                continue
-            best = current.get(norad)
-            if best is None or record.epoch >= best[0]:
-                pair = (record.tle_line1, record.tle_line2)
-                if best is None or best[1] != pair:
-                    current[norad] = (record.epoch, pair)
-                    changed = True
-        if not changed:
-            return (0, lineless)
-        _atomic_write(
-            path,
-            _render_tle(current[n][1] for n in sorted(current)),
-        )
-        return (1, lineless)
+    now = utcnow()
+    for entry in entries:
+        key = output_key(entry)
+        digest = _key_hash(key)
+        row = session.execute(
+            select(OutputCursor).where(OutputCursor.key_hash == digest)
+        ).scalar_one_or_none()
+        if row is None:
+            session.add(
+                OutputCursor(
+                    output_key=key, key_hash=digest, last_tle_id=target, updated=now
+                )
+            )
+        else:
+            row.last_tle_id = target
+            row.updated = now
+    session.commit()
 
-    # omm-csv
-    fieldnames = _fieldnames(entry)
-    current_rows: dict[int, tuple[datetime.datetime, dict]] = {}
-    if path.exists():
-        for row in _read_csv_rows(path):
+
+def output_lag(
+    session: Session, entries: Sequence[OutputFile]
+) -> tuple[int, list[str]]:
+    """(store ids past the slowest cursor, entries with no cursor).
+
+    For `status`. The id count is an upper bound on pending rows (dialect
+    insert-ignore burns ids on skipped duplicates).
+    """
+    cursors = load_cursors(session, entries)
+    missing = sorted(key for key, value in cursors.items() if value is None)
+    present = [value for value in cursors.values() if value is not None]
+    if not present:
+        return 0, missing
+    max_id = session.execute(select(func.max(TLE.id))).scalar_one() or 0
+    return max(0, max_id - min(present)), missing
+
+
+def _sweep_tmp_files(entries: Sequence[OutputFile]) -> None:
+    """Delete stray *.tmp files left by a killed render.
+
+    Safe under the writer lock — no render is in flight. The worst a kill
+    can leave behind is a complete old-or-new file plus one of these.
+    """
+    for directory in {pathlib.Path(entry.dir) for entry in entries}:
+        if not directory.is_dir():
+            continue
+        for tmp in directory.glob("*.tmp"):
             try:
-                norad = int(str(row.get("NORAD_CAT_ID", "")).strip())
-            except ValueError:
-                continue
-            epoch = _parse_iso(row.get("EPOCH", "") or "")
-            if epoch is None:
-                continue
-            best = current_rows.get(norad)
-            if best is None or epoch >= best[0]:
-                current_rows[norad] = (epoch, row)
-    changed = not path.exists()
-    for norad, record in winners.items():
-        best = current_rows.get(norad)
-        if best is None or record.epoch >= best[0]:
-            row = _row_for(entry, record)
-            if best is None or best[1] != row:
-                current_rows[norad] = (record.epoch, row)
-                changed = True
-    if not changed:
-        return (0, 0)
-    _atomic_write(
-        path,
-        _render_csv(fieldnames, (current_rows[n][1] for n in sorted(current_rows))),
-    )
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+# --- rendering (pure filesystem; runs on the pool) ----------------------------
+
+
+def _render_object_file(
+    entry: OutputFile, norad: int, records: list[GPRecord]
+) -> tuple[int, int]:
+    """Render one object's whole file from its store records.
+
+    Returns (files_written, lineless_skipped). Records arrive in
+    (epoch, id) order from the query. TLE outputs are verbatim
+    passthrough: line-less records are skipped and counted.
+    """
+    path = entry.object_path(norad)
+    if entry.format == "tle":
+        pairs = [
+            (r.tle_line1, r.tle_line2)
+            for r in records
+            if r.tle_line1 and r.tle_line2
+        ]
+        lineless = len(records) - len(pairs)
+        if not pairs:
+            return (0, lineless)
+        _atomic_write(path, _render_tle(pairs))  # type: ignore[arg-type]
+        return (1, lineless)
+    rows = [_row_for(entry, r) for r in records]
+    _atomic_write(path, _render_csv(_fieldnames(entry), rows))
     return (1, 0)
 
 
-# --- rebuild -------------------------------------------------------------------
+def _render_date_file(
+    entry: OutputFile, day: datetime.date, records: list[GPRecord]
+) -> tuple[int, int]:
+    """Render one date's whole file (the day's winner per object).
 
-# Objects per pool batch during rebuild: bounds the rows materialized at
-# once while keeping the write pool busy.
-_REBUILD_CHUNK_OBJECTS = 200
+    Returns (files_written, lineless_skipped)."""
+    path = entry.date_path(day)
+    ordered = sorted(records, key=lambda r: r.norad_cat_id)
+    if entry.format == "tle":
+        pairs = [
+            (r.tle_line1, r.tle_line2)
+            for r in ordered
+            if r.tle_line1 and r.tle_line2
+        ]
+        lineless = len(ordered) - len(pairs)
+        if not pairs:
+            return (0, lineless)
+        _atomic_write(path, _render_tle(pairs))  # type: ignore[arg-type]
+        return (1, lineless)
+    rows = [_row_for(entry, r) for r in ordered]
+    _atomic_write(path, _render_csv(_fieldnames(entry), rows))
+    return (1, 0)
 
 
-def rebuild_outputs(
-    session: Session,
-    output: OutputConfig,
-    *,
-    progress=None,
-) -> dict[str, int]:
-    """Re-derive every output from a linear store scan.
+# --- the render core -----------------------------------------------------------
 
-    First run, disaster recovery, or a new output entry. Object outputs
-    stream grouped by object; date outputs stream the per-(date, object)
-    winners via a window function. Returns files written per output key.
-    """
-    from thistle_db.progress import NO_PROGRESS
+# Objects per pool batch: bounds the rows materialized at once while
+# keeping the write pool busy.
+_CHUNK_OBJECTS = 200
 
-    progress = progress or NO_PROGRESS
-    written: dict[str, int] = {}
-    object_entries = [e for e in output.files if e.type == "object"]
-    date_entries = [e for e in output.files if e.type == "date"]
-    for entry in output.files:
-        pathlib.Path(entry.dir).mkdir(parents=True, exist_ok=True)
 
-    with WritePool(output.write_workers) as pool:
-        if object_entries:
-            _rebuild_objects(session, object_entries, pool, written, progress)
-        if date_entries:
-            _rebuild_dates(session, date_entries, pool, written, progress)
-    return written
+@dataclasses.dataclass
+class _RenderStats:
+    written: dict[str, int] = dataclasses.field(default_factory=dict)
+    lineless_skipped: int = 0
+    alpha5_overflow: set[int] = dataclasses.field(default_factory=set)
+
+
+def _flush_object_batch(
+    entries: Sequence[OutputFile],
+    batch: dict[int, list[GPRecord]],
+    pool: WritePool,
+    stats: _RenderStats,
+    progress,
+    task,
+) -> None:
+    if not batch:
+        return
+    for entry in entries:
+        key = output_key(entry)
+        if entry.object_id == "alpha5":
+            stats.alpha5_overflow.update(n for n in batch if n > MAX_SATNUM)
+
+        def write_one(
+            item: tuple[int, list[GPRecord]], entry: OutputFile = entry
+        ) -> tuple[int, int]:
+            norad, records = item
+            return _render_object_file(entry, norad, records)
+
+        results = pool.map(write_one, list(batch.items()))
+        stats.written[key] = stats.written.get(key, 0) + sum(w for w, _ in results)
+        stats.lineless_skipped += sum(skipped for _, skipped in results)
+        progress.advance(task, len(batch))
 
 
 def _iter_records(rows) -> Iterable[tuple[int, GPRecord]]:
@@ -528,7 +354,8 @@ def _iter_records(rows) -> Iterable[tuple[int, GPRecord]]:
         yield tle.norad_cat_id, record_from_row(tle, metadata)
 
 
-def _rebuild_objects(session, entries, pool, written, progress) -> None:
+def _render_objects_full(session, entries, pool, stats, progress) -> None:
+    """Every object, from one linear store scan (rebuild)."""
     count = session.execute(
         select(func.count(func.distinct(TLE.norad_cat_id)))
     ).scalar_one()
@@ -542,55 +369,56 @@ def _rebuild_objects(session, entries, pool, written, progress) -> None:
     )
 
     batch: dict[int, list[GPRecord]] = {}
-
-    def flush_batch() -> None:
-        nonlocal batch
-        if not batch:
-            return
-        for entry in entries:
-            key = output_key(entry)
-
-            def write_one(item: tuple[int, list[GPRecord]]) -> int:
-                norad, records = item
-                return _rebuild_object_file(entry, norad, records)
-
-            results = pool.map(write_one, list(batch.items()))
-            written[key] = written.get(key, 0) + sum(results)
-            progress.advance(task, len(batch))
-        batch = {}
-
     current_norad: Optional[int] = None
     for norad, record in _iter_records(session.execute(stmt)):
-        if norad != current_norad and len(batch) >= _REBUILD_CHUNK_OBJECTS:
-            flush_batch()
+        if norad != current_norad and len(batch) >= _CHUNK_OBJECTS:
+            _flush_object_batch(entries, batch, pool, stats, progress, task)
+            batch = {}
         current_norad = norad
         batch.setdefault(norad, []).append(record)
-    flush_batch()
+    _flush_object_batch(entries, batch, pool, stats, progress, task)
     progress.finish(task)
 
 
-def _rebuild_object_file(
-    entry: OutputFile, norad: int, records: list[GPRecord]
-) -> int:
-    path = entry.object_path(norad)
-    if entry.format == "tle":
-        pairs = [
-            (r.tle_line1, r.tle_line2)
-            for r in records
-            if r.tle_line1 and r.tle_line2
-        ]
-        if not pairs:
-            return 0
-        _atomic_write(path, _render_tle(pairs))  # type: ignore[arg-type]
-        return 1
-    rows = [_row_for(entry, r) for r in records]
-    _atomic_write(path, _render_csv(_fieldnames(entry), rows))
-    return 1
+def _render_objects_scoped(
+    session, entries, pool, stats, progress, norads: list[int]
+) -> None:
+    """Only the dirty objects, each rendered from its full history."""
+    task = progress.task(
+        "Updating object files", total=len(norads) * len(entries)
+    )
+    for i in range(0, len(norads), _CHUNK_OBJECTS):
+        chunk = norads[i : i + _CHUNK_OBJECTS]
+        stmt = (
+            select(TLE, OmmMetadata)
+            .outerjoin(OmmMetadata, OmmMetadata.tle_id == TLE.id)
+            .where(TLE.norad_cat_id.in_(chunk))
+            .order_by(TLE.norad_cat_id, TLE.epoch, TLE.id)
+            .execution_options(yield_per=5000)
+        )
+        batch: dict[int, list[GPRecord]] = {}
+        for norad, record in _iter_records(session.execute(stmt)):
+            batch.setdefault(norad, []).append(record)
+        _flush_object_batch(entries, batch, pool, stats, progress, task)
+    progress.finish(task)
 
 
-def _rebuild_dates(session, entries, pool, written, progress) -> None:
-    # Per-(epoch date, object) winners in SQL: one candidate row each, so
-    # memory stays O(one date) regardless of history depth.
+def _render_dates(
+    session,
+    entries,
+    stats: _RenderStats,
+    progress,
+    *,
+    days: Optional[list[datetime.date]] = None,
+) -> None:
+    """Date files from per-(date, object) winners computed in SQL.
+
+    ``days=None`` renders every date (rebuild); otherwise only the given
+    dirty days. Scoping filters by an epoch range covering the dirty days
+    — the UNIQUE(epoch, record_hash) index is epoch-first, so this is a
+    range scan — plus an exact day check in the loop (gap days inside the
+    hull cost their rows' window computation, nothing else).
+    """
     date_expr = func.date(TLE.epoch).label("epoch_date")
     rn = (
         func.row_number()
@@ -600,7 +428,14 @@ def _rebuild_dates(session, entries, pool, written, progress) -> None:
         )
         .label("rn")
     )
-    winners = select(TLE.id.label("tle_id"), date_expr, rn).subquery()
+    winners_sel = select(TLE.id.label("tle_id"), date_expr, rn)
+    if days:
+        start = datetime.datetime.combine(min(days), datetime.time.min)
+        end = datetime.datetime.combine(
+            max(days) + datetime.timedelta(days=1), datetime.time.min
+        )
+        winners_sel = winners_sel.where(TLE.epoch >= start, TLE.epoch < end)
+    winners = winners_sel.subquery()
     stmt = (
         select(TLE, OmmMetadata, winners.c.epoch_date)
         .join(winners, TLE.id == winners.c.tle_id)
@@ -610,21 +445,25 @@ def _rebuild_dates(session, entries, pool, written, progress) -> None:
         .execution_options(yield_per=5000)
     )
 
-    task = progress.task("Rebuilding date files", total=None)
+    days_set = set(days) if days else None
+    task = progress.task(
+        "Updating date files" if days else "Rebuilding date files",
+        total=len(days) if days else None,
+    )
     current_date: Optional[datetime.date] = None
     day_records: list[GPRecord] = []
 
     def flush_day() -> None:
         if current_date is None or not day_records:
             return
+        if days_set is not None and current_date not in days_set:
+            return
         for entry in entries:
             key = output_key(entry)
-            written[key] = written.get(key, 0) + _rebuild_date_file(
-                entry, current_date, day_records
-            )
+            wrote, lineless = _render_date_file(entry, current_date, day_records)
+            stats.written[key] = stats.written.get(key, 0) + wrote
+            stats.lineless_skipped += lineless
         progress.advance(task)
-
-    from thistle_db.model import date_from_sql
 
     for tle, metadata, raw_date in session.execute(stmt):
         day = date_from_sql(raw_date)
@@ -637,22 +476,148 @@ def _rebuild_dates(session, entries, pool, written, progress) -> None:
     progress.finish(task)
 
 
-def _rebuild_date_file(
-    entry: OutputFile, day: datetime.date, records: list[GPRecord]
-) -> int:
-    path = entry.date_path(day)
-    if entry.format == "tle":
-        pairs = [
-            (r.tle_line1, r.tle_line2)
-            for r in sorted(records, key=lambda r: r.norad_cat_id)
-            if r.tle_line1 and r.tle_line2
-        ]
-        if not pairs:
-            return 0
-        _atomic_write(path, _render_tle(pairs))  # type: ignore[arg-type]
-        return 1
-    rows = [
-        _row_for(entry, r) for r in sorted(records, key=lambda r: r.norad_cat_id)
-    ]
-    _atomic_write(path, _render_csv(_fieldnames(entry), rows))
-    return 1
+def _log_render_warnings(stats: _RenderStats) -> None:
+    if stats.lineless_skipped:
+        logger.warning(
+            f"{stats.lineless_skipped} line-less record(s) have no TLE "
+            "rendering and are absent from tle outputs"
+        )
+    if stats.alpha5_overflow:
+        ids = sorted(stats.alpha5_overflow)
+        logger.warning(
+            f"{len(ids)} object(s) beyond alpha-5 range named with "
+            f"integer stems (e.g. {ids[0]}) in alpha5 outputs"
+        )
+
+
+# --- entry points ----------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class OutputRun:
+    """Structured result of one ``update_outputs`` run."""
+
+    cursor: int = 0
+    """Where the slowest entry stood before this run."""
+    target: int = 0
+    """max(tle.id) this run caught every entry up to."""
+    dirty_objects: int = 0
+    dirty_days: int = 0
+    written: dict[str, int] = dataclasses.field(default_factory=dict)
+    """Files written per output key."""
+    lineless_skipped: int = 0
+    alpha5_overflow: set[int] = dataclasses.field(default_factory=set)
+
+    @property
+    def up_to_date(self) -> bool:
+        return self.target <= self.cursor
+
+
+def update_outputs(
+    session: Session,
+    output: OutputConfig,
+    *,
+    progress=None,
+) -> OutputRun:
+    """Re-render exactly the output files dirtied since the last update.
+
+    One PK-range scan over ``(cursor, target]`` finds the dirty object ids
+    and dirty epoch dates; each dirty file is rendered whole from the
+    store (byte-identical to a rebuild of that file) and every entry's
+    cursor advances to ``target`` — only after all renders complete, so a
+    cancelled run redoes the same dirty set next time. Raises
+    ``MissingCursorError`` for entries ``rebuild`` has never initialized.
+    """
+    progress = progress or NO_PROGRESS
+    entries = output.files
+    cursors = load_cursors(session, entries)
+    missing = sorted(key for key, value in cursors.items() if value is None)
+    if missing:
+        raise MissingCursorError(missing)
+
+    cursor = min(value for value in cursors.values() if value is not None)
+    target = session.execute(select(func.max(TLE.id))).scalar_one() or 0
+    run = OutputRun(cursor=cursor, target=target)
+    if run.up_to_date:
+        logger.info(f"Outputs are up to date (cursor at store id {cursor})")
+        return run
+
+    for entry in entries:
+        pathlib.Path(entry.dir).mkdir(parents=True, exist_ok=True)
+    _sweep_tmp_files(entries)
+
+    norads = sorted(
+        session.execute(
+            select(TLE.norad_cat_id)
+            .where(TLE.id > cursor, TLE.id <= target)
+            .distinct()
+        ).scalars()
+    )
+    days = sorted(
+        {
+            date_from_sql(raw)
+            for raw in session.execute(
+                select(func.date(TLE.epoch))
+                .where(TLE.id > cursor, TLE.id <= target)
+                .distinct()
+            ).scalars()
+            if raw is not None
+        }
+    )
+    run.dirty_objects = len(norads)
+    run.dirty_days = len(days)
+
+    stats = _RenderStats()
+    object_entries = [entry for entry in entries if entry.type == "object"]
+    date_entries = [entry for entry in entries if entry.type == "date"]
+    with WritePool(output.write_workers) as pool:
+        if object_entries and norads:
+            _render_objects_scoped(
+                session, object_entries, pool, stats, progress, norads
+            )
+        if date_entries and days:
+            _render_dates(session, date_entries, stats, progress, days=days)
+
+    set_cursors(session, entries, target)
+    _log_render_warnings(stats)
+    run.written = stats.written
+    run.lineless_skipped = stats.lineless_skipped
+    run.alpha5_overflow = stats.alpha5_overflow
+    logger.info(
+        f"Updated {sum(stats.written.values())} output file(s): "
+        f"{run.dirty_objects} dirty object(s), {run.dirty_days} dirty day(s)"
+    )
+    return run
+
+
+def rebuild_outputs(
+    session: Session,
+    output: OutputConfig,
+    *,
+    progress=None,
+) -> dict[str, int]:
+    """Re-derive every output from a linear store scan; reset the cursors.
+
+    First run, disaster recovery, or a new/renamed output entry. The
+    cursor target is captured before the scan (stable under the writer
+    lock) and committed only at the end, so an interrupted rebuild leaves
+    the cursors untouched. Returns files written per output key.
+    """
+    progress = progress or NO_PROGRESS
+    object_entries = [entry for entry in output.files if entry.type == "object"]
+    date_entries = [entry for entry in output.files if entry.type == "date"]
+    for entry in output.files:
+        pathlib.Path(entry.dir).mkdir(parents=True, exist_ok=True)
+    _sweep_tmp_files(output.files)
+
+    target = session.execute(select(func.max(TLE.id))).scalar_one() or 0
+    stats = _RenderStats()
+    with WritePool(output.write_workers) as pool:
+        if object_entries:
+            _render_objects_full(session, object_entries, pool, stats, progress)
+        if date_entries:
+            _render_dates(session, date_entries, stats, progress)
+
+    set_cursors(session, output.files, target)
+    _log_render_warnings(stats)
+    return stats.written

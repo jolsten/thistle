@@ -1,8 +1,75 @@
 # Changelog
 
+## [Unreleased]
+
+**Breaking: store-only, per-file ingest + decoupled, cursor-scoped
+outputs.** Existing 0.16 databases upgrade in
+place: run `thistle-db init-db` once (adds the `output_cursor` table —
+purely additive), then `thistle-db rebuild` once to initialize the
+cursors.
+
+### Changed
+
+- **Ingest is store-only and resumable.** It no longer writes output
+  files. The delta engine flushes at every file boundary (store → that
+  file's `ingest_files` state → re-admission stamps), so batches never
+  span files and the unit of durability is one source file: a cancelled
+  or killed run retains every completed file's work and the next run
+  continues from the first unprocessed file, replaying at most the one
+  in-flight file (absorbed by dedup). `flush_records` now only bounds
+  memory within a single very large file.
+- **Outputs update after ingest, scoped by a cursor.** The new
+  `update-outputs` command (or `ingest --update-outputs`) finds the
+  objects and epoch dates with records past each output's cursor
+  (`output_cursor`, keyed by `type:format:dir`) in one PK-range scan and
+  re-renders only those files — each rendered *whole* from the store and
+  replaced atomically, byte-identical to a rebuild of the same file, so
+  touching is healing. Cursors advance only after every dirty file is
+  rendered; an interrupted update re-renders the same dirty set next
+  run. `rebuild` initializes/resets the cursors; a new or renamed entry
+  must be rebuilt before `update-outputs` will run. Both commands sweep
+  stray `*.tmp` files at start.
+- **One write path.** The incremental output layer is deleted:
+  tail-epoch probes, append paths, merge-rewrites, the date-file upsert,
+  and torn-tail healing (`OutputApplier` and friends). Every output
+  write in the system is now render-whole + tmp + atomic rename — no
+  half-written files and no torn tails at any kill point, by
+  construction.
+- **Infrastructure failures fail the run.** A store or state-commit
+  failure during a flush raises `FlushError` and aborts the scan with
+  exit 1, instead of being logged as one "bad file" after another on a
+  scan that exits 0. Per-file tolerance remains for data problems.
+- An operator interrupt (Ctrl+C) finalizes the run row as `cancelled`
+  (new status) instead of `failed`, prints what was retained, and exits
+  130. Durability never depends on the handler — a hard kill is equally
+  safe, it just leaves the row `running` (reported by `status` as a
+  crashed run).
+- `status` now reports output lag: store rows not yet reflected in
+  outputs, and entries whose cursor is missing (→ run `rebuild`).
+- Enrichment caveat (narrowed, but now global): an enrichment-only
+  redelivery (identical lines, richer metadata) updates `omm_metadata`
+  without creating a `tle` row, so it moves no cursor and refreshes no
+  output file until that object/day next dirties or the next `rebuild`.
+- Bulk backfill guidance: ingest everything, then `rebuild` — with the
+  whole catalog dirty, a scoped update is the same work with worse
+  streaming.
+
+### Added
+
+- `output_cursor` table (additive DDL; `init-db` creates it on existing
+  deployments). `update-outputs` command; `ingest --update-outputs`
+  flag; `outputs.update_outputs` / `outputs.output_lag` library API
+  returning a structured `OutputRun`.
+
+### Removed
+
+- `OutputApplier` and the incremental apply layer in `outputs.py`;
+  ingest-time output writes; the per-run "line-less records skipped"
+  warning moved from ingest to the output commands.
+
 ## [0.16.0] - 2026-11-09
 
-**Breaking: the single-store architecture (PLAN.md).** No backwards
+**Breaking: the single-store architecture.** No backwards
 compatibility, no migration tooling — adopt by re-ingesting source files,
 or `dump` from 0.15 and `ingest` the result after `init-db --drop`.
 

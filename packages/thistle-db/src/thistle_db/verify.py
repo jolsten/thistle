@@ -1,18 +1,21 @@
 """Count reconciliation of every output against the store (the authority).
 
-Catches damage the incremental tail guard can't see: mid-file truncation,
-deleted files for quiet objects, orphan files for objects the store no
-longer knows. Reads every output file, so this is a periodic (e.g.
-weekly) cron run, not an every-run check. Also stamps
-``rejects.resolved_at`` for payloads whose exact hash now exists in
-``tle`` — the reconciliation half of the rejects lifecycle.
+Catches damage the scoped-update path can't see: hand-edited or truncated
+files for quiet objects, deleted files, orphan files for objects the
+store no longer knows — anything touching files whose objects/days never
+dirty. Reads every output file, so this is a periodic (e.g. weekly) cron
+run, not an every-run check. Note that outputs are legitimately stale
+between `ingest` and `update-outputs` (`status` shows the cursor lag);
+run `update-outputs` before `verify` to avoid flagging ordinary lag.
+Also stamps ``rejects.resolved_at`` for payloads whose exact hash now
+exists in ``tle`` — the reconciliation half of the rejects lifecycle.
 
 Line-less records (OMM-native) are invisible to tle outputs by design;
 expected counts for tle outputs therefore consider only line-full rows.
-In the rare edge where an object's newest record for a date is line-less,
-the incremental date path keeps the older line-full entry while a rebuild
-drops the object for that date — verify may flag such a date file; a
-`rebuild` settles it.
+In the rare edge where an object's *newest* record for a date is
+line-less, tle date files omit the object (the day's winner has no
+rendering) while the expected count includes it — verify may flag such a
+date file persistently; it is a known, accepted discrepancy.
 """
 
 import dataclasses
@@ -26,7 +29,7 @@ from sqlalchemy.orm import Session
 
 from thistle_db.config import OutputConfig, OutputFile
 from thistle_db.model import Reject, TLE, date_from_sql, utcnow
-from thistle_db.outputs import _read_csv_rows, _read_tle_pairs, output_key
+from thistle_db.outputs import output_key, read_csv_rows, read_tle_pairs
 
 __all__ = ["VerifyIssue", "VerifyReport", "stamp_resolved_rejects", "verify_outputs"]
 
@@ -65,8 +68,8 @@ class VerifyReport:
 
 def _count_file_records(entry: OutputFile, path: pathlib.Path) -> int:
     if entry.format == "tle":
-        return len(_read_tle_pairs(path))
-    return len(_read_csv_rows(path))
+        return len(read_tle_pairs(path))
+    return len(read_csv_rows(path))
 
 
 def _expected_per_object(session: Session, lines_only: bool) -> dict[int, int]:

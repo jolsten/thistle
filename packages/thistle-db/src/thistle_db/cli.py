@@ -20,12 +20,18 @@ from thistle_db.config import Settings, load_config
 from thistle_db.export import EXPORT_FORMATS, export as export_store
 from thistle_db.ingest import (
     DeltaEngine,
+    FlushError,
     ingest_paths,
     ingest_sources,
     readmit_matured_rejects,
 )
 from thistle_db.lock import LockHeldError, SingleWriterLock, lock_path_for
-from thistle_db.outputs import rebuild_outputs
+from thistle_db.outputs import (
+    MissingCursorError,
+    output_lag,
+    rebuild_outputs,
+    update_outputs,
+)
 from thistle_db.progress import ProgressReporter, console
 from thistle_db.rejects import export_unresolved, unresolved_summary
 from thistle_db.runs import recent_runs, run_context, stuck_runs
@@ -108,6 +114,25 @@ def _writer_lock(ctx_obj: CliContext) -> SingleWriterLock:
     return SingleWriterLock(lock_path_for(ctx_obj.config_path))
 
 
+def _run_update_outputs(session, config: Settings, progress) -> None:
+    """One update-outputs pass, recorded as its own ingest_runs row.
+
+    Shared by the `update-outputs` command and `ingest --update-outputs`
+    (same lock and session either way)."""
+    with run_context(session, "update-outputs") as (run, report):
+        result = update_outputs(session, config.output, progress=progress)
+        report.output_writes.update(result.written)
+        report.lineless_skipped = result.lineless_skipped
+    if result.up_to_date:
+        logger.info("Outputs already up to date")
+    else:
+        logger.info(
+            f"Updated {sum(result.written.values())} output file(s) "
+            f"({result.dirty_objects} dirty object(s), "
+            f"{result.dirty_days} dirty day(s))"
+        )
+
+
 CONFIG_TEMPLATE = """\
 # thistle-db configuration
 # See: https://github.com/jolsten/thistle
@@ -164,8 +189,9 @@ name = "thistle-db.db"
 # shorter than 69 characters skip the check.
 # verify_checksums = true
 
-# Buffered records that trigger an early delta flush (memory budget,
-# ~600 bytes per record; never a correctness knob).
+# Buffered records that trigger an early mid-file store flush (memory
+# budget, ~600 bytes per record; never a correctness knob — batches never
+# span files, and this only bounds a single very large file).
 # flush_records = 1000000
 
 [[ingest.sources]]
@@ -178,12 +204,14 @@ pattern = "*.tle"    # glob pattern for matching files
 # pattern = "*.json"
 
 # ----------------------------------------------
-# Outputs — maintained incrementally by ingest
+# Outputs — rendered from the store after ingest
 # ----------------------------------------------
-# Each [[output.files]] entry defines one output; `ingest` requires at
-# least one entry and maintains all of them in the same pass (there is no
-# separate generate step — `rebuild` re-derives everything after a config
-# change or for disaster recovery):
+# Each [[output.files]] entry defines one output. Ingest never writes
+# them: run `thistle-db update-outputs` after ingest (or use
+# `ingest --update-outputs`) to re-render exactly the files dirtied by
+# new records. `rebuild` re-derives everything and must run once first
+# (and after adding or renaming an entry) to initialize its cursor.
+# Outputs are optional — with no entries, the deployment is store-only.
 #   type   = "date"     -> one file per date (latest record per satellite)
 #          = "object"   -> one file per satellite (all records, epoch order)
 #   format = "tle"      -> verbatim two-line element text
@@ -400,18 +428,33 @@ def ingest(
             help="Re-ingest files even if their recorded state is unchanged",
         ),
     ] = False,
+    with_outputs: Annotated[
+        bool,
+        typer.Option(
+            "--update-outputs",
+            help="After the scan, run update-outputs under the same lock "
+            "(re-renders the output files dirtied by new records)",
+        ),
+    ] = False,
 ) -> None:
-    """Ingest TLE/OMM files: validate, store, maintain every output.
+    """Ingest TLE/OMM files into the store (store-only; outputs separate).
 
-    One pass does everything — there is no separate generate step. Scans
-    are tolerant (exit 0; failed files retried next scan); explicitly
-    named files exit 1 on any failure so cron wrappers can detect it.
-    With no [[output.files]] configured, ingest is store-only.
+    Flushes per source file, so progress is durable file by file: a
+    cancelled run keeps every completed file's work and the next run
+    continues from the first unprocessed file. Output files are rendered
+    afterwards by `update-outputs` (or here, via --update-outputs).
+
+    Scans are tolerant of bad files (exit 0; failed files retried next
+    scan); explicitly named files exit 1 on any failure so cron wrappers
+    can detect it. A store failure aborts the run with exit 1 either way.
     """
     config = _load_config_or_exit(ctx.obj)
     _setup_logging(config.logging.level, ctx.obj.log_file)
+    if with_outputs:
+        _require_outputs(config)
 
     command = f"ingest {len(files)} file(s)" if files else "ingest"
+    report = None
     try:
         with _writer_lock(ctx.obj):
             session, engine_db = _open_session_or_exit(config)
@@ -434,19 +477,78 @@ def ingest(
                                     force=force,
                                     progress=progress,
                                 )
-                logger.info(report.summary())
+                    logger.info(report.summary())
+                    if with_outputs:
+                        _run_update_outputs(session, config, progress)
             finally:
                 session.close()
                 engine_db.dispose()
     except LockHeldError as err:
         print(f"Error: {err}", file=sys.stderr)
         raise typer.Exit(code=1) from None
+    except MissingCursorError as err:
+        print(f"Error: {err}", file=sys.stderr)
+        raise typer.Exit(code=2) from None
+    except FlushError as err:
+        print(f"Error: ingest aborted: {err}", file=sys.stderr)
+        raise typer.Exit(code=1) from None
+    except KeyboardInterrupt:
+        # Reporting only — durability comes from the per-file commits,
+        # never from this handler.
+        if report is not None:
+            print(f"Interrupted: {report.summary()}", file=sys.stderr)
+        print(
+            "Progress up to the in-flight file is retained; the next run "
+            "continues from there.",
+            file=sys.stderr,
+        )
+        raise typer.Exit(code=130) from None
 
-    if files and report.files_failed:
+    if files and report is not None and report.files_failed:
         # Explicitly named files failing is an error the caller (cron
         # included) must be able to detect. Directory scans stay tolerant:
         # failed files there are retried on the next scan by design.
         raise typer.Exit(code=1)
+
+
+@app.command(name="update-outputs")
+def update_outputs_cmd(ctx: typer.Context) -> None:
+    """Re-render the output files dirtied since the last update.
+
+    Scoped: one store scan finds the objects and epoch dates with records
+    past each output's cursor; only those files are re-rendered — whole,
+    from the store, byte-identical to a rebuild of the same file — and
+    the cursors advance once everything is written. Run it after
+    `ingest`, or use `ingest --update-outputs`. New or renamed
+    [[output.files]] entries have no cursor yet: initialize them with
+    `rebuild`.
+    """
+    config = _load_config_or_exit(ctx.obj)
+    _setup_logging(config.logging.level, ctx.obj.log_file)
+    _require_outputs(config)
+
+    try:
+        with _writer_lock(ctx.obj):
+            session, engine_db = _open_session_or_exit(config)
+            try:
+                with _progress(ctx.obj) as progress:
+                    _run_update_outputs(session, config, progress)
+            finally:
+                session.close()
+                engine_db.dispose()
+    except LockHeldError as err:
+        print(f"Error: {err}", file=sys.stderr)
+        raise typer.Exit(code=1) from None
+    except MissingCursorError as err:
+        print(f"Error: {err}", file=sys.stderr)
+        raise typer.Exit(code=2) from None
+    except KeyboardInterrupt:
+        print(
+            "Interrupted — cursors unchanged; the next run re-renders the "
+            "same dirty set.",
+            file=sys.stderr,
+        )
+        raise typer.Exit(code=130) from None
 
 
 @app.command()
@@ -454,7 +556,8 @@ def rebuild(ctx: typer.Context) -> None:
     """Re-derive every output file from a linear store scan.
 
     First run, disaster recovery, or after adding/changing an
-    [[output.files]] entry.
+    [[output.files]] entry. Also initializes/resets every output's
+    cursor, so `update-outputs` can take over incrementally.
     """
     config = _load_config_or_exit(ctx.obj)
     _setup_logging(config.logging.level, ctx.obj.log_file)
@@ -655,6 +758,11 @@ def status(
         run_rows = recent_runs(session, limit=runs)
         stuck = stuck_runs(session)
         reject_rows = unresolved_summary(session)
+        pending, cursorless = (
+            output_lag(session, config.output.files)
+            if config.output.files
+            else (0, [])
+        )
     finally:
         session.close()
         engine_db.dispose()
@@ -691,6 +799,21 @@ def status(
             print(f"  {code:<20} {count:>8}  (last seen {last_seen})")
     else:
         print("\nNo unresolved rejects.")
+
+    if config.output.files:
+        if cursorless:
+            print(
+                "\nOutputs: no cursor for "
+                + ", ".join(cursorless)
+                + " — run `thistle-db rebuild`"
+            )
+        elif pending:
+            print(
+                f"\nOutputs: ~{pending} store row(s) not yet reflected — "
+                "run `thistle-db update-outputs`"
+            )
+        else:
+            print("\nOutputs: up to date")
 
 
 @app.command()

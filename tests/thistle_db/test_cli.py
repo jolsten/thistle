@@ -96,6 +96,9 @@ def test_ingest_scan_status_and_get_tle(config, tmp_path):
     )
     result = invoke(config, "ingest")
     assert result.exit_code == 0, result.output
+    # Store-only: outputs are rendered by rebuild/update-outputs, not ingest.
+    assert not (tmp_path / "objects" / "22.tle").exists()
+    assert invoke(config, "rebuild").exit_code == 0
     assert (tmp_path / "objects" / "22.tle").exists()
 
     result = invoke(config, "get-tle", "22")
@@ -146,6 +149,8 @@ path = "{incoming.as_posix()}"
     # The output-centric commands still require outputs.
     assert invoke(config, "rebuild").exit_code == 2
     assert invoke(config, "verify").exit_code == 2
+    assert invoke(config, "update-outputs").exit_code == 2
+    assert invoke(config, "ingest", str(tle), "--update-outputs").exit_code == 2
 
 
 def test_rejects_summary_and_export(config, tmp_path):
@@ -183,6 +188,7 @@ def test_verify_and_rebuild(config, tmp_path):
         "".join(f"{a}\n{b}\n" for a, b in TLES)
     )
     invoke(config, "ingest")
+    assert invoke(config, "rebuild").exit_code == 0
     assert invoke(config, "verify").exit_code == 0
 
     (tmp_path / "objects" / "22.tle").unlink()
@@ -191,6 +197,32 @@ def test_verify_and_rebuild(config, tmp_path):
     assert invoke(config, "rebuild").exit_code == 0
     assert (tmp_path / "objects" / "22.tle").exists()
     assert invoke(config, "verify").exit_code == 0
+
+
+def test_update_outputs_flow(config, tmp_path):
+    (tmp_path / "incoming" / "a.tle").write_text(f"{L1}\n{L2}\n")
+    assert invoke(config, "ingest").exit_code == 0
+
+    # No cursor yet: update-outputs refuses and points at rebuild.
+    assert invoke(config, "update-outputs").exit_code == 2
+    assert invoke(config, "rebuild").exit_code == 0
+    assert (tmp_path / "objects" / "22.tle").exists()
+
+    # New delivery: store-only ingest, then the flag renders the delta.
+    (tmp_path / "incoming" / "b.tle").write_text(
+        f"{TLES[2][0]}\n{TLES[2][1]}\n"
+    )
+    result = invoke(config, "ingest", "--update-outputs")
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "objects" / "81069.tle").exists()
+
+    result = invoke(config, "status")
+    assert result.exit_code == 0
+    assert "update-outputs" in result.output  # its own run row
+    assert "up to date" in result.output  # the cursor-lag line
+
+    # Nothing new: a bare update-outputs run is a clean no-op.
+    assert invoke(config, "update-outputs").exit_code == 0
 
 
 def test_omm_ingest_via_cli(config, tmp_path):

@@ -1,17 +1,8 @@
 # CLAUDE.md
 
-This file is the **target design spec** for thistle-db. Where the code and this
-document disagree, this document wins — update the code to match, not the other
-way around.
-
-**Architecture status (2026-11):** the GP-record, single-SQL-store
-architecture is **implemented** — adopted from `PLAN-gp-store.md`
-(2026-09), amended 2026-11-09 (files store dropped; DB-resident `rejects`
-and `ingest_runs` tables; checksum validation; see `PLAN.md` for the full
-design + rationale), and built the same day. The legacy dual-backend
-code (`filestore.py`, `generator.py`, `[storage]`, the filesystem
-quarantine, `epoch_date_state` watermarks) is deleted; see git history
-for its documentation.
+This file is the **design spec** for thistle-db. Where the code and this
+document disagree, this document wins — update the code to match, not the
+other way around.
 
 ## What thistle-db is
 
@@ -19,19 +10,25 @@ thistle-db is a database manager for orbital element sets. It ingests TLE
 (Two-Line Element) and OMM (Orbit Mean-Elements Message) files from configured
 directories into a SQL database — the canonical store — and maintains
 organized output files (TLE by object and by date; STK-compatible OMM CSV)
-directly from ingest.
+rendered from the store after ingest.
 
 ## Shape of the system
 
 ```
+Phase 1: ingest (store-only, per-file durable)
 sources ──► readers ──► validation ──► delta buffer (GP records, by object)
-(TLE/OMM)                   │                │  flush at end-of-scan / flush_records
-                            │ rejected       ▼
-                            ▼           1. store.add(delta)         dedup by RECORD_HASH
-                       rejects table    2. output.apply(delta) ×N   merge-dedup / tail guard / date upsert
-                       (reason-coded,   3. commit ingest_files state
+(TLE/OMM)                   │                │  flush per file (flush_records
+                            │ rejected       ▼   only bounds one huge file)
+                            ▼           1. store.add(file's delta)  dedup by RECORD_HASH
+                       rejects table    2. commit ingest_files state
+                       (reason-coded,   3. stamp re-admissions
                         deduped)
                                         run accounting ──► ingest_runs (one row per run)
+
+Phase 2: update-outputs (after ingest, optional)
+output_cursor ──► dirty objects/days = tle rows past the cursor (one PK-range scan)
+                      └► re-render each dirty file WHOLE from the store ×N entries
+                         └► advance every cursor (only after all renders)
 ```
 
 Three ideas, one per layer:
@@ -39,32 +36,37 @@ Three ideas, one per layer:
 1. **One canonical record** — the GP record (`record.py`), an OMM-superset
    modeled on Space-Track's published GP class, carrying verbatim TLE lines
    as fields. Everything produces, stores, or projects this record.
-2. **One engine** — the single-pass delta flush. Ingest validates records,
-   buffers them grouped by object, and at flush time hands the same delta to
-   every sink. Source-file state commits only after all sinks succeed.
-   **Every sink is idempotent against replay** (store dedups on
-   `RECORD_HASH`; object outputs dedup on merge and guard appends by tail
-   epoch; date outputs upsert on `epoch >=`), so that one ordering rule is
-   the entire crash-safety story: a crash replays at most the files whose
-   state was never recorded, and every sink absorbs the duplicates. Outputs
-   consume the *validated buffer, pre-dedup* — they never ask the store
-   which rows were new, which is what eliminates watermark/lookback
-   machinery.
+2. **Two phases, each resumable at its unit.** Ingest is store-only and
+   flushes at every file boundary — store, then that file's state — so a
+   batch never spans files and the unit of durability is one source file:
+   a cancelled or killed run retains every completed file's work and
+   replays at most the one in-flight file (the store's `RECORD_HASH`
+   dedup absorbs it). Outputs update afterwards, scoped by the
+   `output_cursor`: one PK-range scan finds the objects/days dirtied past
+   the cursor, each dirty file is re-rendered **whole from the store**
+   through the same render path `rebuild` uses, and cursors advance only
+   after every dirty file is written — an interrupted update re-renders
+   the same dirty set next run. **One write path** (render whole + tmp +
+   atomic rename): no appends, no merges with on-disk content, no torn
+   tails, and every touched file is byte-identical to a rebuild's, so
+   touching is healing. Known, accepted gap: an enrichment-only
+   redelivery (identical lines, richer metadata) updates `omm_metadata`
+   without a new `tle` row, moves no cursor, and lands in outputs only
+   when that object/day next dirties or at the next `rebuild`.
 3. **One store — a SQL database.** SQLite for dev and small/serverless
-   deployments; MariaDB/MySQL or PostgreSQL operationally. The former
-   "one interface, two implementations" design (GP-CSV object tree as an
-   alternative store) was **dropped 2026-11-09**: SQLite already covers the
-   serverless case, the dual-store interface taxed every feature with a
-   lowest-common-denominator spec (exact vs approximate `get-tle`,
-   merge-as-UPDATE vs merge-rewrite, no natural home for the rejects and
-   runs tables), and the files store's bulk-ingest throughput edge only
-   mattered for rare full-catalog restores, which the deferred-index flow
-   already serves. Outputs remain files; the *store* is the database. The
-   delta engine calls the store module directly — no store abstraction
-   layer is maintained.
+   deployments; MariaDB/MySQL or PostgreSQL operationally. There is
+   deliberately **no store-abstraction layer and no second backend** —
+   the delta engine calls the store module directly. SQLite already
+   covers the serverless case, and a pluggable store would tax every
+   feature with a lowest-common-denominator spec while giving the
+   rejects and runs tables no natural home. Outputs remain files; the
+   *store* is the database.
 
-There is no steady-state `generate`. Ingest maintains the outputs. The cron
-entry is `thistle-db ingest`.
+The steady-state cron entry is `thistle-db ingest --update-outputs` (or
+the two commands chained). Outputs may legitimately lag the store between
+the two phases; `status` reports the lag. For bulk backfills, ingest
+everything first, then `rebuild` — with the whole catalog dirty, a scoped
+update is the same work with worse streaming.
 
 ## Core workflow
 
@@ -74,11 +76,15 @@ entry is `thistle-db ingest`.
    commands never create tables and fail with a clear "run `thistle-db
    init-db`" error (exit 3) against an uninitialized database.
 2. `thistle-db ingest` scans those directories, auto-detects each file's
-   format, parses and validates the element sets, adds them to the store,
-   and updates every configured output — all in one pass. Duplicates are
-   silently absorbed — ingest is **idempotent**: running it twice over the
-   same files must never create duplicate records or fail. Records that
-   fail validation land in the `rejects` table; nothing is silently lost.
+   format, parses and validates the element sets, and adds them to the
+   store — flushing per file, so an interrupted run retains every
+   completed file's work and the next run continues from the first
+   unprocessed file. Duplicates are silently absorbed — ingest is
+   **idempotent**: running it twice over the same files must never create
+   duplicate records or fail. Records that fail validation land in the
+   `rejects` table; nothing is silently lost. `thistle-db update-outputs`
+   (or `ingest --update-outputs`) then re-renders exactly the output
+   files dirtied by the new records.
 3. `rebuild`, `verify`, `export`, and `status` cover disaster recovery,
    periodic reconciliation, interchange, and observability (see CLI).
 
@@ -223,11 +229,11 @@ the database rows):
 - the **future-epoch guard**: an elset whose epoch runs more than
   `[ingest] max_epoch_ahead_days` (default 30; 0 disables) ahead of now is
   rejected. TLE epochs carry two-digit years (00-56 → 2000-2056), so a
-  corrupted epoch parses *cleanly* into a date decades out — and once stored
-  it becomes its object file's tail epoch (forcing merge-rewrites forever)
-  and plants a junk date file. Real feeds deliver at most hours to a day
-  ahead; raise it for predicted-elset workflows. Deliberately one-sided —
-  past epochs are never bounded, so historical archives ingest untouched.
+  corrupted epoch parses *cleanly* into a date decades out — and once
+  stored it rides as the permanent tail of its object's history and plants
+  a junk date file. Real feeds deliver at most hours to a day ahead; raise
+  it for predicted-elset workflows. Deliberately one-sided — past epochs
+  are never bounded, so historical archives ingest untouched.
 
 No stored float is ever non-finite. **Do not relax this by flagging invalid
 records in `tle` instead** — a validity predicate would have to thread
@@ -246,10 +252,9 @@ arithmetic) and unit-test the cleaning directly.
 
 #### The `rejects` table
 
-Rejected records are **retained in the database**, replacing the old
-filesystem quarantine (decided 2026-11-09 — once the store is always a
-database, rejects become queryable rows instead of files only visible on
-the ingest host). One row per *distinct* rejected payload:
+Rejected records are **retained in the database** — queryable rows beside
+the data they failed to join, not files visible only on the ingest host.
+One row per *distinct* rejected payload:
 
 - `record_hash` — sha256 of the verbatim payload (`line1\nline2` for TLE;
   the raw record JSON for OMM), raw `BINARY(32)`, **unique** — the dedup
@@ -263,9 +268,9 @@ the ingest host). One row per *distinct* rejected payload:
 - `source_path`, `first_seen`, `last_seen`, `times_seen` — provenance and
   recurrence; re-rejection of a known payload is an upsert bumping
   `last_seen`/`times_seen`, so the table is bounded by *distinct* broken
-  records, not by time. Append-only otherwise: a run with no rejects
-  deletes nothing (unlike the old live-view quarantine — the table is an
-  archive; `resolved_at` carries the lifecycle instead).
+  records, not by time. Append-only otherwise: the table is an archive —
+  a run with no rejects deletes nothing; `resolved_at` carries the
+  lifecycle instead.
 - `norad_cat_id`, `epoch` — nullable convenience columns populated when
   parseable, so "which objects have a bad feed" is one query.
 - `resolved_at` — stamped by `verify` when the same `record_hash` exists in
@@ -294,16 +299,18 @@ bad file never aborts a scan.
 ## The store
 
 A SQL database — SQLite (default/dev/serverless), MariaDB/MySQL
-(operational), PostgreSQL (tested in CI). The two-table element shape
-survives on merits: `tle` (one row per record — `norad_cat_id` NOT NULL,
-nullable verbatim `line0/line1/line2`, parsed columns,
-`mean_element_theory`) + `omm_metadata` (sparse sidecar, unique FK,
-carrying metadata, provenance `gp_id`/`file_id`/`creation_date`/
-`originator`, and nullable `ref_frame`/`time_system`/`center_name`
-overrides — null means implicit per ephemeris type), with `ingest_files`,
-`rejects`, and `ingest_runs` in the same database — one backup artifact,
-one place every question is answerable in SQL. Enrichment is an UPDATE of
-the metadata row — the one sanctioned mutation; `tle` rows stay immutable.
+(operational), PostgreSQL (tested in CI). Two element tables: `tle` (one
+row per record — `norad_cat_id` NOT NULL, nullable verbatim
+`line0/line1/line2`, parsed columns, `mean_element_theory`) +
+`omm_metadata` (sparse sidecar, unique FK, carrying metadata, provenance
+`gp_id`/`file_id`/`creation_date`/`originator`, and nullable
+`ref_frame`/`time_system`/`center_name` overrides — null means implicit
+per ephemeris type), with `ingest_files`, `rejects`, `ingest_runs`, and
+`output_cursor` (per-entry output catch-up state: PK + `UNIQUE(key_hash)`,
+select-then-write under the writer lock) in the same database — one
+backup artifact, one place every question is answerable in SQL.
+Enrichment is an UPDATE of the metadata row — the one sanctioned
+mutation; `tle` rows stay immutable.
 
 Outputs are **lossy projections** (TLE has no metadata; the STK CSV has no
 provenance), so the store must be full-fidelity — never reconstructible
@@ -316,7 +323,8 @@ MariaDB — do not regress casually):
   auto-increment values on every duplicate skipped, so id consumption tracks
   rows *attempted*.
 - All stored datetimes are **naive UTC with microseconds** (`DATETIME(6)` on
-  MariaDB); `epoch` must round-trip exactly for the tail guard.
+  MariaDB); `epoch` must round-trip exactly (line-less identity hashing
+  and date-winner selection depend on it).
 - Element/derived float columns are **single precision** (`Float32`) except
   `mean_motion` (10 significant digits — DOUBLE); the lines are the lossless
   truth, so these are a re-derivable convenience view. Never compare them
@@ -330,8 +338,7 @@ MariaDB — do not regress casually):
   `UNIQUE(epoch, record_hash)`, `(norad_cat_id, epoch)`. Epoch-first
   uniqueness keeps normal ingest probing the hot right edge of the index
   regardless of table size, and keeps the index 32 bytes wide instead of
-  560 (`BINARY(32)`; use `HEX(record_hash)` in ad-hoc SQL). The legacy
-  `(created)` index is gone with `generate`'s lookback. Every added
+  560 (`BINARY(32)`; use `HEX(record_hash)` in ad-hoc SQL). Every added
   secondary index taxes every insert; add one only with a query that
   needs it.
 - Dedup is enforced with dialect-aware upserts (`ON CONFLICT DO NOTHING` for
@@ -347,10 +354,12 @@ changes below).
 
 ## Outputs
 
-Declarative `[[output.files]]` entries, all maintained incrementally by the
-flush engine. Each entry names a `type` (`object` / `date`), a `format`, a
-destination `dir`, and a filename scheme. At least one entry is required
-(misconfiguration exits 2, not a silent no-op).
+Declarative `[[output.files]]` entries, all rendered from the store by
+`update-outputs` (scoped to dirty files) and `rebuild` (everything) —
+never during ingest. Each entry names a `type` (`object` / `date`), a
+`format`, a destination `dir`, and a filename scheme. The output
+commands require at least one entry (misconfiguration exits 2, not a
+silent no-op); no entries at all is a valid store-only deployment.
 
 - **`format = "tle"`**: verbatim passthrough of stored lines — the
   compatibility surface for TLE-only consumers (GMAT, legacy pipelines).
@@ -366,9 +375,9 @@ destination `dir`, and a filename scheme. At least one entry is required
   (default) | `"full"` (all store columns). Acceptance check: a generated
   file loads in STK's SGP4 propagator. CSV rows render at **stored
   precision** (single-precision element columns rounded before
-  formatting), so an incremental write and a later `rebuild` — which
-  reads the rounded columns back — produce byte-identical files.
-- Filename templating as currently implemented: `extension` overrides the
+  formatting), so every render of the same store rows is byte-identical,
+  whichever command produced it.
+- Filename templating: `extension` overrides the
   default suffix; `filename` arranges `{id}`/`{date}`/`{ext}`/`{format}`/
   `{type}`, validated at **config load** (unknown placeholder, missing
   `{id}`/`{date}`, format specs, path separators, `..` all fail there — a
@@ -379,44 +388,57 @@ destination `dir`, and a filename scheme. At least one entry is required
   back to the plain integer stem for that object** with one WARNING per run —
   ingest never fails or drops valid data over an output naming choice;
   `parse_object_name`/`object_glob` must accept both stems.
-- Date outputs are upserted from the delta ("latest per object that day" can
-  only change when a newer-epoch record for that (object, date) arrives);
-  replace on `epoch >=`, so newest-ingested wins ties.
+- Date files hold the day's winner per object, computed in SQL from the
+  store (newest epoch; `id` breaks ties, so newest-ingested wins — the
+  same rule everywhere).
 - Output files are projections, always rebuildable from the store
-  (`rebuild`); a damaged output is an inconvenience, never data loss. The
-  incremental machinery (tail-epoch append guard, merge-dedup rewrite,
-  atomic tmp+rename) is an efficiency layer on top of that guarantee.
+  (`rebuild`); a damaged output is an inconvenience, never data loss.
+  Files are always rendered whole and replaced via tmp + atomic rename —
+  there is no append/merge machinery to maintain or distrust, and a
+  damaged file heals the next time its object/day dirties.
+  `update-outputs`' scoping (only dirty files are touched, found by one
+  PK-range scan past the `output_cursor`) is the efficiency layer on top
+  of that guarantee. A missing cursor means the entry was never rebuilt
+  (new, or renamed — the key embeds the dir): `update-outputs` refuses
+  with a pointer at `rebuild`, which initializes/resets every cursor.
+  Both commands sweep stray `*.tmp` files at start (safe under the
+  writer lock).
 
 Filesystem work runs on the write pool (`writer.WritePool`,
-`output.write_workers`): per-file open/close was 44% of a full rebuild —
-pure blocked time with the GIL released. The pool only ever receives pure
-filesystem work; sessions/queries stay on the calling thread; work is
-submitted a chunk of objects at a time so memory stays bounded and each task
-owns a distinct path. `rebuild` streams rows with `yield_per` (bounded
-memory); switching its reads from ORM entities to Core column tuples is
-the known perf lever if full-rebuild time ever matters at catalog scale
-(the legacy generator measured ~7.6s of a 38s rebuild in ORM
+`output.write_workers`): per-file open/close measured at 44% of a full
+rebuild — pure blocked time with the GIL released. The pool only ever
+receives pure filesystem work; sessions/queries stay on the calling thread;
+work is submitted a chunk of objects at a time so memory stays bounded and
+each task owns a distinct path. `rebuild` streams rows with `yield_per`
+(bounded memory); switching its reads from ORM entities to Core column
+tuples is the known perf lever if full-rebuild time ever matters at
+catalog scale (~7.6s of a measured 38s full rebuild was ORM
 materialization). Ingest scans **sort source files chronologically** (by
-name — delivery files are date-named) so historical backfills hit the
-append path, not merge-rewrites.
+name — delivery files are date-named) so historical backfills probe the
+hot right edge of the epoch-first dedup index.
 
 ## Observability
 
 Runs are **observable as data**, not just log lines:
 
 - **`ingest_runs` table**: one row per run — command, started/finished,
-  status (`running` / `succeeded` / `failed`), counters (files scanned /
-  ingested / skipped / refreshed / failed; records seen / inserted /
-  rejected), and an error summary on failure. Written at run start, updated
-  at completion; a row stuck in `running` is itself a signal (crashed run).
+  status (`running` / `succeeded` / `failed` / `cancelled`), counters
+  (files scanned / ingested / skipped / refreshed / failed; records seen
+  / inserted / rejected), and an error summary on failure. Written at run
+  start, updated at completion; a row stuck in `running` is itself a
+  signal (crashed run). An operator interrupt finalizes `cancelled` —
+  the work committed before it is durable, not lost. `update-outputs`
+  writes its own row (also when invoked via `ingest --update-outputs`).
   Index budget: PK only (insertion-ordered reads suffice).
 - **Structured reports**: `ingest_sources` and friends return a report
   object carrying those counters, not a bare int — the CLI prints it, the
   run row stores it, and any wrapper (cron mail, orchestrator) consumes the
   same numbers.
-- **`thistle-db status`**: reads `ingest_runs` and `rejects` — last run
-  outcome and duration, reject trends by reason, unresolved reject counts.
-  The cron-and-terminal dashboard.
+- **`thistle-db status`**: reads `ingest_runs`, `rejects`, and
+  `output_cursor` — last run outcome and duration, reject trends by
+  reason, unresolved reject counts, and output lag (store rows not yet
+  reflected in outputs; entries whose cursor is missing). The
+  cron-and-terminal dashboard.
 
 **Orchestration stays out of the core.** No Dagster (or other orchestrator)
 imports in thistle-db: the pipeline is three linear nodes (fetch → ingest →
@@ -434,13 +456,12 @@ knows it exists. Until then: cron / Task Scheduler + `status` + exit codes.
   db fallback), parsed into pydantic-settings models: `[database]`,
   `[ingest]` (`max_epoch_ahead_days`, `verify_checksums`, `flush_records`,
   `[[ingest.sources]]`), `[output]` with `[[output.files]]`, `[logging]`.
-  `[output]` rejects unknown keys (`extra="forbid"`) so stale configs fail
-  validation with a pointer at the key instead of being silently ignored.
-- **Gone with the files store**: the `[storage]` section (`backend`,
-  `state`, `flush_records`) and `[ingest] reject_dir`. `flush_records`
-  (the delta-buffer memory budget, default 1,000,000) lives in
-  `[ingest]`; rejects live in the database. `[ingest]` and `[output]`
-  both reject unknown keys, so a stale config fails loudly at load.
+- `flush_records` (default 1,000,000) is the delta-buffer memory budget —
+  ingest flushes at every file boundary regardless, so it only bounds a
+  single very large file.
+- `[ingest]` and `[output]` both reject unknown keys (`extra="forbid"`),
+  so a stale or mistyped config fails validation with a pointer at the
+  key instead of being silently ignored.
 - Database credentials are **never** stored in `config.toml`. Resolution
   order (highest first):
   1. Env vars `THISTLE_DB_DATABASE__USERNAME` / `THISTLE_DB_DATABASE__PASSWORD`
@@ -472,19 +493,31 @@ Commands:
   read-path indexes for bulk restores — the unique dedup index is never
   deferred, so idempotency holds throughout; a later plain `init-db` builds
   missing indexes (the finalize step).
-- `ingest [FILES...] [--force]` — everything: validate, store, outputs, run
-  accounting. Scans stay tolerant (exit 0; failed files retried next scan);
-  named files exit 1 on any failure so cron wrappers can detect it. No
-  `[[output.files]]` configured → store-only, a valid deployment (e.g. the
-  thistle catalog-fallback DB); only `rebuild`/`verify` require outputs.
-- `rebuild` — linear store scan re-deriving all outputs (first run, disaster
-  recovery, new output entry).
+- `ingest [FILES...] [--force] [--update-outputs]` — validate, store, run
+  accounting; store-only, flushed per file (an interrupt keeps every
+  completed file's work and exits 130 with the run row `cancelled`).
+  Scans stay tolerant of *data* problems (exit 0; failed files retried
+  next scan); named files exit 1 on any failure so cron wrappers can
+  detect it; a store failure (`FlushError`) aborts either mode with exit
+  1. `--update-outputs` runs the output phase afterwards under the same
+  lock (its own run row). Outputs are never required by plain `ingest` —
+  store-only is a valid deployment (e.g. the thistle catalog-fallback
+  DB); `update-outputs`/`rebuild`/`verify` require them.
+- `update-outputs` — re-render exactly the output files dirtied since
+  the last update: dirty objects/days from one PK-range scan past the
+  cursors, whole-file renders, cursors advanced only after all writes
+  (an interrupt loses nothing but redone work). Exits 2 with a pointer
+  at `rebuild` when an entry has no cursor yet.
+- `rebuild` — linear store scan re-deriving all outputs (first run,
+  disaster recovery, new/renamed output entry, post-backfill); also
+  initializes/resets every output's cursor.
 - `verify` — count reconciliation of every output against the **store** (the
   authority): per-object record counts, per-date winner counts. Also stamps
   `rejects.resolved_at` for payloads now present in `tle`. Catches damage
-  the tail guard can't see (mid-file truncation, deleted files for quiet
-  objects). Reads all output files → periodic cron (e.g. weekly), not every
-  run.
+  the scoped update can't see (hand-damaged or deleted files for quiet
+  objects, orphans). Reads all output files → periodic cron (e.g. weekly), not every
+  run; run `update-outputs` first so ordinary cursor lag is not flagged
+  as damage.
 - `export OUTPUT [--format tle|csv|omm-xml|omm-kvn] [--force]` — full-fidelity
   CSV is the backup/interchange form; TLE concat for legacy; CCSDS OMM
   XML/KVN (core keywords + extras in `userDefinedParameters`) for
@@ -496,24 +529,30 @@ Commands:
   date `YYYYMMDD` (nearest TLE per object to 12:00 UTC, ±N days, default 7)
   or an alpha-5-compatible NORAD ID (every TLE for that object, epoch
   order). Exits 1 if nothing matches. Always exact — it queries the store.
-- `status` — last runs, reject trends, unresolved reject counts (see
-  Observability).
+- `status` — last runs, reject trends, unresolved reject counts, output
+  lag (see Observability).
 - `rejects [--export DIR]` — summarize the rejects table; `--export` writes
   unresolved payloads back out as re-ingestable files (repair workflow:
   export, fix, ingest).
 
-Privilege tiering: `init-db` = DDL; `ingest` = DML **and output writes** (the
-ingest account owns the output tree); read commands open **read-only
-connections** (`PRAGMA query_only` / read-only transaction characteristics)
-as defense in depth on top of DB grants. **Single-writer ingest is
-universal** — output-file guards assume serialized ingest (`flock` / cron
+Privilege tiering: `init-db` = DDL; `ingest` = DML; `update-outputs` /
+`rebuild` = DML (cursors) **and output writes** (that account owns the
+output tree); read commands open **read-only connections** (`PRAGMA
+query_only` / read-only transaction characteristics) as defense in depth
+on top of DB grants. **Single-writer is universal** — every writing
+command takes the advisory lock, and the cursor's select-then-write and
+the `.tmp` sweep both assume serialized writers (`flock` / cron
 chaining).
 
 ## Error handling philosophy
 
-Ingest is tolerant: a malformed record is skipped and recorded in the
-`rejects` table — one bad record must never abort a file, and one bad file
-must never abort a scan. A missing source directory is a warning.
+Ingest is tolerant of **data** problems: a malformed record is skipped and
+recorded in the `rejects` table — one bad record must never abort a file,
+and one bad file must never abort a scan. A missing source directory is a
+warning. **Infrastructure** problems are the opposite: a store or
+state-commit failure during a flush raises `FlushError` and fails the
+run — a down database must never masquerade as a scan full of bad files
+that exits 0.
 
 Logging levels: routine no-ops (unchanged files skipped) and individual
 rejected records at DEBUG; per-file actions and per-directory summaries at
@@ -528,11 +567,11 @@ stays short.
 | Module | Responsibility |
 |---|---|
 | `record.py` | canonical GP record: construction, identity (incl. checksum helpers, exact epochs), merge, CSV/STK serialization |
-| `model.py` | SQLAlchemy models (schema v2) + GPRecord↔row conversion, derived values |
+| `model.py` | SQLAlchemy models + GPRecord↔row conversion, derived values |
 | `config.py` | pydantic-settings config + layered secrets resolution, output naming/templating |
 | `reader.py` | format detection + file readers (TLE, OMM JSON/CSV/XML) |
-| `ingest.py` | the delta engine: validation, scanning, buffer/flush, store sink, re-admission |
-| `outputs.py` | output application from the delta (tail guard, merge, date upsert) + rebuild |
+| `ingest.py` | the delta engine: validation, scanning, per-file buffer/flush, store sink, re-admission, `FlushError` |
+| `outputs.py` | output rendering from the store: cursor-scoped update, full rebuild, one atomic write path |
 | `rejects.py` | DB-backed reject sink (fuse, payload cap, upserts) + reject queries/export |
 | `runs.py` | run accounting (`ingest_runs`, `IngestReport`, status queries) |
 | `verify.py` | output↔store reconciliation, orphan scan, reject resolution stamping |
@@ -574,10 +613,9 @@ land in one hot region of the epoch-first index — a reason its column order
 must not change. Purely additive changes may ship as hand-written `ALTER`
 statements for all three dialects in the release notes.
 
-## Build order
+## Design history
 
-Complete. `PLAN-gp-store.md` steps 1–3 (spec, spikes, `record.py`) landed
-2026-09; `PLAN.md` milestones M4–M5 (schema v2, delta engine, outputs,
-rejects/runs/checksums, rebuild/verify/export/status/rejects CLI, legacy
-deletion) landed 2026-11-09. `PLAN.md` remains the detailed design
-rationale for the implemented system.
+How this design was reached — superseded alternatives and the
+measurements that decided them — is condensed in `DESIGN-HISTORY.md`;
+fuller detail lives in the changelog and git history. This document
+describes only the system as it is meant to be.

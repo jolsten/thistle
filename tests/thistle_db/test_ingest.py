@@ -1,17 +1,23 @@
-"""The delta engine: idempotence, enrichment, state tracking, crash replay."""
+"""The delta engine: idempotence, enrichment, per-file batches, cancellation."""
 
 import json
 import pathlib
 
+import pytest
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from .conftest import TLES, engine_ingest, make_settings, with_checksum
 from thistle_db.config import IngestSource
-from thistle_db.ingest import CHUNK_SIZE
+from thistle_db.ingest import (
+    CHUNK_SIZE,
+    DeltaEngine,
+    FlushError,
+    readmit_matured_rejects,
+)
 from thistle_db.model import IngestFile, OmmMetadata, Reject, TLE
-from thistle_db.outputs import OutputApplier
 from thistle_db.reader import read_tle, unique
+from thistle_db.runs import IngestReport
 
 DATA = pathlib.Path(__file__).parent / "data"
 BIG_FILE = DATA / "20250418.txt"
@@ -269,7 +275,8 @@ def test_blank_satnum_rejects_as_no_norad(db_session: Session, tmp_path):
 
 def test_replay_after_lost_state_converges(db_session: Session, tmp_path):
     """Crash-safety: replaying a file whose state never committed changes
-    nothing — every sink absorbs the duplicates."""
+    nothing — the store dedups, and zero new rows means zero dirty
+    outputs."""
     settings = make_settings(tmp_path)
     source_dir = tmp_path / "incoming"
     source_dir.mkdir()
@@ -277,13 +284,9 @@ def test_replay_after_lost_state_converges(db_session: Session, tmp_path):
     sources = [IngestSource(path=str(source_dir), pattern="*.tle")]
 
     engine_ingest(db_session, settings, sources=sources)
-    objects_dir = tmp_path / "objects"
-    reference = {
-        p.name: p.read_bytes() for p in sorted(objects_dir.iterdir())
-    }
     count = _tle_count(db_session)
 
-    # Simulate the crash window: rows + outputs landed, file state did not.
+    # Simulate the crash window: rows landed, file state did not.
     db_session.execute(delete(IngestFile))
     db_session.commit()
 
@@ -291,44 +294,111 @@ def test_replay_after_lost_state_converges(db_session: Session, tmp_path):
     assert report.files_ingested == 1  # re-read in full
     assert report.records_inserted == 0
     assert _tle_count(db_session) == count
-    replayed = {p.name: p.read_bytes() for p in sorted(objects_dir.iterdir())}
-    assert replayed == reference  # byte-identical outputs
 
 
-def test_crash_between_store_and_outputs_converges(
-    db_session: Session, tmp_path, monkeypatch
-):
-    """Kill between flush steps 1 and 2, then re-run: byte-identical end
-    state. The store committed, the outputs and file state did not."""
+def test_batches_never_span_files(db_session: Session, tmp_path, monkeypatch):
+    """One batch = one file: every store_add call carries records from a
+    single source file."""
+    import thistle_db.ingest as ingest_mod
+
+    calls: list[set[int]] = []
+    real_store_add = ingest_mod.store_add
+
+    def spy(session, records):
+        calls.append({record.norad_cat_id for record in records})
+        return real_store_add(session, records)
+
+    monkeypatch.setattr("thistle_db.ingest.store_add", spy)
+
     settings = make_settings(tmp_path)
     source_dir = tmp_path / "incoming"
     source_dir.mkdir()
-    _write_tle(source_dir / "a.tle", TLES[0], TLES[1])
+    _write_tle(source_dir / "a.tle", TLES[0], TLES[1])  # object 22
+    _write_tle(source_dir / "b.tle", TLES[2])  # object 81069
     sources = [IngestSource(path=str(source_dir), pattern="*.tle")]
 
-    original_apply = OutputApplier.apply
+    engine_ingest(db_session, settings, sources=sources)
+    assert [c for c in calls if c] == [{22}, {81069}]
 
-    def exploding_apply(self, delta):
-        raise RuntimeError("simulated crash before outputs")
 
-    monkeypatch.setattr(OutputApplier, "apply", exploding_apply)
-    try:
+def test_cancel_mid_scan_retains_completed_files(
+    db_session: Session, tmp_path, monkeypatch
+):
+    """Cancellation loses at most the in-flight file; the next run
+    continues from it and converges."""
+    settings = make_settings(tmp_path)
+    source_dir = tmp_path / "incoming"
+    source_dir.mkdir()
+    _write_tle(source_dir / "a.tle", TLES[0])
+    _write_tle(source_dir / "b.tle", TLES[1])
+    _write_tle(source_dir / "c.tle", TLES[2])
+    sources = [IngestSource(path=str(source_dir), pattern="*.tle")]
+
+    real_read = read_tle
+
+    def interrupting(path):
+        if path.name == "b.tle":
+            raise KeyboardInterrupt
+        return real_read(path)
+
+    monkeypatch.setattr("thistle_db.ingest.read_tle", interrupting)
+    with pytest.raises(KeyboardInterrupt):
         engine_ingest(db_session, settings, sources=sources)
-    except RuntimeError:
-        pass
-    monkeypatch.setattr(OutputApplier, "apply", original_apply)
 
-    assert _tle_count(db_session) == 2  # store committed first
+    # File a's work is durable: rows stored, state recorded.
+    assert _tle_count(db_session) == 1
+    assert (
+        db_session.execute(select(func.count(IngestFile.id))).scalar_one() == 1
+    )
+
+    monkeypatch.undo()
+    report = engine_ingest(db_session, settings, sources=sources)
+    assert report.files_skipped == 1  # a: not even reopened
+    assert report.files_ingested == 2  # b and c
+    assert _tle_count(db_session) == 3
+
+
+def test_store_failure_aborts_scan_as_flush_error(
+    db_session: Session, tmp_path, monkeypatch
+):
+    """Infrastructure failures fail the run — a down database must not be
+    logged as one 'bad file' after another on a scan that exits 0."""
+    settings = make_settings(tmp_path)
+    source_dir = tmp_path / "incoming"
+    source_dir.mkdir()
+    _write_tle(source_dir / "a.tle", TLES[0])
+    _write_tle(source_dir / "b.tle", TLES[2])
+    sources = [IngestSource(path=str(source_dir), pattern="*.tle")]
+
+    def boom(session, records):
+        raise RuntimeError("database unreachable")
+
+    monkeypatch.setattr("thistle_db.ingest.store_add", boom)
+    with pytest.raises(FlushError):
+        engine_ingest(db_session, settings, sources=sources)
     assert (
         db_session.execute(select(func.count(IngestFile.id))).scalar_one() == 0
     )
-    assert not (tmp_path / "objects").exists() or not list(
-        (tmp_path / "objects").iterdir()
-    )
 
-    report = engine_ingest(db_session, settings, sources=sources)
-    assert report.records_inserted == 0  # dedup absorbed the replay
-    assert report.files_ingested == 1
-    # Both records are object 22: one file, two records, epoch order.
-    obj = tmp_path / "objects" / "22.tle"
-    assert obj.read_text().count("\n") == 4
+
+def test_readmissions_are_durable_before_any_file(
+    db_session: Session, tmp_path
+):
+    """Re-admissions flush (and stamp) as their own batch — cancelling
+    right after the re-admission pass loses nothing."""
+    line1, line2 = TLES[0]
+    future1 = with_checksum(line1[:18] + "56107.90268499" + line1[32:])
+    path = _write_tle(tmp_path / "future.tle", (future1, line2))
+    engine_ingest(db_session, make_settings(tmp_path), files=[path])
+    assert _tle_count(db_session) == 0  # rejected: future epoch
+
+    wide = make_settings(tmp_path, max_epoch_ahead_days=20000)
+    report = IngestReport()
+    with pytest.raises(RuntimeError):
+        with DeltaEngine(db_session, wide, report) as engine:
+            readmit_matured_rejects(db_session, engine)
+            raise RuntimeError("cancelled before the first file")
+
+    assert _tle_count(db_session) == 1
+    reject = db_session.execute(select(Reject)).scalar_one()
+    assert reject.resolved_at is not None

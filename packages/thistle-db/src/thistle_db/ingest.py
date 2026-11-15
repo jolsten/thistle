@@ -1,25 +1,32 @@
-"""The delta engine — validate, buffer, flush to every sink in order.
+"""The delta engine — validate, buffer, flush the store per source file.
 
-One pass: ingest validates records, buffers them grouped by object, and at
-flush time (end of scan, or every ``flush_records``) hands the same delta
-to every sink in a fixed order:
+Ingest is store-only. One pass validates records, buffers them grouped by
+object, and flushes at every file boundary:
 
-    1. store.add(delta)        -- chunked dialect upsert, dedup on
+    1. store.add(file's delta) -- chunked dialect upsert, dedup on
                                   UNIQUE(epoch, record_hash); then the OMM
                                   metadata insert/merge pass
-    2. output.apply(delta) ×N  -- tail-guarded appends / merge rewrites /
-                                  date upserts (outputs.py)
-    3. commit ingest_files     -- only for files fully consumed by this
-                                  flush
+    2. commit ingest_files     -- that one file's state, only after its
+                                  records are durably stored
+    3. stamp re-admissions     -- reject rows resolve only after their
+                                  records reach the store
 
-That ordering rule is the entire crash-safety story: a crash replays at
-most the files whose state was never recorded, and every sink is
-idempotent against the replay (the store dedups; object outputs dedup on
-merge and guard appends by tail epoch; date outputs upsert on
-``epoch >=``).
+Batches never span files, so the unit of durability is one source file: a
+cancelled or killed run retains every completed file's work, and the next
+run continues from the first unprocessed file. Replay of the one
+in-flight file is absorbed by the store's dedup. ``flush_records`` only
+bounds memory within a single huge file — a mid-file flush still never
+spans files.
 
-Validation is tolerant: one bad record never aborts a file (it lands in
-the ``rejects`` table) and one bad file never aborts a scan.
+Output files are not written here: ``outputs.update_outputs`` (the
+``update-outputs`` command, or ``ingest --update-outputs``) renders them
+from the store afterwards, scoped by the output cursor.
+
+Failures split by kind. Validation stays tolerant — one bad record never
+aborts a file (it lands in the ``rejects`` table) and one bad file never
+aborts a scan. A store or state-commit failure, by contrast, raises
+``FlushError`` and aborts the run: a down database must fail loudly, not
+masquerade as a scan full of bad files that exits 0.
 """
 
 import dataclasses
@@ -47,7 +54,6 @@ from thistle_db.model import (
     tle_row_from_record,
     utcnow,
 )
-from thistle_db.outputs import OutputApplier
 from thistle_db.progress import NO_PROGRESS, ProgressReporter
 from thistle_db.reader import (
     detect_format,
@@ -77,9 +83,18 @@ from thistle_db.rejects import (
     upsert_rejects,
 )
 from thistle_db.runs import IngestReport
-from thistle_db.writer import WritePool
 
 CHUNK_SIZE = 5000
+
+
+class FlushError(RuntimeError):
+    """A flush failed at the store or state-commit step.
+
+    Infrastructure, not data: `process_file` re-raises it past the
+    per-file tolerance, so a down database or broken session fails the
+    run instead of being logged as one "bad file" after another on a
+    scan that exits 0.
+    """
 
 # Dedup index columns for ON CONFLICT dialects (SQLite/PostgreSQL); MariaDB
 # uses INSERT IGNORE, which keys off the same unique constraints.
@@ -415,7 +430,7 @@ def _apply_sidecar(
 
 def _merge_sidecar(metadata: OmmMetadata, record: GPRecord) -> bool:
     """Apply the enrichment-merge precedence to an existing sidecar row —
-    the one sanctioned UPDATE (PLAN.md §3.2):
+    the one sanctioned UPDATE (CLAUDE.md, "Enrichment merge"):
 
     1. Non-null beats null.
     2. Both non-null and unequal: newest CREATION_DATE wins field-wise;
@@ -464,7 +479,7 @@ class FileStatus(enum.StrEnum):
 @dataclasses.dataclass
 class PendingFileState:
     """A successfully parsed file whose state commits with the flush that
-    carries its last record — never before its records reach every sink."""
+    carries its last record — never before its records reach the store."""
 
     path: str
     path_hash: str
@@ -485,10 +500,12 @@ def _file_sha256(path: pathlib.Path) -> str:
 
 
 class DeltaEngine:
-    """Buffers validated records by object and flushes them to every sink.
+    """Buffers validated records by object and flushes the store per file.
 
-    Use as a context manager; exit flushes the tail of the buffer, stamps
-    re-admissions, and emits the once-per-run warnings.
+    Use as a context manager; a clean exit flushes any tail (normally a
+    no-op — `file_done` flushes at every file boundary). An exceptional
+    exit flushes nothing: unflushed files have no state recorded and are
+    simply re-read next run.
     """
 
     def __init__(
@@ -504,26 +521,17 @@ class DeltaEngine:
         self.report = report
         self.run_id = run_id
         self.flush_records = settings.ingest.flush_records
-        self._pool = WritePool(settings.output.write_workers)
-        self._applier: Optional[OutputApplier] = None
         self._buffer: dict[int, dict[bytes, GPRecord]] = {}
         self._count = 0
         self._pending_files: list[PendingFileState] = []
         self._readmitted_ids: list[int] = []
 
     def __enter__(self) -> "DeltaEngine":
-        self._pool.__enter__()
-        self._applier = OutputApplier(
-            self.settings.output.files, self._pool, self.report
-        )
         return self
 
     def __exit__(self, exc_type, *exc_info) -> None:
-        try:
-            if exc_type is None:
-                self.close()
-        finally:
-            self._pool.__exit__(exc_type, *exc_info)
+        if exc_type is None:
+            self.close()
 
     # -- buffering ---------------------------------------------------------
 
@@ -543,7 +551,14 @@ class DeltaEngine:
             self.flush()
 
     def file_done(self, state: PendingFileState) -> None:
+        """Record a fully parsed file and flush — the batch boundary.
+
+        Batches never span files: everything buffered belongs to this
+        file (plus, mid-file, earlier chunks of the same file via the
+        ``flush_records`` bound), so this flush makes exactly this file's
+        work durable before the next file is opened."""
         self._pending_files.append(state)
+        self.flush()
 
     def readmitted(self, reject_id: int) -> None:
         self._readmitted_ids.append(reject_id)
@@ -551,35 +566,35 @@ class DeltaEngine:
     # -- flushing ----------------------------------------------------------
 
     def flush(self) -> None:
-        """Store, then outputs, then file state — the one ordering rule."""
-        if self._count == 0 and not self._pending_files:
+        """Store, then file state, then re-admission stamps — the ordering
+        rule. A failure here is infrastructure, not data: it raises
+        ``FlushError`` and aborts the run."""
+        if (
+            self._count == 0
+            and not self._pending_files
+            and not self._readmitted_ids
+        ):
             return
         delta = {
             norad: list(per_object.values())
             for norad, per_object in self._buffer.items()
         }
         records = [record for group in delta.values() for record in group]
-        self.report.records_inserted += store_add(self.session, records)
-        assert self._applier is not None, "DeltaEngine used outside its context"
-        self._applier.apply(delta)
-        self._commit_file_states()
+        try:
+            self.report.records_inserted += store_add(self.session, records)
+            self._commit_file_states()
+            self._stamp_readmissions()
+        except Exception as exc:
+            try:
+                self.session.rollback()
+            except Exception:
+                pass
+            raise FlushError(f"{type(exc).__name__}: {exc}") from exc
         self._buffer = {}
         self._count = 0
 
     def close(self) -> None:
         self.flush()
-        self._stamp_readmissions()
-        if self.report.lineless_skipped:
-            logger.warning(
-                f"{self.report.lineless_skipped} line-less record(s) skipped "
-                "by tle outputs (TLE outputs are verbatim passthrough)"
-            )
-        if self._applier is not None and self._applier.alpha5_overflow:
-            ids = sorted(self._applier.alpha5_overflow)
-            logger.warning(
-                f"{len(ids)} object(s) beyond alpha-5 range named with "
-                f"integer stems (e.g. {ids[0]}) in alpha5 outputs"
-            )
 
     def _commit_file_states(self) -> None:
         if not self._pending_files:
@@ -629,9 +644,10 @@ def process_file(
     """Validate one file into the engine, with state tracking.
 
     Unchanged files (per the ingest_files state table) are skipped without
-    being opened. Never raises for per-file problems — logs a warning and
-    returns FAILED, leaving the file's state unrecorded so it is retried
-    on the next scan.
+    being opened. Never raises for per-file *data* problems — logs a
+    warning and returns FAILED, leaving the file's state unrecorded so it
+    is retried on the next scan. ``FlushError`` (a store failure during
+    this file's flush) passes through and aborts the scan.
     """
     report = engine.report
     settings = engine.settings
@@ -701,6 +717,8 @@ def process_file(
             PendingFileState(resolved, key, stat.st_size, stat.st_mtime_ns, digest)
         )
         return FileStatus.INGESTED
+    except FlushError:
+        raise
     except Exception as exc:
         session.rollback()
         logger.warning(f"Failed to ingest {path}: {exc}")
@@ -717,7 +735,9 @@ def readmit_matured_rejects(session: Session, engine: DeltaEngine) -> int:
     Their source file is state-tracked and will never be re-read, so this
     is the only path back in. A candidate that now fails for a *different*
     reason has its reject row's reason updated, which removes it from
-    future candidate scans.
+    future candidate scans. Promotions flush as their own batch — before
+    the first file is read — and the flush stamps the reject rows
+    resolved only once the records are durably stored.
     """
     days = engine.settings.ingest.max_epoch_ahead_days
     epoch_limit = _epoch_limit(days)
@@ -765,6 +785,7 @@ def readmit_matured_rejects(session: Session, engine: DeltaEngine) -> int:
             "inside the horizon"
         )
         engine.report.records_readmitted += promoted
+        engine.flush()
     return promoted
 
 

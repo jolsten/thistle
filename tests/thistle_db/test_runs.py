@@ -34,6 +34,19 @@ def test_run_context_failure_records_and_reraises(db_session: Session):
     assert row.finished is not None
 
 
+def test_run_context_cancelled_on_interrupt(db_session: Session):
+    """An operator interrupt finalizes 'cancelled', not 'failed' — the
+    work committed before the interrupt is durable, not lost."""
+    with pytest.raises(KeyboardInterrupt):
+        with run_context(db_session, "ingest") as (run, report):
+            report.files_ingested = 2
+            raise KeyboardInterrupt()
+    row = db_session.execute(select(IngestRun)).scalar_one()
+    assert row.status == "cancelled"
+    assert row.finished is not None
+    assert row.files_ingested == 2
+
+
 def test_stuck_runs_detects_crashed_rows(db_session: Session):
     with run_context(db_session, "a") as (run, report):
         pass

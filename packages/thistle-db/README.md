@@ -3,7 +3,8 @@
 Orbital element database manager. Ingests TLE (Two-Line Element) and OMM
 (Orbit Mean-Elements Message) files into a SQL database — the canonical,
 full-fidelity store — and maintains organized output files (TLE by object
-and by date; STK-compatible OMM CSV) in the same pass.
+and by date; STK-compatible OMM CSV) rendered from the store after
+ingest.
 
 Nothing is silently lost: records that fail validation are retained in a
 queryable `rejects` table with a reason code, and every run is recorded in
@@ -100,11 +101,14 @@ thistle-db ingest                      # scan configured source directories
 thistle-db ingest 20260327.tle gp.json # or ingest specific files
 ```
 
-One pass does everything: validate, store, and update every configured
-output. There is no separate generate step — the steady-state cron entry
-is just `thistle-db ingest`. Outputs are optional: with no
-`[[output.files]]` entries, ingest is store-only (useful when the
-database is queried directly, e.g. as `thistle`'s catalog fallback).
+Ingest is **store-only** and flushes per source file, so progress is
+durable file by file: a cancelled or killed run keeps every completed
+file's work, and the next run continues from the first unprocessed file.
+Output files are rendered afterwards — the steady-state cron entry is
+`thistle-db ingest --update-outputs` (or chain `ingest` and
+`update-outputs`). Outputs are optional: with no `[[output.files]]`
+entries, the deployment is store-only (useful when the database is
+queried directly, e.g. as `thistle`'s catalog fallback).
 
 File format is auto-detected by extension:
 
@@ -128,9 +132,12 @@ re-admitted automatically once their epoch comes inside the horizon.
 
 ### 5. Outputs
 
-Declared as `[[output.files]]` entries; `ingest` maintains all of them
-incrementally, and `rebuild` re-derives everything from the store (first
-run, disaster recovery, or after adding an entry):
+Declared as `[[output.files]]` entries. `thistle-db update-outputs`
+re-renders exactly the files dirtied by records ingested since the last
+update (each file rendered whole from the store and replaced atomically
+— byte-identical to a rebuild of that file), and `rebuild` re-derives
+everything (first run, disaster recovery, or after adding/renaming an
+entry — which also initializes the entry's catch-up cursor):
 
 - **Object files** (`type = "object"`) — all records for one satellite,
   epoch order. NORAD IDs render as integers (optionally zero-padded) or
@@ -144,7 +151,8 @@ run, disaster recovery, or after adding an entry):
 ## Operations
 
 ```bash
-thistle-db status            # recent runs, reject trends, stuck runs
+thistle-db update-outputs    # render output files dirtied since last update
+thistle-db status            # recent runs, reject trends, output lag, stuck runs
 thistle-db verify            # reconcile outputs against the store (weekly cron)
 thistle-db rejects           # summarize rejected input by reason
 thistle-db rejects --export repair/   # write payloads out for repair + re-ingest
@@ -153,12 +161,17 @@ thistle-db get-tle 20260327  # nearest TLE per object to that date's noon
 thistle-db export backup.csv # full-fidelity, re-ingestable backup
 ```
 
-- **Runs are data**: every `ingest`/`rebuild` writes an `ingest_runs` row
-  with per-run counters; `status` reads it back. Scans exit 0 even when
+- **Runs are data**: every `ingest`/`update-outputs`/`rebuild` writes an
+  `ingest_runs` row with per-run counters; `status` reads it back
+  (including how far outputs lag the store). Scans exit 0 even when
   individual files fail (they retry next scan); explicitly named files
-  exit 1 on failure so cron wrappers can alert.
-- **Single-writer**: `ingest` and `rebuild` take an advisory lock beside
+  exit 1 on failure so cron wrappers can alert. An interrupted run
+  finishes `cancelled` — its completed files are already durable.
+- **Single-writer**: the writing commands take an advisory lock beside
   the config file; a second writer exits immediately.
+- **Bulk backfills**: ingest everything (per-file flushes are cheap),
+  then `rebuild` — with the whole catalog dirty, a scoped update would
+  do the same work with worse streaming.
 - **Backup/migration**: `export` writes a full-fidelity CSV that
   re-ingests into any supported dialect (`init-db` + `ingest backup.csv`
   — also the schema-migration path; there is deliberately no migration

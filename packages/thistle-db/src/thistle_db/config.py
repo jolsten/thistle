@@ -28,9 +28,9 @@ CONFIG_PATH_ENV = "THISTLE_DB_CONFIG"
 DEFAULT_MAX_EPOCH_AHEAD_DAYS = 30
 
 # Default for [ingest] flush_records — buffered records that trigger an
-# early delta flush. Purely a memory budget (~600 B/record), never a
-# correctness knob: flushes are idempotent, so an early flush only means
-# touching hot output files more than once per run.
+# early mid-file store flush. Purely a memory budget (~600 B/record),
+# never a correctness knob: flushes are idempotent, batches never span
+# files, and this bound only matters inside a single very large file.
 DEFAULT_FLUSH_RECORDS = 1_000_000
 
 # Alpha-5 tops out at Z9999, so no real catalog number exceeds this. Lets
@@ -126,15 +126,14 @@ class IngestConfig(BaseModel):
     """Reject elsets whose epoch is more than this many days in the future.
 
     A corrupted epoch field parses cleanly into 2000-2056 (two-digit TLE
-    years), and once stored such a row permanently poisons its object
-    file's tail guard — every later legitimate elset triggers a full
-    rewrite instead of an append — and plants a junk date file nothing
-    cleans up. Real feeds run at most hours to a day ahead of now, so the
-    default (30) is generous; raise it for predicted-elset workflows, or
-    set 0 to disable the guard entirely. One-sided: epochs in the past are
-    never bounded, so historical archives ingest untouched. Rejected
-    records are retained in the `rejects` table and re-admitted
-    automatically once their epoch comes inside the horizon."""
+    years), and once stored such a row sits at the tail of its object
+    file forever and plants a junk date file nothing cleans up. Real
+    feeds run at most hours to a day ahead of now, so the default (30) is
+    generous; raise it for predicted-elset workflows, or set 0 to disable
+    the guard entirely. One-sided: epochs in the past are never bounded,
+    so historical archives ingest untouched. Rejected records are
+    retained in the `rejects` table and re-admitted automatically once
+    their epoch comes inside the horizon."""
     verify_checksums: bool = True
     """Reject TLE lines whose mod-10 checksum (column 69) does not match.
 
@@ -144,7 +143,8 @@ class IngestConfig(BaseModel):
     validation has. Lines shorter than 69 characters skip the check (some
     tools emit trimmed lines; historical archives contain them)."""
     flush_records: int = Field(default=DEFAULT_FLUSH_RECORDS, ge=1)
-    """Buffered records that trigger an early delta flush (memory budget)."""
+    """Buffered records that trigger an early mid-file store flush
+    (memory budget; batches never span files)."""
 
 
 class OutputFile(BaseModel):
@@ -152,7 +152,8 @@ class OutputFile(BaseModel):
 
     Declared as ``[[output.files]]`` entries in config.toml. Entries may
     share a directory (extensions keep them apart) or spread across
-    directories; each is maintained independently by the flush engine.
+    directories; each is rendered independently from the store by
+    `update-outputs` / `rebuild` — never during ingest.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -358,8 +359,10 @@ class OutputConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     files: list[OutputFile] = []
-    """Outputs to maintain. Empty is valid config for query-only use, but
-    `ingest` and `rebuild` refuse to run with nothing to produce."""
+    """Outputs to maintain. Empty is valid config for store-only
+    deployments (ingest never writes outputs); the output commands
+    (`update-outputs`, `rebuild`, `verify`) refuse to run with nothing
+    to produce."""
     write_workers: int = 0
     """Threads used for output file writes. 0 = auto (CPU count x 4, capped).
 

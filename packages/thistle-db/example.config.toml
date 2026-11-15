@@ -25,7 +25,9 @@ name = "tle.db"
 max_epoch_ahead_days = 30
 # Reject TLE lines whose mod-10 checksum (column 69) does not match.
 verify_checksums = true
-# Delta-buffer memory budget (records per flush; ~600 B each).
+# Delta-buffer memory budget (records per mid-file flush; ~600 B each).
+# Ingest flushes at every file boundary regardless — batches never span
+# files — so this only bounds a single very large file.
 flush_records = 1000000
 
 [[ingest.sources]]
@@ -36,8 +38,11 @@ pattern = "*.txt"
 path = "/data/spacetrack/gp"
 pattern = "*.json"
 
-# Outputs are maintained incrementally by `ingest` itself; `rebuild`
-# re-derives them all from the store after a config change.
+# Outputs are rendered from the store AFTER ingest: `thistle-db
+# update-outputs` (or `ingest --update-outputs`) re-renders exactly the
+# files dirtied by new records; `rebuild` re-derives everything and must
+# run once first (and after adding/renaming an entry) to initialize the
+# entry's cursor. Omit all entries for a store-only deployment.
 
 [[output.files]]
 type = "object"          # one file per satellite, full history, epoch order
